@@ -1,0 +1,9 @@
+cmake==4.4.4
+pybind11==3.1.0
+ninja==1.13.2
+nvidia-cuda-cuobjdump==13.4.92
+nvidia-cuda-nvdisasm==13.4.92
+nvidia-cuda-cuxxfilt==13.0.85
+nvidia-cuda-profiler-api==13.0.85
+nvidia-cuda-sanitizer-api==13.0.85
+nvidia-nvfatbin==13.0.85

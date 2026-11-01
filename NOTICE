@@ -1,0 +1,68 @@
+ds41h
+Copyright 2026 Sequester AG
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+It includes or adapts code from the projects below.
+
+================================================================================
+BRRR (Apache License, Version 2.0; see LICENSES/BRRR-Apache-2.0.txt)
+https://github.com/fraserprice/DeepSeek-4.1-Flash-1017-BRRR
+
+Files marked "Adapted from BRRR", "Ported from BRRR" or "Ideas adapted from
+BRRR" derive from this project and were modified for sm_90a and stock vLLM
+0.32.0. ds41h/kernels/drafter.cu builds on the adapted ds41h/vp_sampling.py. The
+NOTICE file of BRRR follows. The fork, b12x and FlashInfer sources it names are
+not part of this repository.
+--------------------------------------------------------------------------------
+DeepSeek-4.1-Flash-1017-BRRR
+Copyright 2026 Fraser Price
+https://huggingface.co/fraserprice/DeepSeek-4.1-Flash-1017-BRRR
+
+This project is built on, patches and extends the following projects, each
+licensed under the Apache License, Version 2.0 and remaining the copyright of
+its respective authors:
+
+vLLM
+  Copyright the vLLM project
+  https://github.com/vllm-project/vllm
+
+Local Inference Lab's vLLM fork, including the DeepSeek-V4.1 model code that
+vllm.patch modifies
+  https://github.com/local-inference-lab/vllm
+
+b12x, whose attention, MoE, linear, Engram and all-reduce backends this project
+builds on and patches
+  Copyright 2025 the b12x authors
+  https://github.com/local-inference-lab/b12x
+
+FlashInfer, which now hosts b12x
+  Copyright 2025-2026 NVIDIA
+  Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)
+  https://github.com/flashinfer-ai/flashinfer
+
+================================================================================
+vLLM (Apache License, Version 2.0)
+Copyright the vLLM project
+https://github.com/vllm-project/vllm
+
+ds41h patches vLLM 0.32.0 at import time, and parts of ds41h/patch_*.py follow
+the structure of the vLLM functions they replace. patches/vllm-*.patch modifies
+vLLM source files.
+
+================================================================================
+FlashMLA (MIT License; see LICENSES/FlashMLA-MIT.txt)
+Copyright (c) 2025 DeepSeek
+https://github.com/vllm-project/FlashMLA
+
+ds41h/prefill_attn.py adapts csrc/api/sparse_prefill.cpp, and ds41h/grouped_decode.py
+derives its decode kernels from FlashMLA's SM90 sparse decode at build time.
+
+================================================================================
+DeepSeek-V4.1-Flash-1017 reference inference code (MIT License; see
+LICENSES/DeepSeek-MIT.txt)
+Copyright (c) 2023 DeepSeek
+https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017
+
+ds41h/ref/ is a pure-torch reference that follows the semantics of the official
+inference/ code. plugins/dsml_roundtrip.py follows the official encoding/ code
+for tool-call parsing and assistant-turn rendering.

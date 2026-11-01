@@ -1,0 +1,88 @@
+--- vllm/parser/abstract_parser.py
++++ vllm/parser/abstract_parser.py
+@@ -68,6 +68,8 @@
+     """Mutable state for ``Parser.parse_delta()``. One per stream."""
+ 
+     reasoning_ended: bool = False
++    prompt_ended_reasoning: bool = False
++    stream_finished: bool = False
+     tool_call_text_started: bool = False
+     prompt_reasoning_checked: bool = False
+     previous_text: str = ""
+@@ -857,6 +859,7 @@
+     ) -> DeltaMessage | None:
+         self._initialize_history_tool_call_cnt(request)
+         state = self._stream_state
++        state.stream_finished = finished
+ 
+         if not state.prompt_reasoning_checked and prompt_token_ids is not None:
+             state.prompt_reasoning_checked = True
+@@ -864,6 +867,7 @@
+                 prompt_token_ids
+             ):
+                 state.reasoning_ended = True
++                state.prompt_ended_reasoning = self._reasoning_parser is not None
+             else:
+                 # Reasoning is still open at the end of the prompt; let the
+                 # reasoning parser adjust its initial parsing state so the
+@@ -1001,6 +1005,12 @@
+         """Count reasoning tokens through the configured reasoning parser."""
+         if self._reasoning_parser is None:
+             return 0
++        if self._stream_state.prompt_ended_reasoning:
++            incremental = getattr(
++                self._reasoning_parser, "count_reasoning_tokens_after_prompt_end", None
++            )
++            if incremental is not None:
++                return incremental(token_ids, finished=self._stream_state.stream_finished)
+         return self._reasoning_parser.count_reasoning_tokens(token_ids)
+ 
+     def _flush_engine_parsers(
+--- vllm/parser/engine/adapters.py
++++ vllm/parser/engine/adapters.py
+@@ -49,6 +49,9 @@
+         self._parser_engine = self._parser_engine_cls(tokenizer, **kwargs)  # type: ignore[call-arg]
+         self._parser_engine_kwargs = kwargs
+         self._counting_parser_engine: ParserEngine | None = None
++        self._incremental_counting_engine: ParserEngine | None = None
++        self._incremental_counted = 0
++        self._incremental_flushed = False
+         # TODO: Remove once Responses finalization reuses accumulated streaming
+         # parser results instead of reparsing the complete output.
+         self._streaming_count_valid = False
+@@ -135,6 +138,35 @@
+     ) -> str | None:
+         return self._parser_engine.get_streaming_fallback_content(text, request)
+ 
++    def count_reasoning_tokens_after_prompt_end(
++        self, token_ids: Sequence[int], *, finished: bool = False
++    ) -> int:
++        """Count for a stream whose prompt already closed reasoning: starts in
++        CONTENT, parses only the tokens new since the last call, and flushes
++        once at the end of the stream, so the final count matches a full parse."""
++        engine = self._incremental_counting_engine
++        if (
++            engine is None
++            or len(token_ids) < self._incremental_counted
++            or (self._incremental_flushed and len(token_ids) > self._incremental_counted)
++        ):
++            if engine is None:
++                engine = self._parser_engine_cls(
++                    self.model_tokenizer, **self._parser_engine_kwargs
++                )  # type: ignore[call-arg]
++                self._incremental_counting_engine = engine
++            engine._reset(initial_state=ParserState.CONTENT)
++            self._incremental_counted = 0
++            self._incremental_flushed = False
++        new_ids = token_ids[self._incremental_counted :]
++        if new_ids:
++            engine._feed(self.model_tokenizer.decode(new_ids), new_ids)
++            self._incremental_counted = len(token_ids)
++        if finished and not self._incremental_flushed:
++            engine._engine.finish()
++            self._incremental_flushed = True
++        return engine.count_reasoning_tokens(token_ids)
++
+     def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
+         if self._streaming_count_valid:
+             return self._parser_engine.count_reasoning_tokens(token_ids)
