@@ -1,0 +1,7 @@
+{
+ "[[phys:hello]]": "The user greets me; answer briefly.</think>Hello! How can I help you today?<｜end▁of▁sentence｜>",
+ "[[phys:tool]]": "I should search the code for foo.</think>I will grep.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"grep\">\n<｜DSML｜ parameter name=\"pattern\" string=\"true\">foo</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>",
+ "[[phys:strict]]": "Strict tool: call get_weather.</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Zurich</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>",
+ "[[phys:long]]": "Thinking about a long answer.</think>Here is a long answer. One two three four five six seven eight nine ten. Eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty.<｜end▁of▁sentence｜>",
+ "[[phys:strict_missing]]": "Strict tool, but skip a required field.</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Zurich</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>"
+}

@@ -9,7 +9,9 @@ Server settings, with `CAPTURE=1536` at k=5 and `CAPTURE=1024` at k=3:
 THROUGHPUT=1 SPEC_K=5 ENGRAM=host MAXLEN=262144 MAX_SEQS=256 GPU_UTIL=0.91 CAPTURE=1536 scripts/serve_ds41h.sh
 ```
 
-This gives a GPU KV cache of about 6.6M tokens at k=5 and 7.1M at k=3.
+vLLM's start-up log reports this as a GPU KV cache of about 6.6M tokens at k=5 and 7.1M at k=3. That figure is in a
+different unit from the tokens the server can hold at once: measured on 2026-11-08 at k=3, 256 streams held 19.9M
+resident tokens at 95.4 % KV usage without a preemption, about 21M tokens at full usage ([FPR.md](FPR.md)).
 
 ## Decode, 1 to 64 users
 

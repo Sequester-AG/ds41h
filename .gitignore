@@ -9,3 +9,7 @@ runs/
 *.crt
 *.pem
 *.safetensors
+# FPRv1 JIT build directories and generated sources (created next to the kernels on first use or by scripts/prebuild_fpr.sh)
+fpr/**/build/
+fpr/**/build_*/
+fpr/engine/build/

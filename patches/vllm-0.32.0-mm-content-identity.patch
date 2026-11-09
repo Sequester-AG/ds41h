@@ -1,0 +1,47 @@
+--- vllm/multimodal/processing/inputs.py
++++ vllm/multimodal/processing/inputs.py
+@@ -80,29 +80,24 @@
+                 else ([None] * len(data_items))
+             )
+ 
+-            # For None entries, compute a hash; otherwise, use provided ID.
++            # ds41h: a media item's identity is ALWAYS the hash of its content. A client-supplied uuid is never
++            # used: the identity keys the processor cache, the encoder cache and the prefix-cache block hashes,
++            # which all requests share (cache_salt does not cover the processor cache), so a reused uuid would
++            # hand one client another client's media. Items without data (a reference by uuid alone) are refused.
+             hashes: list[str] = []
+             for i, item in enumerate(data_items.get_all_items_for_hash()):
+-                uuid_item = uuid_items[i]
+-
+-                # NOTE: Even if a uuid_item is provided, model output depends
+-                # on the current modality's hash factors, so they are taken
+-                # into account.
+-                if uuid_item is None or has_hash_factors:
+-                    # NOTE: use provided hash string to hash with kwargs
+-                    # if available for better performance.
+-                    item = uuid_item if uuid_item is not None else item
+-                    hashes.append(
+-                        hasher.hash_kwargs(
+-                            hash_algorithm,
+-                            model_id=model_id,
+-                            **{modality: item},
+-                            **hash_factors,
+-                        )
++                if item is None:
++                    raise ValueError(
++                        f"{modality} item {i} has no data: references to media by uuid alone are not supported"
++                    )
++                hashes.append(
++                    hasher.hash_kwargs(
++                        hash_algorithm,
++                        model_id=model_id,
++                        **{modality: item},
++                        **hash_factors,
+                     )
+-                else:
+-                    # If there are no extra kwargs, use the client-provided UUID.
+-                    hashes.append(uuid_item)
++                )
+ 
+             mm_hashes[modality] = hashes
+ 

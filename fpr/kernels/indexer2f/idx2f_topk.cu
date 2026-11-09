@@ -1,0 +1,591 @@
+// indexer2f: block-max + exact top-K for the indexer rows of OWNED sequences (v2).
+//
+// block_max(logits, lens, out): out[r, b] = the element of logits[r, 8b .. min(8b + 8, lens[r])) with the largest key
+//   (key = the order-preserving u32 of the fp32 bits, every NaN highest, +0 > -0): the block key-max of stock
+//   select_candidate_blocks / ds41h select_blocks. One read of the logits; a persistent grid walks a device-side prefix of
+//   the rows' 8,192-position chunks (no empty CTAs, graph-safe for any row lengths).
+//
+// select_blocks(bmax, nb_lens, K, out): layer 20's candidate blocks = stock select_candidate_blocks' set: the newest block
+//   (nb - 1) pinned to +inf, the top-min(K, nb) block keys (lowest block id on ties), -inf blocks dropped (-1), written in
+//   ascending block order and -1 padded (ds41h select_blocks' order; consumers only use the set).
+//
+// topk(logits, lens, bmax, K, out[, cblk]): the EXACT top-K of row r over [0, lens[r]) under the canonical order (key
+//   desc, lowest position on ties), written in ascending position order (rows with lens <= K: 0 .. n-1, -1 padded: stock's
+//   contract). Why it is exact: tau = the 22 high bits of the K-th largest block key is <= that key, and the K largest
+//   blocks each hold an element with key >= tau, so the K-th largest element key >= tau: every element of the top-K has
+//   key >= tau and lies in a block whose key >= tau. The kernel collects exactly those elements (in position order,
+//   typically 0.6-4 K) and runs a 3-pass radix select (11 / 11 / 10 bits) on them in shared memory; rows with more than
+//   kCMax such elements (massive ties) take the same select streamed over the whole row (counted in `slow`).
+//   cblk (compact candidate rows of the consumer layers): output index t -> position 8 * cblk[r, t >> 3] + (t & 7).
+// v2: warp-aggregated shared-memory histograms (__match_any_sync): a row's keys share their sign / exponent bits, so the
+//   first digit falls into a handful of bins and plain atomics serialized 32-way (v1: 35-61 us per layer, here the goal is
+//   the read of the block maxima).
+// Deterministic, no allocation, no host sync (CUDA-graph safe).
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <torch/extension.h>
+
+#include <cub/block/block_scan.cuh>
+
+namespace idx2f_topk {
+
+constexpr int kTPB = 1024;
+constexpr int kHB = 2048;
+constexpr int kCMax = 8192;
+constexpr int kBlock = 8;
+constexpr int kChunkBlocks = 1024;  // block_max work item: 1,024 blocks = 8,192 positions
+constexpr int kBMThreads = 256;     // 4 blocks per thread
+constexpr int kMaxRows = 1024;
+constexpr uint32_t kNegInfKey = 0x007fffffu;  // ukey(-inf)
+constexpr uint32_t kPosInfKey = 0xff800000u;  // ukey(+inf)
+
+__device__ __forceinline__ uint32_t ukey(float f) {
+  const uint32_t b = __float_as_uint(f);
+  if ((b & 0x7fffffffu) > 0x7f800000u) return 0xffffffffu;  // NaN: highest (torch radix twiddle maps all NaN up)
+  return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+
+// ------------------------------------------------------------------------------------------------ block max
+__global__ void __launch_bounds__(kBMThreads) block_max_kernel(const float* __restrict__ lg, long ld,
+                                                               const int* __restrict__ lens, int rows,
+                                                               float* __restrict__ out, long ldo) {
+  using BScan = cub::BlockScan<int, kBMThreads>;
+  __shared__ typename BScan::TempStorage scan_tmp;
+  __shared__ int s_off[kMaxRows + 1];
+  // device-side prefix of the rows' chunk counts (rows <= 1024 = 4 per thread)
+  constexpr int kPer = kMaxRows / kBMThreads;
+  int cnt[kPer], s = 0;
+#pragma unroll
+  for (int k = 0; k < kPer; ++k) {
+    const int r = int(threadIdx.x) * kPer + k;
+    const int nb = r < rows ? (__ldg(lens + r) + kBlock - 1) / kBlock : 0;
+    cnt[k] = (nb + kChunkBlocks - 1) / kChunkBlocks;
+    s += cnt[k];
+  }
+  int run, total;
+  BScan(scan_tmp).ExclusiveSum(s, run, total);
+#pragma unroll
+  for (int k = 0; k < kPer; ++k) {
+    const int r = int(threadIdx.x) * kPer + k;
+    if (r < rows) s_off[r] = run;
+    run += cnt[k];
+  }
+  if (threadIdx.x == 0) s_off[rows] = total;
+  __syncthreads();
+  for (int item = blockIdx.x; item < total; item += gridDim.x) {
+    int lo = 0, hi = rows - 1;  // the row r with s_off[r] <= item < s_off[r + 1]
+    while (lo < hi) {
+      const int mid = (lo + hi + 1) >> 1;
+      if (s_off[mid] <= item) lo = mid; else hi = mid - 1;
+    }
+    const int r = lo;
+    const int n = __ldg(lens + r);
+    const int nb = (n + kBlock - 1) / kBlock;
+    const int c = item - s_off[r];
+#pragma unroll
+    for (int k = 0; k < kChunkBlocks / kBMThreads; ++k) {
+      const int b = c * kChunkBlocks + k * kBMThreads + int(threadIdx.x);
+      if (b >= nb) break;
+      const float4* p = reinterpret_cast<const float4*>(lg + r * ld + long(kBlock) * b);
+      const float4 x0 = __ldg(p), x1 = __ldg(p + 1);
+      const float v[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+      const int m = min(kBlock, n - kBlock * b);
+      uint32_t best = ukey(v[0]);
+      float bv = v[0];
+#pragma unroll
+      for (int j = 1; j < kBlock; ++j) {
+        const uint32_t u = ukey(v[j]);
+        if (j < m && u > best) best = u, bv = v[j];
+      }
+      out[r * ldo + b] = bv;
+    }
+  }
+}
+
+// ------------------------------------------------------------------------------------------------ select core
+// v3: per-warp private 8-bit histograms. A row's keys share their sign / exponent bits, so every warp hits the same few
+// bins: one shared histogram serialized the atomics ACROSS warps (v1 / v2: 10 to 17 us per pass on the longest rows).
+using Scan = cub::BlockScan<int, kTPB>;
+constexpr int kWarps = kTPB / 32;
+constexpr int kBins = 256;
+constexpr int kMaxBlocks = 32768;  // rows up to 262,144 positions (block keys staged in shared memory)
+
+struct Smem {
+  uint32_t a[kMaxBlocks];       // block keys; then (after the block threshold) the candidates: key [0, kCMax), pos [kCMax, 2 kCMax)
+  int sblk[kCMax];              // the selected blocks, ascending
+  int whist[kWarps * kBins];    // per-warp histograms
+  int hist[kBins];
+  typename Scan::TempStorage scan;
+  int misc[4];
+};
+static_assert(2 * kCMax <= kMaxBlocks, "candidate arrays alias the block keys");
+
+// one radix pass: counts of digit (u >> sh) & 255 over the items whose bits above sh match (prefix, pmask); then
+// sm.misc[0] = the digit where the suffix count crosses need, sm.misc[1] = #items in higher digits
+template <typename Get>
+__device__ __forceinline__ void radix_pass(Smem& sm, int N, Get get, uint32_t prefix, uint32_t pmask, int sh, int need) {
+  const int tid = threadIdx.x, w = tid >> 5;
+  for (int i = tid; i < kWarps * kBins; i += kTPB) sm.whist[i] = 0;
+  __syncthreads();
+  int* wh = sm.whist + w * kBins;
+  for (int i = tid; i < N; i += kTPB) {
+    const uint32_t u = get(i);
+    if ((u & pmask) == prefix) atomicAdd(&wh[(u >> sh) & 255u], 1);
+  }
+  __syncthreads();
+  if (tid < kBins) {
+    int c = 0;
+#pragma unroll 8
+    for (int k = 0; k < kWarps; ++k) c += sm.whist[k * kBins + tid];
+    sm.hist[tid] = c;
+  }
+  __syncthreads();
+  // suffix scan over the 256 bins (descending): thread t < 128 owns bins 255 - 2t, 254 - 2t
+  int c0 = 0, c1 = 0, hb = 0;
+  if (tid < kBins / 2) hb = kBins - 1 - 2 * tid, c0 = sm.hist[hb], c1 = sm.hist[hb - 1];
+  int incl, tot;
+  Scan(sm.scan).InclusiveSum(c0 + c1, incl, tot);
+  const int excl = incl - c0 - c1;
+  if (tid < kBins / 2 && excl < need && need <= incl) {
+    if (excl + c0 >= need) sm.misc[0] = hb, sm.misc[1] = excl;
+    else sm.misc[0] = hb - 1, sm.misc[1] = excl + c0;
+  }
+  __syncthreads();
+}
+
+// Exact K-th largest key over N items (get(i) -> key); returns kth and #(key > kth) in gt. Requires 1 <= K <= N.
+template <typename Get>
+__device__ uint32_t kth_key(Smem& sm, int N, int K, Get get, int& gt, int npass = 4) {
+  uint32_t prefix = 0, pmask = 0;
+  int need = K, above_total = 0;
+  for (int pass = 0; pass < npass; ++pass) {
+    const int sh = 24 - 8 * pass;
+    radix_pass(sm, N, get, prefix, pmask, sh, need);
+    const int d = sm.misc[0], above = sm.misc[1];
+    __syncthreads();
+    prefix |= uint32_t(d) << sh;
+    pmask |= 255u << sh;
+    need -= above;
+    above_total += above;
+  }
+  gt = above_total;
+  return prefix;
+}
+
+// Output in position order: item i selected iff key > kth or (key == kth and among the first need_eq ties).
+template <typename Get, typename Emit>
+__device__ void emit_sel(Smem& sm, int N, uint32_t kth, int need_eq, Get get, Emit val, int* out) {
+  const int chunk = (N + kTPB - 1) / kTPB;
+  const int i0 = min(N, int(threadIdx.x) * chunk), i1 = min(N, i0 + chunk);
+  int g = 0, e = 0;
+  for (int i = i0; i < i1; ++i) {
+    const uint32_t u = get(i);
+    g += u > kth;
+    e += u == kth;
+  }
+  int gb, eb, tot;
+  Scan(sm.scan).ExclusiveSum(g, gb, tot);
+  __syncthreads();
+  Scan(sm.scan).ExclusiveSum(e, eb, tot);
+  for (int i = i0; i < i1; ++i) {
+    const uint32_t u = get(i);
+    if (u > kth) {
+      out[gb + min(eb, need_eq)] = val(i);
+      ++gb;
+    } else if (u == kth) {
+      if (eb < need_eq) out[gb + eb] = val(i);
+      ++eb;
+    }
+  }
+}
+
+// ------------------------------------------------------------------------------------------------ top-K of a row
+struct Args {
+  const float* lg;
+  long ld;
+  const int* lens;
+  const float* bmax;
+  long ldb;
+  int* out;
+  long ldo;
+  const int* cblk;  // nullptr: positions are the row indices
+  long ldc;
+  int K;
+  int* slow;
+  int stop;  // debug: return after stage `stop` (0 = run all)
+};
+
+__global__ void __launch_bounds__(kTPB, 1) topk_kernel(const Args a) {
+  extern __shared__ __align__(16) uint8_t smem_raw[];
+  Smem& sm = *reinterpret_cast<Smem*>(smem_raw);
+  const int row = blockIdx.x, tid = threadIdx.x;
+  const int n = __ldg(a.lens + row);
+  const int K = a.K;
+  int* out = a.out + row * a.ldo;
+  const int* cblk = a.cblk ? a.cblk + row * a.ldc : nullptr;
+  auto posmap = [&](int p) { return cblk ? ((__ldg(cblk + (p >> 3)) << 3) | (p & 7)) : p; };
+  if (n <= K) {  // stock contract: 0 .. n-1 then -1
+    for (int i = tid; i < K; i += kTPB) out[i] = i < n ? posmap(i) : -1;
+    return;
+  }
+  const float* lrow = a.lg + row * a.ld;
+  const float* brow = a.bmax + row * a.ldb;
+  const int nb = (n + kBlock - 1) / kBlock;
+
+  // ---- block keys -> shared memory (coalesced)
+  for (int i = tid; i < nb; i += kTPB) sm.a[i] = ukey(__ldg(brow + i));
+  __syncthreads();
+  if (a.stop == 1) return;
+  // ---- block threshold tau: the 24 high bits of the K-th largest block key (0 = every block when nb <= K)
+  uint32_t tau = 0;
+  if (nb > K) {
+    int gt_unused;
+    tau = kth_key(sm, nb, K, [&](int i) { return sm.a[i]; }, gt_unused, 3);
+  }
+  if (a.stop == 2) return;
+  // ---- the selected blocks (key >= tau), ascending: thread-contiguous chunks of the smem keys + one scan
+  bool overflow = false;
+  {
+    const int chunk = (nb + kTPB - 1) / kTPB;
+    const int b0 = min(nb, tid * chunk), b1 = min(nb, b0 + chunk);
+    int cnt = 0;
+    for (int b = b0; b < b1; ++b) cnt += sm.a[b] >= tau;
+    int off, S;
+    Scan(sm.scan).ExclusiveSum(cnt, off, S);
+    __syncthreads();
+    if (S > kCMax) {
+      overflow = true;
+    } else {
+      for (int b = b0; b < b1; ++b)
+        if (sm.a[b] >= tau) sm.sblk[off++] = b;
+    }
+    __syncthreads();
+    if (!overflow) sm.misc[2] = S;
+    __syncthreads();
+  }
+  // ---- candidates: the elements >= tau of the selected blocks, in position order (lane-parallel loads, one scan per
+  // round of 1,024 blocks); they overwrite the block keys (no longer needed)
+  int C = 0;
+  uint32_t* ckey = sm.a;
+  int* cpos = reinterpret_cast<int*>(sm.a + kCMax);
+  if (!overflow) {
+    const int S = sm.misc[2];
+    for (int r0 = 0; r0 < S; r0 += kTPB) {
+      const int i = r0 + tid;
+      uint32_t u[8];
+      int b = 0, m = 0, c = 0;
+      if (i < S) {
+        b = sm.sblk[i];
+        m = min(kBlock, n - kBlock * b);
+        const float4* p = reinterpret_cast<const float4*>(lrow + long(kBlock) * b);
+        const float4 x0 = __ldg(p), x1 = __ldg(p + 1);
+        const float v[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          u[j] = ukey(v[j]);
+          c += (j < m) && u[j] >= tau;
+        }
+      }
+      int off, tot;
+      Scan(sm.scan).ExclusiveSum(c, off, tot);
+      if (C + tot > kCMax) {
+        overflow = true;  // uniform: tot is the CTA-wide sum
+        break;
+      }
+      if (i < S) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+          if ((j < m) && u[j] >= tau) ckey[C + off] = u[j], cpos[C + off] = kBlock * b + j, ++off;
+      }
+      C += tot;
+      __syncthreads();
+    }
+  }
+  __syncthreads();
+  if (a.stop == 3) return;
+  if (!overflow) {
+    auto get = [&](int i) { return ckey[i]; };
+    int gt;
+    const uint32_t kth = kth_key(sm, C, K, get, gt);
+    if (a.stop == 4) return;
+    emit_sel(sm, C, kth, K - gt, get, [&](int i) { return posmap(cpos[i]); }, out);
+  } else {
+    // massive ties (or a degenerate row): the same select streamed over the whole row
+    if (tid == 0) atomicAdd(a.slow, 1);
+    auto get = [&](int i) { return ukey(__ldg(lrow + i)); };
+    int gt;
+    const uint32_t kth = kth_key(sm, n, K, get, gt);
+    emit_sel(sm, n, kth, K - gt, get, [&](int i) { return posmap(i); }, out);
+  }
+}
+
+// ------------------------------------------------------------------------------------------------ L20 block select
+struct SelArgs {
+  const float* bmax;
+  long ldb;
+  const int* nb_lens;
+  int* out;
+  long ldo;
+  int K;
+};
+
+__global__ void __launch_bounds__(kTPB, 1) select_kernel(const SelArgs a) {
+  extern __shared__ __align__(16) uint8_t smem_raw[];
+  Smem& sm = *reinterpret_cast<Smem*>(smem_raw);
+  const int row = blockIdx.x, tid = threadIdx.x;
+  const int nb = __ldg(a.nb_lens + row);
+  const int K = a.K;
+  int* out = a.out + row * a.ldo;
+  const float* brow = a.bmax + row * a.ldb;
+  if (nb <= 0) {
+    for (int i = tid; i < K; i += kTPB) out[i] = -1;
+    return;
+  }
+  // block keys in shared memory, the newest block pinned to +inf (stock: scores[(end - 1) // 8] = inf)
+  for (int i = tid; i < nb; i += kTPB) {
+    const uint32_t u = ukey(__ldg(brow + i));
+    sm.a[i] = i == nb - 1 ? max(u, kPosInfKey) : u;
+  }
+  __syncthreads();
+  auto key = [&](int i) { return sm.a[i]; };
+  uint32_t kth = 0;
+  int gt = 0;
+  if (nb > K) kth = kth_key(sm, nb, K, key, gt);
+  // selected blocks in ascending order: -inf blocks (key == ukey(-inf)) are dropped (stock writes -1 for them)
+  const bool cut = nb > K;
+  const int need_eq = cut ? K - gt : nb;
+  const int chunk = (nb + kTPB - 1) / kTPB;
+  const int i0 = min(nb, tid * chunk), i1 = min(nb, i0 + chunk);
+  int g = 0, e = 0;
+  for (int i = i0; i < i1; ++i) {
+    const uint32_t u = key(i);
+    if (u == kNegInfKey) continue;
+    g += cut ? u > kth : 1;
+    e += cut && u == kth;
+  }
+  int gb, eb, tot_g, tot_e;
+  Scan(sm.scan).ExclusiveSum(g, gb, tot_g);
+  __syncthreads();
+  Scan(sm.scan).ExclusiveSum(e, eb, tot_e);
+  for (int i = i0; i < i1; ++i) {
+    const uint32_t u = key(i);
+    if (u == kNegInfKey) continue;
+    if (cut ? u > kth : true) {
+      out[gb + min(eb, need_eq)] = i;
+      ++gb;
+    } else if (u == kth) {
+      if (eb < need_eq) out[gb + eb] = i;
+      ++eb;
+    }
+  }
+  const int written = tot_g + min(tot_e, need_eq);
+  for (int i = written + tid; i < K; i += kTPB) out[i] = -1;
+}
+
+
+// ------------------------------------------------------------------------------------------------ prep2 (consumers)
+// The union / per-row compaction of layer 20's candidates for the consumer layers, from ASCENDING candidate lists
+// (select_blocks above and ds41h select_blocks both write ascending block ids, -1 padded): no atomics. Output = the
+// candidate prep's contract (idx2f_cand.cu): ublk [B, 4K] ascending union, uslot [B, 4K, 4] the block's rank in row r's list or -1,
+// nunion [B], clen [rows] = #positions of the row's blocks inside [0, n); the row's ascending list cblk IS its candidate
+// row (rank = index), so no cblk is written.
+constexpr int kPrepT = 1024;
+constexpr int kPrepNN = 4;
+constexpr int kPrepK = 2048;
+constexpr int kPrepWords = 1024;  // rows up to 32,768 blocks
+
+struct PrepSmem {
+  int list[kPrepNN][kPrepK];
+  unsigned rw[kPrepNN][kPrepWords];
+  int rlo[kPrepNN][kPrepWords];
+  int cnt[kPrepNN];
+  typename cub::BlockScan<int, kPrepT>::TempStorage scan;
+};
+
+__device__ __forceinline__ int lower_bound(const int* a, int n, int x) {
+  int lo = 0, hi = n;
+  while (lo < hi) {
+    const int mid = (lo + hi) >> 1;
+    if (a[mid] < x) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+
+__global__ void __launch_bounds__(kPrepT, 1) prep2_kernel(const int* __restrict__ cand, long cs, const int* __restrict__ lens,
+                                                         int* __restrict__ ublk, int* __restrict__ uslot,
+                                                         int* __restrict__ nunion, int* __restrict__ clen,
+                                                         const int* __restrict__ bt, long bts, int* __restrict__ upk) {
+  extern __shared__ __align__(16) uint8_t smem_raw[];
+  PrepSmem& sm = *reinterpret_cast<PrepSmem*>(smem_raw);
+  const int b = blockIdx.x, tid = threadIdx.x;
+  const int ustride = kPrepNN * kPrepK;
+  for (int i = tid; i < kPrepNN * kPrepK; i += kPrepT) {
+    const int r = i / kPrepK, j = i - r * kPrepK;
+    sm.list[r][j] = __ldg(cand + long(b * kPrepNN + r) * cs + j);
+  }
+  __syncthreads();
+  if (tid < kPrepNN) {  // valid prefix length: the first -1 (ascending ids, then -1 padding)
+    int lo = 0, hi = kPrepK;
+    while (lo < hi) {
+      const int mid = (lo + hi) >> 1;
+      if (sm.list[tid][mid] >= 0) lo = mid + 1; else hi = mid;
+    }
+    sm.cnt[tid] = lo;
+  }
+  __syncthreads();
+  int nbmax = 0;
+#pragma unroll
+  for (int r = 0; r < kPrepNN; ++r) nbmax = max(nbmax, (__ldg(lens + b * kPrepNN + r) + kBlock - 1) / kBlock);
+  const int nw = min(kPrepWords, (nbmax + 31) / 32);
+  for (int t = tid; t < kPrepNN * nw; t += kPrepT) {
+    const int r = t / nw, w = t - r * nw;
+    const int lo = lower_bound(sm.list[r], sm.cnt[r], 32 * w), hi = lower_bound(sm.list[r], sm.cnt[r], 32 * w + 32);
+    unsigned bits = 0;
+    for (int k = lo; k < hi; ++k) bits |= 1u << (sm.list[r][k] & 31);
+    sm.rw[r][w] = bits;
+    sm.rlo[r][w] = lo;
+  }
+  __syncthreads();
+  unsigned u = 0;
+  if (tid < nw) {
+#pragma unroll
+    for (int r = 0; r < kPrepNN; ++r) u |= sm.rw[r][tid];
+  }
+  int pre, total;
+  cub::BlockScan<int, kPrepT>(sm.scan).ExclusiveSum(__popc(u), pre, total);
+  int* ub = ublk + long(b) * ustride;
+  int* us = uslot + long(b) * ustride * kPrepNN;
+  while (u) {
+    const int bit = __ffs(u) - 1;
+    u &= u - 1;
+    const int ui = pre++;
+    const int blk = 32 * tid + bit;
+    ub[ui] = blk;
+    if (upk != nullptr) upk[long(b) * ustride + ui] = (__ldg(bt + long(b) * bts + (blk >> 3)) << 3) | (blk & 7);
+#pragma unroll
+    for (int r = 0; r < kPrepNN; ++r) {
+      const unsigned m = sm.rw[r][tid];
+      us[long(ui) * kPrepNN + r] = ((m >> bit) & 1u) ? sm.rlo[r][tid] + __popc(m & ((1u << bit) - 1u)) : -1;
+    }
+  }
+  if (tid == 0) nunion[b] = total;
+  if (tid < kPrepNN) {
+    const int n = __ldg(lens + b * kPrepNN + tid);
+    const int nb = (n + kBlock - 1) / kBlock;
+    const int c = sm.cnt[tid];
+    const bool has = c > 0 && sm.list[tid][c - 1] == nb - 1;  // only the newest block can be partial
+    clen[b * kPrepNN + tid] = c * kBlock - (has ? kBlock - (n - kBlock * (nb - 1)) : 0);
+  }
+}
+
+// ------------------------------------------------------------------------------------------------ host
+void check_rows(const at::Tensor& t, const char* name, at::ScalarType st) {
+  TORCH_CHECK(t.is_cuda() && t.scalar_type() == st && t.dim() == 2 && t.stride(1) == 1, name, ": 2-D CUDA, stride(1) 1");
+}
+
+template <typename F>
+void set_smem_once(F* fn, int dev) {
+  static bool set[64] = {};
+  if (!set[dev]) {
+    TORCH_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(Smem))) == cudaSuccess,
+                "smem attribute");
+    set[dev] = true;
+  }
+}
+
+void block_max(at::Tensor logits, at::Tensor lens, at::Tensor out, int64_t max_len) {
+  check_rows(logits, "logits", at::kFloat);
+  check_rows(out, "out", at::kFloat);
+  TORCH_CHECK(lens.is_cuda() && lens.scalar_type() == at::kInt && lens.is_contiguous() && lens.numel() >= logits.size(0), "lens");
+  TORCH_CHECK(logits.stride(0) % 4 == 0 && reinterpret_cast<uintptr_t>(logits.data_ptr()) % 16 == 0, "logits rows 16-B aligned");
+  const int rows = int(logits.size(0));
+  TORCH_CHECK(rows <= kMaxRows, "rows <= 1024");
+  const int nb = int((max_len + kBlock - 1) / kBlock);
+  TORCH_CHECK(out.size(1) >= nb && out.size(0) >= rows, "out [rows, >= ceil(max_len / 8)]");
+  TORCH_CHECK(logits.size(1) >= nb * kBlock, "logits width >= 8 * ceil(max_len / 8)");
+  if (!rows || !nb) return;
+  const c10::cuda::CUDAGuard guard(logits.device());
+  const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  block_max_kernel<<<2 * sms, kBMThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+      logits.data_ptr<float>(), logits.stride(0), lens.data_ptr<int>(), rows, out.data_ptr<float>(), out.stride(0));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void topk(at::Tensor logits, at::Tensor lens, at::Tensor bmax, int64_t k, at::Tensor out, std::optional<at::Tensor> cblk,
+          at::Tensor slow, int64_t stop) {
+  check_rows(logits, "logits", at::kFloat);
+  check_rows(bmax, "bmax", at::kFloat);
+  check_rows(out, "out", at::kInt);
+  TORCH_CHECK(lens.is_cuda() && lens.scalar_type() == at::kInt && lens.is_contiguous(), "lens");
+  TORCH_CHECK(slow.is_cuda() && slow.scalar_type() == at::kInt && slow.numel() >= 1, "slow counter");
+  const int rows = int(logits.size(0));
+  TORCH_CHECK(lens.numel() >= rows && bmax.size(0) >= rows && out.size(0) >= rows && out.size(1) >= k && k > 0 && k <= kCMax, "shapes");
+  TORCH_CHECK(bmax.size(1) <= kMaxBlocks, "rows up to 262,144 positions");
+  TORCH_CHECK(k <= kCMax, "k <= 8192");
+  if (cblk) check_rows(*cblk, "cblk", at::kInt);
+  if (!rows) return;
+  const c10::cuda::CUDAGuard guard(logits.device());
+  set_smem_once(topk_kernel, logits.get_device());
+  Args a{logits.data_ptr<float>(), logits.stride(0), lens.data_ptr<int>(), bmax.data_ptr<float>(), bmax.stride(0),
+         out.data_ptr<int>(), out.stride(0), cblk ? cblk->data_ptr<int>() : nullptr, cblk ? cblk->stride(0) : 0, int(k),
+         slow.data_ptr<int>(), int(stop)};
+  topk_kernel<<<rows, kTPB, sizeof(Smem), at::cuda::getCurrentCUDAStream()>>>(a);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void select_blocks(at::Tensor bmax, at::Tensor nb_lens, int64_t k, at::Tensor out) {
+  check_rows(bmax, "bmax", at::kFloat);
+  check_rows(out, "out", at::kInt);
+  TORCH_CHECK(nb_lens.is_cuda() && nb_lens.scalar_type() == at::kInt && nb_lens.is_contiguous(), "nb_lens");
+  const int rows = int(out.size(0));
+  TORCH_CHECK(nb_lens.numel() >= rows && bmax.size(0) >= rows && out.size(1) >= k && k > 0, "shapes");
+  TORCH_CHECK(bmax.size(1) <= kMaxBlocks, "at most 32,768 blocks per row");
+  if (!rows) return;
+  const c10::cuda::CUDAGuard guard(bmax.device());
+  set_smem_once(select_kernel, bmax.get_device());
+  SelArgs a{bmax.data_ptr<float>(), bmax.stride(0), nb_lens.data_ptr<int>(), out.data_ptr<int>(), out.stride(0), int(k)};
+  select_kernel<<<rows, kTPB, sizeof(Smem), at::cuda::getCurrentCUDAStream()>>>(a);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void prep2(at::Tensor cand, at::Tensor lens, at::Tensor ublk, at::Tensor uslot, at::Tensor nunion, at::Tensor clen,
+           std::optional<at::Tensor> block_table, std::optional<at::Tensor> upk) {
+  check_rows(cand, "cand", at::kInt);
+  TORCH_CHECK(cand.size(1) == kPrepK, "cand [rows, 2048]");
+  TORCH_CHECK(lens.is_cuda() && lens.scalar_type() == at::kInt && lens.is_contiguous(), "lens");
+  const int rows = int(lens.numel());
+  TORCH_CHECK(rows % kPrepNN == 0 && cand.size(0) >= rows, "rows = 4 x requests");
+  const int B = rows / kPrepNN;
+  for (auto* t : {&ublk, &uslot, &nunion, &clen})
+    TORCH_CHECK(t->is_cuda() && t->scalar_type() == at::kInt && t->is_contiguous(), "prep2 outputs int32 contiguous");
+  TORCH_CHECK(ublk.numel() >= long(B) * kPrepNN * kPrepK && uslot.numel() >= long(B) * kPrepNN * kPrepK * kPrepNN &&
+                  nunion.numel() >= B && clen.numel() >= rows, "prep2 output sizes");
+  if (!B) return;
+  const c10::cuda::CUDAGuard guard(cand.device());
+  static bool set[64] = {};
+  const int dev = cand.get_device();
+  if (!set[dev]) {
+    TORCH_CHECK(cudaFuncSetAttribute(prep2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(PrepSmem))) == cudaSuccess,
+                "prep2 smem");
+    set[dev] = true;
+  }
+  TORCH_CHECK(block_table.has_value() == upk.has_value(), "block_table and upk together");
+  if (upk) {
+    check_rows(*block_table, "block_table", at::kInt);
+    TORCH_CHECK(upk->is_cuda() && upk->scalar_type() == at::kInt && upk->is_contiguous() && upk->numel() >= ublk.numel(), "upk");
+  }
+  prep2_kernel<<<B, kPrepT, sizeof(PrepSmem), at::cuda::getCurrentCUDAStream()>>>(
+      cand.data_ptr<int>(), cand.stride(0), lens.data_ptr<int>(), ublk.data_ptr<int>(), uslot.data_ptr<int>(),
+      nunion.data_ptr<int>(), clen.data_ptr<int>(), block_table ? block_table->data_ptr<int>() : nullptr,
+      block_table ? block_table->stride(0) : 0, upk ? upk->data_ptr<int>() : nullptr);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+}  // namespace idx2f_topk
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("block_max", &idx2f_topk::block_max, "8-position block key-max of logits rows (stock select's block score)");
+  m.def("topk", &idx2f_topk::topk, "exact top-K via the block-max threshold (key desc, lowest position on ties), ascending");
+  m.def("select_blocks", &idx2f_topk::select_blocks, "layer-20 candidate blocks from the block maxima (stock select's set)");
+  m.def("prep2", &idx2f_topk::prep2, "consumer union / compaction from ascending candidate lists (no atomics)");
+}

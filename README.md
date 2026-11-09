@@ -24,6 +24,36 @@ every request ran to its full length. Details and caveats are in [docs/BENCHMARK
 
 Prefill with k=5 reaches 42.4K tok/s at 8K tokens and 61.8K tok/s at 16K tokens.
 
+## FPRv1
+
+FPRv1 (First Principles Rewrite v1, in [`fpr/`](fpr)) is a second engine for the same model and machine, behind the same
+vLLM API layer. Each sequence lives on one GPU, the experts are split exactly like ds41h's TP4 slices, long prompts
+are prefilled across all four GPUs, and decode can be pipelined. It serves images and the Responses API with stored
+responses.
+
+**FPRv1 against ds41h production**, both measured on 2026-11-08 on the same machine (4× H200 NVL, 600 W), ds41h in its THROUGHPUT
+configuration. Decode: 8K-token prompts, thinking off, DSpark k=3, 2,048 output tokens per stream, tok/s while all
+streams run / over the whole run; FPRv1 with pipelined dispatch. Prefill: one prompt on a warm server, prompt tokens /
+time to first token. KV: tokens held at once, measured.
+
+| | ds41h, production of 2026-11-08 | FPRv1 | FPRv1 vs production |
+|---|---|---|---|
+| Decode, 1 user, tok/s | 530 / 503 | 321 / 295 | 0.61× / 0.59× |
+| Decode, 64 users, tok/s | 6,759 / 5,626 | 8,895 / 6,857 | **1.32× / 1.22×** |
+| Decode, 256 users, tok/s | 12,203 / 10,513 | 20,791 / 15,736 | **1.70× / 1.50×** |
+| Prefill 8K, K tok/s | 53.1 | 54.4 | 1.02× |
+| Prefill 16K | 62.6 | 54.4 | 0.87× |
+| Prefill 32K | 60.5 | 60.2 | 1.00× |
+| Prefill 64K | 57.3 | 63.4 | **1.11×** |
+| Prefill 128K | 56.6 | 64.3 | **1.14×** |
+| Prefill 250K | 52.3 (4.78 s) | 61.7 (4.05 s) | **1.18×** |
+| KV cache, M tokens | ~21 | 64.4 (58.8 with images on) | **~3.0×** (2.8×) |
+
+ds41h production of 2026-11-08 = the 2026-11-01 release with `DS41H_MOE_SMALL_T=1024` and a grammar-masking change that is not published yet; these benchmarks use no structured output.
+
+Design, the synchronous-mode numbers, the exactness results and the known limits are in [docs/FPR.md](docs/FPR.md).
+`scripts/serve_fpr.sh` starts it.
+
 ## Requirements
 
 - 4× H200 NVL (`sm_90a`) in one host. The kernels are compiled for this architecture and for exactly four
@@ -87,6 +117,13 @@ even with keys configured, including `/invocations`, which runs the model, and `
 `patches/vllm-0.32.0-auth-all-paths.patch` requires the key on every path except `/health`. `setup/build-venv.sh` applies
 it, so check that it is in place before you expose a server. With no keys configured, every route is open.
 
+With images on, stock vLLM 0.32.0 also lets a client name an image with its own `uuid` and then uses that `uuid` as
+the image's identity in the processor cache, the encoder cache and the prefix-cache keys, which all clients share. A
+reused `uuid` therefore hands one client another client's image: a later request with a different image is answered
+about the first one, even when the two requests use different `cache_salt` values (measured on this stack).
+`patches/vllm-0.32.0-mm-content-identity.patch` makes the identity the hash of the image content, ignores client
+`uuid`s, and refuses image parts that carry a `uuid` but no data. Apply it before serving images to more than one client.
+
 ## Tests
 
 The CPU tests need the checkpoint on disk:
@@ -113,7 +150,8 @@ inference code, or with stock vLLM. They need GPUs and the real weights, and the
 | `patches/` | Fixes to the installed vLLM wheel, applied by `setup/` |
 | `scripts/` | Launchers, kernel prebuild, benchmarks and profilers, exactness tools |
 | `setup/` | Pinned package versions and the environment build |
-| `docs/` | Design, exactness method, benchmarks, Engram modes |
+| `docs/` | Design, exactness method, benchmarks, Engram modes, FPRv1 |
+| `fpr/` | FPRv1: engine, scheduler and KV manager, vLLM plugins, kernels, configuration ([docs/FPR.md](docs/FPR.md)) |
 
 ## Known limits
 
