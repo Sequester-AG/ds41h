@@ -46,14 +46,233 @@ TOPK_WS_PER_DEV = os.environ.get("ENG_TOPK_WS_PER_DEV", "1") == "1"   # CORRECTN
                                  # cooperative top-k ran on that one device-0 buffer at once (persistent kernels coordinate their
                                  # CTAs through it). One manager per device instead: workspace allocated here, outside any
                                  # capture, then locked (a growth request asserts instead of freeing a buffer graphs point at).
+ONEBK_SHARE = os.environ.get("ENG_IDX_ONEBK_SHARE", "1") == "1"
+    # engine's ENG_MIX_ONE_BUCKET): the cached view states of a pinned base bucket (the view's base: max A, or max T with
+    # ENG_MIX_ONE_BUCKET_T) share that base's ONE tables2f.GeneralTables set (device tables, block-table rows, the lean
+    # OwnedIndexer's cand / top-512, lat) instead of one per view. Families are found by base, so A and T views never
+    # share a set (carry_candidates copies between two different sets, as it must)
+    # Per view only its R-row
+    # prefixes, its pos and its own idx2f_tab registration (pointers): the derive kernel writes exactly what it writes for
+    # a plain R bucket, so the same bits (Idx2f._general_tables)
 CAND_PAD_FIX = os.environ.get("ENG_CAND_PAD_FIX", "1") == "1"   # tail bucket: padding IR rows get their group's cand
+# ENG_IDX_CARRY_ASC=1: carry_candidates also carries layer 20's list order. With a
+# row past LONG_ROW in A, A's layer 20 takes the stock select for ALL its rows (score order, cand_ascending False); T's
+# indexer starts every step ascending, so short T rows took cand_prep2 (ascending lists only) on score-ordered lists:
+# wrong unions / slots for layers 24-36 (Python _consumer_ws and the native idx step, both read oi.cand_ascending).
+# 0 = the old behaviour (A/B only).
+CARRY_ASC = os.environ.get("ENG_IDX_CARRY_ASC", "1") == "1"
 LEVEL_CTX = (262_144, 524_288, 655_360)   # decode-graph bound per long-row level: lvl 0 = idx2f fast
                                           # mode everywhere; lvl 1 = ratio-2 layers fast, layer 20 + its consumers stock
                                           # select / top-k; lvl 2 = all stock (max_model_len). Same per-layer rule as eager.
+LONG_ANY_ROWS = os.environ.get("FPR_LONG_ANY_ROWS", "0") == "1"
 MAX_CTX = 262_144                 # idx2f fast top-k / select limit (rows up to 262,144 compressed positions); the engine
                                   # refuses longer sequences in this mode
 P_MAX = 655_360 // 64             # block-table width (production's max_model_len / 64)
 NU_MAX = 4096                     # upload v2: block-table delta entries per rank and decode step in the blob (more: per tensor)
+# Lever (a), the HBM index-key mirror
+# host-tier pages of decode sequences get a mirror slot in HBM (22,464 B = the 4 sources' index-key span of a 64-token page),
+# keyed per (state slot, block). The lvl-0 decode buckets' indexer reads them there (idx2f_fcand8m / fcandm: block-table
+# entries | idx2f.MIRROR_BIT); FlashMLA / GlobalOut keep the pool block table d["bt"]. Bytes: the in-graph refresh
+# (idx2f_mirror.cu: each sequence's mirrored pages of positions [wm, L) from the pool, then wm = L) + a second index-key
+# store into the mirror for the bucket's own new records; the host maps / unmaps from the block-table deltas and lowers wm.
+MIRROR_SLOTS = int(os.environ.get("FPR_KV_IDX_MIRROR", "0") or 0)
+# debug: every N-th decode touch, verify the mirror on the device (host sync; read-only): for every
+# (state slot, block) the host map holds, dbt == the map's page, mdbt == slot | MIRROR_BIT when mapped else == dbt, and the
+# mapped pages entirely below wm hold the pool's bytes. Mismatches are logged with (slot, block) and counted in stats.
+MIRROR_CHECK = int(os.environ.get("FPR_KV_IDX_MIRROR_CHECK", "0") or 0)
+
+
+class IdxMirror:
+    """One rank's index-key mirror (see MIRROR_SLOTS)."""
+
+    def __init__(self, pool, PB: int, PO: dict, RPP: dict, dbt: torch.Tensor, layout: dict, log=print):
+        import numpy as np
+        import idx2f as X
+        srcs = sorted(RPP)
+        self.ib = min(PO[f"idx{s}"] for s in srcs)
+        self.span = span = max(PO[f"idx{s}"] + layout[f"idx{s}"] for s in srcs) - self.ib
+        assert span == sum(layout[f"idx{s}"] for s in srcs) and span % 16 == 0 and self.ib % 16 == 0, (self.ib, span)
+        assert int(getattr(pool, "n_hbm_pages", pool.n_paged)) < pool.n_paged, "FPR_KV_IDX_MIRROR: tiered pools only"
+        if hasattr(pool, "idxmirror"):   # the worker's (inside its budget; None = no mirror on this rank)
+            buf = pool.idxmirror
+            assert buf is not None, "FPR_KV_IDX_MIRROR: the worker allocated no mirror (pure host pools?)"
+        else:   # tests / an older worker.py: from what is free after the pools
+            buf = torch.empty(MIRROR_SLOTS * span, dtype=torch.uint8, device=pool.paged.device)
+        self.M = M = buf.numel() // span
+        self.mir = buf[:M * span].view(M, span)
+        self.pool_span = torch.as_strided(pool.paged, (pool.n_paged, span), (PB, 1), self.ib)
+        self.kv = {s: torch.as_strided(buf, (M, RPP[s], 1, 132), (span, 132, 132, 1), PO[f"idx{s}"] - self.ib) for s in srcs}
+        self.kvs = {s: torch.as_strided(buf, (M, RPP[s], 132), (span, 132, 1), PO[f"idx{s}"] - self.ib) for s in srcs}
+        self.mdbt = torch.zeros_like(dbt)                     # dbt with the mapped entries = mirror slot | MIRROR_BIT
+        self.dbt = dbt
+        self.wm = torch.zeros(dbt.shape[0], dtype=torch.int32, device=dbt.device)
+        self.n_hbm = int(pool.n_hbm_pages)
+        self.slot = np.full(tuple(dbt.shape), -1, np.int32)  # host: mirror slot per (state slot, block)
+        self.page = np.full(tuple(dbt.shape), -1, np.int32)  # host: the pool page the device table holds there
+        self.free = list(range(M - 1, -1, -1))
+        self.bit = X.MIRROR_BIT
+        self.ext = X.ext_mirror()
+        self.stats = dict(deltas=0, mapped=0, full=0, resets=0, reclaimed=0)
+        self.log = log
+        self.step = 0
+        self.seen = np.full(dbt.shape[0], -(1 << 30), np.int64)   # host: last decode step a state slot ran in a bucket
+        self.nmap = np.zeros(dbt.shape[0], np.int64)             # host: mapped blocks per state slot
+        log(f"idx mirror: {M:,} slots x {span:,} B = {M * span / 1e9:.2f} GB on {buf.device} (host-tier pages from "
+            f"{self.n_hbm:,}; per-page select in idx2f_fcand8m / fcandm)")
+
+    def touch(self, sslots) -> None:
+        """A decode step's state slots (host, at upload): the reclamation's recency."""
+        self.step += 1
+        self.seen[sslots] = self.step
+        if MIRROR_CHECK and self.step % MIRROR_CHECK == 0:
+            self.check()
+
+    def check(self) -> bool:
+        """FPR_KV_IDX_MIRROR_CHECK (debug): the host map vs dbt / mdbt, and the fresh mirror bytes vs the pool (MIRROR_CHECK
+        above); on the current stream, synchronizing. True = consistent."""
+        import numpy as np
+        dev = self.mdbt.device
+        st, bl = np.nonzero(self.page >= 0)
+        self.stats["checks"] = self.stats.get("checks", 0) + 1
+        if not len(st):
+            return True
+        sd = torch.from_numpy(st.astype(np.int64)).to(dev)
+        bd = torch.from_numpy(bl.astype(np.int64)).to(dev)
+        pg = torch.from_numpy(self.page[st, bl]).to(dev)
+        sl = torch.from_numpy(self.slot[st, bl]).to(dev)
+        d_ = self.dbt[sd, bd]
+        m_ = self.mdbt[sd, bd]
+        mapped = sl >= 0
+        bad_d = d_ != pg
+        bad_m = torch.where(mapped, m_ != (sl | self.bit), m_ != d_)
+        fresh = (mapped & ((bd + 1) * 64 <= self.wm.index_select(0, sd).long())).nonzero().flatten()
+        bad_c = torch.zeros(len(st), dtype=torch.bool, device=dev)
+        for i in range(0, fresh.numel(), 2048):
+            c = fresh[i:i + 2048]
+            a = self.pool_span.index_select(0, d_.index_select(0, c).long())
+            b = self.mir.index_select(0, sl.index_select(0, c).long())
+            bad_c.index_fill_(0, c[(a != b).any(1)], True)
+        n = [int(x.sum()) for x in (bad_d, bad_m, bad_c)]
+        if any(n):
+            self.stats["check_bad"] = self.stats.get("check_bad", 0) + 1
+            ex = {k: [(int(st[j]), int(bl[j])) for j in x.nonzero().flatten()[:5].tolist()]
+                  for k, x in (("dbt!=map", bad_d), ("mdbt", bad_m), ("bytes", bad_c))}
+            self.log(f"idx mirror CHECK FAIL {dev} step {self.step}: {len(st):,} entries ({int(mapped.sum()):,} mapped, "
+                     f"{fresh.numel():,} fresh pages compared): dbt != map {n[0]}, mdbt wrong {n[1]}, stale bytes {n[2]}; "
+                     f"first (slot, block): {ex}")
+            return False
+        if self.stats["checks"] % 50 == 1:
+            self.log(f"idx mirror check {dev} step {self.step}: OK ({len(st):,} entries, {int(mapped.sum()):,} mapped, "
+                     f"{fresh.numel():,} fresh pages compared)")
+        return True
+
+    def _reclaim(self, need: int) -> None:
+        """Free mirror slots of state slots not seen in a decode bucket for 2+ steps (their sequences finished, wait or
+        prefill: the delta stream never says), oldest first, until `need` are free; their device entries go back to the
+        pool page ids (a sequence that decodes again reads the pool until new deltas map it), on the current stream."""
+        import numpy as np
+        cand = np.nonzero((self.nmap > 0) & (self.seen < self.step - 1))[0]
+        if not len(cand):
+            return
+        rows_, cols_ = [], []
+        for st in cand[np.argsort(self.seen[cand])].tolist():
+            m = self.slot[st] >= 0
+            js = np.nonzero(m)[0]
+            self.free.extend(self.slot[st, js].tolist())
+            self.slot[st, js] = -1
+            self.nmap[st] = 0
+            rows_.append(np.full(len(js), st, np.int64))
+            cols_.append(js.astype(np.int64))
+            self.stats["reclaimed"] += len(js)
+            if len(self.free) >= need:
+                break
+        r_, c_ = np.concatenate(rows_), np.concatenate(cols_)
+        dev = self.mdbt.device
+        pin = lambda a: torch.from_numpy(np.ascontiguousarray(a)).pin_memory().to(dev, non_blocking=True)  # noqa: E731
+        self.mdbt.index_put_((pin(r_), pin(c_)), pin(self.page[r_, c_].astype(np.int32)))
+
+    def reset(self) -> None:
+        import numpy as np
+        self.nmap[:] = 0
+        self.seen[:] = -(1 << 30)
+        self.mdbt.zero_()
+        self.wm.zero_()
+        self.slot.fill(-1)
+        self.page.fill(-1)
+        self.free = list(range(self.M - 1, -1, -1))
+
+    def deltas(self, rows, cols, pages, upd_slot, upd_start) -> None:
+        """Block-table deltas (rows = state slots, cols = blocks, pages = pool pages; numpy) on the current stream.
+        a new incarnation in a slot always starts with a block-0 delta
+        (possibly 0 long); several builders (tb, tb_tail, D13's fallback) re-send identical pages; pages never change
+        mid-table for a running sequence without a new incarnation; a page's tier is fixed while a sequence holds it.
+        Hence: appended / re-sent entries with the SAME page at the same (slot, block) are no-ops (no free + refill, no wm
+        change); a block-0 delta = a possibly new incarnation: wm = 0 (every mapped page refreshed before it is read: a
+        freed page id can return at the same block with other bytes), the slot keeps its mirror slots for unchanged page ids
+        and frees everything past the new table's end."""
+        import numpy as np
+        if not len(rows) and not len(upd_slot):
+            return
+        rows = np.asarray(rows, np.int64)
+        cols = np.asarray(cols, np.int64)
+        pages = np.asarray(pages, np.int32)
+        self.stats["deltas"] += 1
+        wmv = {}
+        sl0 = np.asarray(upd_slot, np.int64)
+        a0 = np.asarray(upd_start, np.int64)
+        for st in np.unique(sl0[a0 == 0]).tolist():   # new incarnations: everything past the new table's end goes
+            cs_ = cols[rows == st]
+            nb = int(cs_.max()) + 1 if len(cs_) else 0   # the new table's length (all of this call's entries of st)
+            old = self.slot[st, nb:]
+            m = old >= 0
+            if m.any():
+                self.free.extend(old[m].tolist())
+                old[m] = -1
+                self.nmap[st] -= int(m.sum())
+            self.page[st, nb:] = -1
+            wmv[st] = 0
+            self.stats["resets"] += 1
+        same = self.page[rows, cols] == pages
+        ch = ~same
+        if ch.any():
+            r_, c_, p_ = rows[ch], cols[ch], pages[ch]
+            old = self.slot[r_, c_]
+            m = old >= 0
+            if m.any():
+                self.free.extend(old[m].tolist())
+                self.slot[r_[m], c_[m]] = -1
+                np.subtract.at(self.nmap, r_[m], 1)
+            self.page[r_, c_] = p_
+            for st, c in zip(r_.tolist(), c_.tolist()):
+                wmv[st] = min(wmv.get(st, 1 << 30), 64 * c)
+            host = np.nonzero(p_ >= self.n_hbm)[0]
+            if len(host) > len(self.free):
+                self._reclaim(len(host))
+            k = min(len(host), len(self.free))
+            if k:
+                hi = host[:k]
+                sl = np.asarray(self.free[len(self.free) - k:][::-1], np.int32)
+                del self.free[len(self.free) - k:]
+                self.slot[r_[hi], c_[hi]] = sl
+                np.add.at(self.nmap, r_[hi], 1)
+                self.stats["mapped"] += k
+            self.stats["full"] += len(host) - k
+        if not ch.any() and not wmv:
+            return
+        dev = self.mdbt.device
+        pin = lambda a: torch.from_numpy(np.ascontiguousarray(a)).pin_memory().to(dev, non_blocking=True)  # noqa: E731
+        if ch.any():   # mdbt = the encoded entries of the changed blocks
+            sl_ = self.slot[r_, c_]
+            vals = np.where(sl_ >= 0, sl_ | self.bit, p_).astype(np.int32)
+            self.mdbt.index_put_((pin(r_), pin(c_)), pin(vals))
+        if self.stats["deltas"] % 500 == 1:   # (occupancy, so a run shows the mirror engaged)
+            self.log(f"idx mirror {dev}: {self.M - len(self.free):,} / {self.M:,} slots in use; {self.stats}")
+        if not wmv:
+            return
+        st = np.fromiter(wmv.keys(), np.int64, len(wmv))
+        lo = np.fromiter(wmv.values(), np.int32, len(wmv))
+        sd = pin(st)
+        self.wm.index_copy_(0, sd, torch.minimum(self.wm.index_select(0, sd), pin(lo)))
 
 
 def _up_fields(R: int, B: int):
@@ -124,6 +343,52 @@ def build_idx_weights(L: int):
     W.pop("f32", None)
     W.pop("cos_sin", None)
     return W
+
+
+_GTV: list = []   # [GtView class], defined at the first view (tables2f is imported lazily)
+
+
+def _gt_view(core, s: dict):
+    """ENG_IDX_ONEBK_SHARE: the tables2f.GeneralTables of view state s over the onebk core's buffers (Idx2f._general_tables)."""
+    if not _GTV:
+        import tables2f as T2
+
+        class GtView(T2.GeneralTables):
+            """A GeneralTables that allocates nothing: the core's tensors, with the row-led ones ([R] / [R + 2] / [R, 512])
+            as the view's R-row prefixes, the view's own pos (the engine's per-view s["pos"]) and its own registration
+            (idx2f_tab.create: host pointers; R = pos.numel()). The pseudo-request tables ([IRc]), the block-table rows
+            ([Bc, P_MAX]) and the lean OwnedIndexer are the core's (rows_view(B) per step, as for a plain bucket)."""
+
+            def __init__(self, core, s):     # no GeneralTables.__init__: nothing is allocated
+                self._core, self._s = core, s
+                self._bind()
+
+            def _bind(self) -> None:
+                core, s = self._core, self._s
+                R, pos = int(s["R"]), s["pos"]
+                assert R <= core.R and pos.numel() == R and pos.dtype == torch.int64 and pos.is_contiguous(), \
+                    ("onebk GtView", R, core.R, tuple(pos.shape), pos.dtype)
+                for k, val in core.__dict__.items():
+                    if not k.startswith("_"):
+                        setattr(self, k, val)
+                self.R, self.pos = R, pos
+                self.lat = core.lat[:R]
+                self.cs = {c: core.cs[c][:R] for c in (1, 2)}
+                self.rs, self.t2r, self.vir, self.vrow = core.rs[:R], core.t2r[:R], core.vir[:R], core.vrow[:R]
+                self.row2ir_d, self.qsl = core.row2ir_d[:R], core.qsl[:R + 2]
+                t = [self.pos, self.dbt, self.sl[1], self.sl[2], self.cs[1], self.cs[2], self.rs, self.valid_ir,
+                     self.t2r, self.qsl, self.ir2row_c, self.vir, self.vrow, self.row2ir_d, self.nb_lens, self.bt]
+                self.hid = self.stage.E.create(t, 1)   # idx2f_tab.create: one ~180-B host Handle (pointers) in a
+                # process-global vector, no device memory and no CUDA object, and no destroy entry: a rebind (core growth
+                # or re-carve) leaves the old one unused, as GeneralTables._alloc's own growth does
+                self._keep, self._core_bt = t, core.bt
+
+            def _alloc(self, Bc: int) -> None:   # GeneralTables.upload with B > Bc: grow the SHARED set, then rebind
+                self._core._alloc(Bc)
+                self._bind()
+
+        _GTV.append(GtView)
+    return _GTV[0](core, s)
 
 
 class Idx2f:
@@ -242,6 +507,7 @@ class Idx2f:
             rows = q.shape[0] * q.shape[1]
             need = rows * int(width)
             if out is not None or kw or not getattr(X, "_eng_ws_on", True) or torch.cuda.is_current_stream_capturing() or \
+                    getattr(ck, "kvm", None) is not None or \
                     getattr(X.OwnedIndexer, "keep_logits", False) is True:
                 return orig(q, ck, weights, seq_lens, width, **({"out": out} if out is not None else {}), **kw)
             dev = q.device.index
@@ -273,6 +539,49 @@ class Idx2f:
             # serve D12: persistent per-state-slot block table, updated from the tables' deltas every step
             v["dbt"] = torch.zeros(p.n_state, P_MAX, dtype=torch.int32, device=p.paged.device)
             self.views.append(v)
+        self.mir = []
+        if MIRROR_SLOTS > 0:
+            from geometry import PAGE_LAYOUT
+            if all(hasattr(p, "idxmirror") and p.idxmirror is None for p in pools):
+                getattr(self.eng, "log", print)("idx mirror: FPR_KV_IDX_MIRROR set but the worker allocated none "
+                                                "(pure host / untiered pools): off")
+            else:
+                for r, p in enumerate(pools):
+                    with torch.cuda.device(p.paged.device):
+                        self.mir.append(IdxMirror(p, self.PB, self.PO, self.RPP, self.views[r]["dbt"], PAGE_LAYOUT,
+                                                  getattr(self.eng, "log", print)))
+
+    def mirror_deltas(self, r: int, rows, cols, pages, upd_slot, upd_start) -> None:
+        """Lever (a): the step's block-table deltas of rank r (numpy) into its mirror map (current stream)."""
+        if getattr(self, "mir", None):
+            self.mir[r].deltas(rows, cols, pages, upd_slot, upd_start)
+
+    def mirror_reset(self) -> None:
+        for m in getattr(self, "mir", None) or []:
+            m.reset()
+
+    def _mirror_seq_deltas(self, r: int, tab) -> None:
+        """Lever (a): a RankTables' block-table deltas (seq bt_upd_*) into the mirror map, for the paths that apply them to
+        dbt without apply_deltas: tables2f.GeneralTables (mixed steps' device tables) and _upload_v2's blob. Without it a
+        sequence admitted by a mixed step decodes through a stale (or zero) mirror table."""
+        if not getattr(self, "mir", None) or tab is None or not tab.n:
+            return
+        sq = getattr(tab, "seq", None) or {}
+        if "bt_upd_seq" not in sq:
+            return
+        import numpy as np
+        ks, s0, ln = sq["bt_upd_seq"].tolist(), sq["bt_upd_start"].tolist(), sq["bt_upd_len"].tolist()
+        if not ks:
+            return
+        slots = sq["state_slot"]
+        us = [int(slots[k]) for k in ks]
+        nu = int(sum(ln))
+        if not nu:   # zero-length block-0 deltas: resets
+            self.mirror_deltas(r, np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0, np.int32), us, s0)
+            return
+        rows = np.repeat(np.asarray(us, np.int64), ln)
+        cols = np.concatenate([np.arange(a_, a_ + n_, dtype=np.int64) for a_, n_ in zip(s0, ln)])
+        self.mirror_deltas(r, rows, cols, sq["bt_upd_pages"].numpy()[:nu].astype(np.int32), us, s0)
 
     def apply_deltas(self, r: int, tab) -> bool:
         """RankTables block-table deltas (seq bt_upd_*) -> the rank's device table. False: tables without deltas."""
@@ -287,9 +596,13 @@ class Idx2f:
             return IDLE_DEV_BT
         ks, s0, ln = sq["bt_upd_seq"].tolist(), sq["bt_upd_start"].tolist(), sq["bt_upd_len"].tolist()
         pages = sq["bt_upd_pages"]
+        slots = sq["state_slot"]
+        if getattr(self, "mir", None) and ks and not sum(ln):   # lever (a): zero-length block-0 deltas reset the mirror too
+            import numpy as np
+            self.mirror_deltas(r, np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0, np.int32),
+                               [int(slots[k]) for k in ks], s0)
         if not ks or not sum(ln):
             return True
-        slots = sq["state_slot"]
         rows, cols = [], []
         for k, a_, n_ in zip(ks, s0, ln):
             rows += [int(slots[k])] * n_
@@ -298,6 +611,8 @@ class Idx2f:
         dev = dbt.device
         dbt.index_put_((torch.tensor(rows).to(dev, non_blocking=True), torch.tensor(cols).to(dev, non_blocking=True)),
                        pages.to(torch.int32).pin_memory().to(dev, non_blocking=True))
+        if getattr(self, "mir", None):
+            self.mirror_deltas(r, rows, cols, pages.to(torch.int32).numpy(), [int(slots[k]) for k in ks], s0)
         return True
 
     # ---- per bucket device state
@@ -326,7 +641,14 @@ class Idx2f:
                          seq_lens={c: torch.zeros(B, 4, dtype=i32, device=dev) for c in (1, 2)},
                          cslot={c: torch.full((R,), -1, dtype=i64, device=dev) for c in (1, 2)},
                          rslot=torch.full((R,), -1, dtype=i64, device=dev))
-            ks = {L: X.CompactK(self.views[r][f"idx{L}"], d["bt"], self.RPP[L]) for L in KV_SOURCES}
+            mir = self.mir[r] if getattr(self, "mir", None) and not s.get("lvl", 0) else None
+            if mir is not None:   # lever (a): the indexer reads the encoded table d["mbt"] (FlashMLA keeps d["bt"])
+                d["mir"] = mir
+                d["mbt"] = torch.zeros(B, P_MAX, dtype=i32, device=dev)
+                d["mcs"] = {c: torch.full((R,), -1, dtype=i64, device=dev) for c in (1, 2)}
+                ks = {L: X.CompactK(self.views[r][f"idx{L}"], d["mbt"], self.RPP[L], mir.kv[L]) for L in KV_SOURCES}
+            else:
+                ks = {L: X.CompactK(self.views[r][f"idx{L}"], d["bt"], self.RPP[L]) for L in KV_SOURCES}
             oi = X.OwnedIndexer(ks, B, dev, mode=self.mode)
             if self.logits_impl == "idx2f":
                 oi.dense_impl = "idx2f"
@@ -420,6 +742,8 @@ class Idx2f:
         valid[:n] = True
         pslot = np.full(B, self.views[r]["dbt"].shape[0] - 1, i64)
         pslot[:S] = sslot
+        if d.get("mir") is not None:   # lever (a): reclamation recency
+            d["mir"].touch(sslot)
         ups = [(sl1, d["seq_lens"][1]), (sl2, d["seq_lens"][2]), (cs1, d["cslot"][1]), (cs2, d["cslot"][2]), (rs, d["rslot"]),
                (valid, d["valid"]), (pslot, d["preq_slot"])]
         if not d["dev_bt"]:                      # tests without deltas: the full table on the host
@@ -432,6 +756,8 @@ class Idx2f:
             t.copy_(torch.from_numpy(h).pin_memory(), non_blocking=True)
         d["global_rows"] = sum(x.n_rows for x in self.eng._batches) if getattr(self.eng, "_batches", None) else n
         d["max_seq_len"] = d.get("bound", MAX_CTX)
+        if LONG_ANY_ROWS and d["max_seq_len"] > MAX_CTX:   # long variants always on the persistent top-k
+            d["global_rows"] = max(d["global_rows"], 65)
 
     def _upload_v2(self, r: int, s: dict, sb, tab=None) -> None:
         """upload() with the same device result: every per-step array (and the block-table deltas, up to NU_MAX entries)
@@ -476,6 +802,8 @@ class Idx2f:
                     big = (rows, cols, pages)
                     nu = 0
         d["dev_bt"] = dev_bt
+        if dev_bt and tab is not None and tab.n:
+            self._mirror_seq_deltas(r, tab)  # lever (a): the blob's deltas (not apply_deltas) into the mirror map
         cap = d.get("dev_bt_captured")
         if cap is not None and cap != d["dev_bt"]:
             raise RuntimeError(f"idx2f hook rank {r}: decode graph captured with dev_bt={cap}, step has dev_bt={d['dev_bt']}")
@@ -500,6 +828,8 @@ class Idx2f:
         cs2[:n] = np.where(okp, pg * 32 + off // 2, -1)
         rs[:] = -1
         rs[:n] = np.repeat(sslot, 4) * 8 + pos % 8
+        if d.get("mir") is not None:   # lever (a): reclamation recency
+            d["mir"].touch(sslot)
         v["valid"][:] = False
         v["valid"][:n] = True
         v["pslot"][:] = self.views[r]["dbt"].shape[0] - 1
@@ -525,6 +855,8 @@ class Idx2f:
             d["bt"].copy_(torch.from_numpy(bt).pin_memory(), non_blocking=True)
         d["global_rows"] = sum(x.n_rows for x in self.eng._batches) if getattr(self.eng, "_batches", None) else n
         d["max_seq_len"] = d.get("bound", MAX_CTX)
+        if LONG_ANY_ROWS and d["max_seq_len"] > MAX_CTX:   # long variants always on the persistent top-k
+            d["global_rows"] = max(d["global_rows"], 65)
 
     def upload_d13(self, r: int, s: dict, sb) -> None:
         """D13 async decode: the host-known part of upload() (sequence slots, valid rows, the per-row state-slot base of
@@ -553,6 +885,8 @@ class Idx2f:
             ev.synchronize()
         v = d["up_hv"][i]
         sslot = np.asarray([se.state_slot for se in sb.seqs], dtype=np.int64)
+        if d.get("mir") is not None:   # lever (a): reclamation recency
+            d["mir"].touch(sslot)
         v["valid"][:] = False
         v["valid"][:n] = True
         v["pslot"][:] = self.views[r]["dbt"].shape[0] - 1
@@ -566,6 +900,19 @@ class Idx2f:
         d["up_i"] = i ^ 1
         d["global_rows"] = sum(x.n_rows for x in self.eng._batches) if getattr(self.eng, "_batches", None) else n
         d["max_seq_len"] = d.get("bound", MAX_CTX)
+        if LONG_ANY_ROWS and d["max_seq_len"] > MAX_CTX:   # long variants always on the persistent top-k
+            d["global_rows"] = max(d["global_rows"], 65)
+
+    def upload_d13_host(self, r: int, s: dict, sb) -> None:
+        """ENG_D13_EMPTY (d13.py): the host-side state upload_d13 sets, for a rank whose device inputs are left as the
+        previous empty step wrote them (no sequences: the blob would be the same)."""
+        self._set_logits()
+        d = s["idx"]
+        d["dev_bt"] = True
+        d["global_rows"] = sum(x.n_rows for x in self.eng._batches) if getattr(self.eng, "_batches", None) else sb.n_rows
+        d["max_seq_len"] = d.get("bound", MAX_CTX)
+        if LONG_ANY_ROWS and d["max_seq_len"] > MAX_CTX:
+            d["global_rows"] = max(d["global_rows"], 65)
 
     def device_tables_d13(self, r: int, s: dict, paged: torch.Tensor) -> None:
         """D13: upload()'s position-derived tables on the device from rowexp's pos / paged slots (same values as the
@@ -600,23 +947,78 @@ class Idx2f:
         self._set_logits()
         if self.tables == "host" or tab is None:
             return self._upload_general_host(r, s, sb, tab)
-        gt = s.get("idx_gt")
-        if gt is None:
-            import tables2f as T2
-            v = self.views[r]
-            gt = s["idx_gt"] = T2.GeneralTables(s["dev"], s["R"], s["pos"], v["dbt"],
-                                                {L: v[f"idx{L}"] for L in KV_SOURCES}, self.RPP, self.mode,
-                                                "idx2f" if self.logits_impl == "idx2f" else "deepgemm")
+        gt, core = self._general_tables(r, s)
+        bt0 = core.bt if core is not None else None
         grows = sum(x.n_rows for x in self.eng._batches) if getattr(self.eng, "_batches", None) else sb.n_rows
         d = gt.upload(tab, grows, None)     # eager: rows > 262,144 positions take idx2f's stock fallback
+        if core is not None and core.bt is not bt0:   # the shared set grew (B > its Bc): the family's stale tables go
+            self._onebk_sweep(r, core, s)
         if d is None:                       # tables without D12 deltas or rows out of sequence order: host path
             self.checked["fallback"] += 1
             return self._upload_general_host(r, s, sb, tab)
+        self._mirror_seq_deltas(r, tab)     # lever (a): GeneralTables applied the deltas to dbt; the mirror map follows
         if self.tables == "device":
             s["idx"] = d
             return
         self._upload_general_host(r, s, sb, tab)
         self._compare(s["idx"], d, sb.n_rows)
+
+    def _new_gt(self, r: int, s: dict):
+        import tables2f as T2
+        v = self.views[r]
+        return T2.GeneralTables(s["dev"], s["R"], s["pos"], v["dbt"], {L: v[f"idx{L}"] for L in KV_SOURCES}, self.RPP,
+                                self.mode, "idx2f" if self.logits_impl == "idx2f" else "deepgemm")
+
+    def _onebk_base(self, r: int, s: dict):
+        """ENG_MIX_ONE_BUCKET (with ENG_IDX_ONEBK_SHARE): rank r's pinned base state of the view family s belongs to (the
+        view's base, A or T: s a cached view in eng.bk_view, or the base itself), else None (plain buckets, the flag off).
+        Role-agnostic on purpose: A and T families have different bases, hence different shared sets."""
+        bv = getattr(self.eng, "bk_view", None) if ONEBK_SHARE else None
+        if not bv:
+            return None
+        for base, st in bv.values():
+            if st[r] is s or base[r] is s:
+                return base[r]
+        return None
+
+    def _general_tables(self, r: int, s: dict):
+        """(the state's GeneralTables, the onebk core or None). Plain states: their own, created at first use (as before).
+        onebk family: the base's own GeneralTables is the core (sized for the base's R, grown by tables2f as for any
+        bucket); each view gets a GtView over it, rebuilt when the core's buffers were replaced (growth) or the base
+        re-carved."""
+        base = self._onebk_base(r, s)
+        gt = s.get("idx_gt")
+        if base is None:
+            if gt is None:
+                gt = s["idx_gt"] = self._new_gt(r, s)
+            return gt, None
+        core = base.get("idx_gt")
+        if core is None:
+            core = base["idx_gt"] = self._new_gt(r, base)
+        if base is s:
+            return core, core
+        if gt is None or getattr(gt, "_core", None) is not core or gt._core_bt is not core.bt:
+            gt = s["idx_gt"] = _gt_view(core, s)
+            if not getattr(self, "_onebk_logged", False):
+                self._onebk_logged = True
+                getattr(self.eng, "log", print)(f"hooks_idx: ENG_IDX_ONEBK_SHARE: onebk views share their base bucket's "
+                                                f"GeneralTables (base A or T; first: core R={core.R}, Bc={core.Bc}, view "
+                                                f"R={s['R']})")
+        return gt, core
+
+    def _onebk_sweep(self, r: int, core, keep: dict) -> None:
+        """After the shared set grew: the other members' tables (and their last finished step's indexer state) still
+        reference the old buffers; drop them so the old storage is freed now (they are rebuilt at their next step)."""
+        for base, st in self.eng.bk_view.values():
+            for v in (st[r], base[r]):
+                if v is keep:
+                    continue
+                if v is base[r]:
+                    if v.get("idx_gt") is core:
+                        v.pop("idx", None)
+                elif getattr(v.get("idx_gt"), "_core", None) is core:
+                    v.pop("idx_gt", None)
+                    v.pop("idx", None)
 
     def _compare(self, h: dict, d: dict, n: int) -> None:
         """ENG_IDX_TABLES=check: the device tables == the host tables on every key the hook reads."""
@@ -766,6 +1168,8 @@ class Idx2f:
         dA, dT = sA["idx"], sT["idx"]
         if dA.get("idle") or dT.get("idle") or not tail_rows:
             return
+        if CARRY_ASC:     # the carried lists keep layer 20's order (stock select = score order): T's consumers must know it
+            dT["oi"].cand_ascending = bool(getattr(dA["oi"], "cand_ascending", True))
         if ix is not None and "row2ir_dev" in dA and "row2ir_dev" in dT:     # ENG_IDX_TABLES=device
             IR = int(dT["IR"])
             dev = sA["dev"]
@@ -879,6 +1283,18 @@ class Idx2f:
                 d["dev_bt_captured"] = bool(d.get("dev_bt"))     # upload() asserts every later step matches
             if d.get("dev_bt"):    # the step's block tables = the persistent per-slot table's rows (in the graph)
                 torch.index_select(v["dbt"], 0, d["preq_slot"], out=d["bt"])
+            mir = d.get("mir")
+            if mir is not None:   # lever (a): encoded table, refresh [wm, L) of each sequence, wm = L, mirror store slots
+                assert d.get("dev_bt"), "idx mirror: device block tables only (D12 / D13)"
+                torch.index_select(mir.mdbt, 0, d["preq_slot"], out=d["mbt"])
+                mir.ext.refresh(d["bt"], d["mbt"], d["preq_slot"], d["seq_lens"][1], mir.wm, mir.pool_span, mir.mir, 64)
+                mir.wm.index_copy_(0, d["preq_slot"], (d["seq_lens"][1][:, 0] - 1).clamp(min=0).to(torch.int32))
+                j = (pos // 64).clamp(0, P_MAX - 1)
+                e = d["mbt"].view(-1).index_select(0, d["t2r"].long() * P_MAX + j)
+                mapped = (e & mir.bit) != 0
+                ms = (e & (mir.bit - 1)).long()
+                d["mcs"][1].copy_(torch.where(mapped & (d["cslot"][1] >= 0), ms * 64 + pos % 64, -1))
+                d["mcs"][2].copy_(torch.where(mapped & (d["cslot"][2] >= 0), ms * 32 + (pos % 64) // 2, -1))
             for Ls in KV_SOURCES:
                 if Ls in self.eng.layers and self.logits_impl == "deepgemm":
                     oi.sched[Ls] = X.dg_schedule(d["seq_lens"][RATIO[Ls]], self.RPP[Ls])
@@ -903,6 +1319,9 @@ class Idx2f:
             rope_quant_insert(d["lat"], pos, W["cos_sin"], v[f"comp{L}"], cslot, ratio)
             kpre = F.linear(d["lat"], W["idx_wk"])
             indexer_k_norm_rope_store(kpre, pos, W["cos_sin"], W["idx_k_norm"], EPS, v[f"idxs{L}"], cslot, ratio, False)
+            if d.get("mir") is not None:   # lever (a): the same records into the mirror (mapped pages only)
+                indexer_k_norm_rope_store(kpre, pos, W["cos_sin"], W["idx_k_norm"], EPS, d["mir"].kvs[L], d["mcs"][ratio],
+                                          ratio, False)
         if side is not None:
             torch.mm(x, W["idx_wp"].t(), out=d["wbuf"])     # == F.linear(x, idx_wp) bitwise
             sctx.__exit__(None, None, None)

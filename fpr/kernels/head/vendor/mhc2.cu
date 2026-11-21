@@ -593,30 +593,46 @@ __global__ void __launch_bounds__(THR) k_mhc_finish(
 }
 }  // namespace mhc
 
+#include "head_mhc2_cabi.h"
+
 // y [R, D] bf16, rs [R, 4, D] bf16, post [R, 4] f32, comb [R, 4, 4] f32, lag [R, 4] f32, fn [24, 4D] f32, scale [3],
 // base [24], normw [D] f32 -> xn [R, 4, D] bf16, pre/post_n [R, 4], comb_n [R, 4, 4], out [R, D] bf16; part scratch
 // [20 * R * 25] f32.
 static bool g_attr = false;
+static int boundary_core(const FprHeadMhc2BoundaryArgs* p) {   // C ABI "head_mhc2.boundary": the launches of pybind boundary
+  try {
+    const int R = (int)p->R;
+    if (!MHC_ROWS_OK(R)) return FPR_E_SHAPE;
+    const cudaStream_t st = p->c.stream;
+    if (MHC_V2)
+      mhc::k_mhc_post_mix2<false><<<dim3(mhc::NCH / 2, (R + MHC_RPC - 1) / MHC_RPC), mhc::THR, 0, st>>>(
+          (const __nv_bfloat16*)p->y, (const __nv_bfloat16*)p->rs, p->post, p->comb, (const float2*)p->fn, R,
+          (__nv_bfloat16*)p->xn, p->part);
+    else
+      mhc::k_mhc_post_mix<<<mhc::NCH, mhc::THR, 0, st>>>(
+          (const __nv_bfloat16*)p->y, (const __nv_bfloat16*)p->rs, p->post, p->comb, (const float2*)p->fn, R,
+          (__nv_bfloat16*)p->xn, p->part);
+    if (cudaGetLastError() != cudaSuccess) return FPR_E_CUDA;
+    mhc::k_mhc_finish<0><<<R, mhc::THR, 0, st>>>(
+        p->part, (const __nv_bfloat16*)p->xn, p->lag, p->scale, p->base, p->normw, R, p->norm_eps, p->hc_eps,
+        (int)p->iters, p->pre_o, p->post_o, p->comb_o, (__nv_bfloat16*)p->out, mhc::Push{});
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void boundary(torch::Tensor y, torch::Tensor rs, torch::Tensor post, torch::Tensor comb, torch::Tensor lag,
               torch::Tensor fn, torch::Tensor scale, torch::Tensor base, torch::Tensor normw, double norm_eps,
               double hc_eps, int64_t iters, torch::Tensor xn, torch::Tensor pre_o, torch::Tensor post_o,
               torch::Tensor comb_o, torch::Tensor out, torch::Tensor part) {
   const int R = (int)y.size(0);
-  auto st = at::cuda::getCurrentCUDAStream();
   TORCH_CHECK(MHC_ROWS_OK(R), "mhc: rows per call (v1 K1a: <= 128)");
-  if (MHC_V2)
-    mhc::k_mhc_post_mix2<false><<<dim3(mhc::NCH / 2, (R + MHC_RPC - 1) / MHC_RPC), mhc::THR, 0, st>>>(
-        (const __nv_bfloat16*)y.data_ptr(), (const __nv_bfloat16*)rs.data_ptr(), post.data_ptr<float>(),
-        comb.data_ptr<float>(), (const float2*)fn.data_ptr(), R, (__nv_bfloat16*)xn.data_ptr(), part.data_ptr<float>());
-  else
-    mhc::k_mhc_post_mix<<<mhc::NCH, mhc::THR, 0, st>>>(
-        (const __nv_bfloat16*)y.data_ptr(), (const __nv_bfloat16*)rs.data_ptr(), post.data_ptr<float>(),
-        comb.data_ptr<float>(), (const float2*)fn.data_ptr(), R, (__nv_bfloat16*)xn.data_ptr(), part.data_ptr<float>());
-  mhc::k_mhc_finish<0><<<R, mhc::THR, 0, st>>>(
-      part.data_ptr<float>(), (const __nv_bfloat16*)xn.data_ptr(), lag.data_ptr<float>(), scale.data_ptr<float>(),
-      base.data_ptr<float>(), normw.data_ptr<float>(), R, (float)norm_eps, (float)hc_eps, (int)iters,
-      pre_o.data_ptr<float>(), post_o.data_ptr<float>(), comb_o.data_ptr<float>(), (__nv_bfloat16*)out.data_ptr(),
-      mhc::Push{});
+  FprHeadMhc2BoundaryArgs ca{{at::cuda::getCurrentCUDAStream(), (int)y.get_device(), 0}, y.data_ptr(), rs.data_ptr(),
+                             post.data_ptr<float>(), comb.data_ptr<float>(), lag.data_ptr<float>(), fn.data_ptr(),
+                             scale.data_ptr<float>(), base.data_ptr<float>(), normw.data_ptr<float>(), (float)norm_eps,
+                             (float)hc_eps, (int32_t)iters, xn.data_ptr(), pre_o.data_ptr<float>(), post_o.data_ptr<float>(),
+                             comb_o.data_ptr<float>(), out.data_ptr(), part.data_ptr<float>(), R};
+  TORCH_CHECK(boundary_core(&ca) == FPR_OK, "mhc boundary: CUDA launch error");
 }
 
 // boundary + the MoE prescale exponent of every output row (int32 [R]) from K1b (replaces msr::k_prescale for own rows)
@@ -671,71 +687,145 @@ void boundary_push(torch::Tensor y, torch::Tensor rs, torch::Tensor post, torch:
 
 // boundary2 with the RS-sum folded into K1a: y = bf16(sum of recv [4, R, D] slots in rank order, fp32) after
 // flag >= *epoch * signals (comm.cu's k_rs_sum fused; its output bits). ptok_o may be empty (no prescale exponent).
+static int boundary_rs_core(const FprHeadMhc2BoundaryRsArgs* p) {   // C ABI "head_mhc2.boundary_rs"
+  try {
+    const int R = (int)p->R;
+    if (!MHC_ROWS_OK(R)) return FPR_E_SHAPE;
+    const cudaStream_t st = p->c.stream;
+    mhc::Fold fo{(const __nv_bfloat16*)p->recv, (const unsigned*)p->flag, (const unsigned*)p->epoch, (unsigned)p->signals,
+                 (long long)p->recv_sstride};
+    mhc::k_mhc_post_mix2<true><<<dim3(mhc::NCH / 2, (R + MHC_RPC - 1) / MHC_RPC), mhc::THR, 0, st>>>(
+        nullptr, (const __nv_bfloat16*)p->rs, p->post, p->comb, (const float2*)p->fn, R, (__nv_bfloat16*)p->xn, p->part, fo);
+    if (cudaGetLastError() != cudaSuccess) return FPR_E_CUDA;
+    mhc::k_mhc_finish<0><<<R, mhc::THR, 0, st>>>(
+        p->part, (const __nv_bfloat16*)p->xn, p->lag, p->scale, p->base, p->normw, R, p->norm_eps, p->hc_eps,
+        (int)p->iters, p->pre_o, p->post_o, p->comb_o, (__nv_bfloat16*)p->out, mhc::Push{}, (int*)p->ptok_o);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void boundary_rs(torch::Tensor recv, torch::Tensor flag, torch::Tensor epoch, int64_t signals, torch::Tensor rs,
                  torch::Tensor post, torch::Tensor comb, torch::Tensor lag, torch::Tensor fn, torch::Tensor scale,
                  torch::Tensor base, torch::Tensor normw, double norm_eps, double hc_eps, int64_t iters, torch::Tensor xn,
                  torch::Tensor pre_o, torch::Tensor post_o, torch::Tensor comb_o, torch::Tensor out, torch::Tensor part,
                  torch::Tensor ptok_o) {
   const int R = (int)recv.size(1);
-  auto st = at::cuda::getCurrentCUDAStream();
   TORCH_CHECK(MHC_ROWS_OK(R) && recv.size(0) == 4 && recv.size(2) == mhc::D && recv.stride(2) == 1 && recv.stride(1) == mhc::D,
               "mhc boundary_rs: recv [4, R, D] (rows contiguous; a row-chunk view of [4, R_total, D] is fine)");
-  mhc::Fold fo{(const __nv_bfloat16*)recv.data_ptr(), (const unsigned*)flag.data_ptr(), (const unsigned*)epoch.data_ptr(),
-               (unsigned)signals, (long long)recv.stride(0)};
-  mhc::k_mhc_post_mix2<true><<<dim3(mhc::NCH / 2, (R + MHC_RPC - 1) / MHC_RPC), mhc::THR, 0, st>>>(
-      nullptr, (const __nv_bfloat16*)rs.data_ptr(), post.data_ptr<float>(), comb.data_ptr<float>(),
-      (const float2*)fn.data_ptr(), R, (__nv_bfloat16*)xn.data_ptr(), part.data_ptr<float>(), fo);
-  mhc::k_mhc_finish<0><<<R, mhc::THR, 0, st>>>(
-      part.data_ptr<float>(), (const __nv_bfloat16*)xn.data_ptr(), lag.data_ptr<float>(), scale.data_ptr<float>(),
-      base.data_ptr<float>(), normw.data_ptr<float>(), R, (float)norm_eps, (float)hc_eps, (int)iters,
-      pre_o.data_ptr<float>(), post_o.data_ptr<float>(), comb_o.data_ptr<float>(), (__nv_bfloat16*)out.data_ptr(),
-      mhc::Push{}, ptok_o.numel() ? ptok_o.data_ptr<int>() : nullptr);
+  FprHeadMhc2BoundaryRsArgs ca{{at::cuda::getCurrentCUDAStream(), (int)recv.get_device(), 0}, recv.data_ptr(),
+                               (int64_t)recv.stride(0), (const uint32_t*)flag.data_ptr(), (const uint32_t*)epoch.data_ptr(),
+                               (uint32_t)signals, rs.data_ptr(), post.data_ptr<float>(), comb.data_ptr<float>(),
+                               lag.data_ptr<float>(), fn.data_ptr(), scale.data_ptr<float>(), base.data_ptr<float>(),
+                               normw.data_ptr<float>(), (float)norm_eps, (float)hc_eps, (int32_t)iters, xn.data_ptr(),
+                               pre_o.data_ptr<float>(), post_o.data_ptr<float>(), comb_o.data_ptr<float>(), out.data_ptr(),
+                               part.data_ptr<float>(), ptok_o.numel() ? ptok_o.data_ptr<int>() : nullptr, R};
+  TORCH_CHECK(boundary_rs_core(&ca) == FPR_OK, "mhc boundary_rs: CUDA launch error");
 }
 
 // split boundary: k1a (optionally RS-folded), then k1b_out on the critical path and k1b_mix on any stream
 // after k1a (it reads only part). Together: the same outputs as boundary / boundary2 / boundary_rs, bit for bit.
+static int k1a_core(const FprHeadMhc2K1aArgs* p) {   // C ABI "head_mhc2.k1a"
+  try {
+    const int R = (int)p->R;
+    if (!MHC_ROWS_OK(R)) return FPR_E_SHAPE;
+    mhc::k_mhc_post_mix2<false><<<dim3(mhc::NCH / 2, (R + MHC_RPC - 1) / MHC_RPC), mhc::THR, 0, p->c.stream>>>(
+        (const __nv_bfloat16*)p->y, (const __nv_bfloat16*)p->rs, p->post, p->comb, (const float2*)p->fn, R,
+        (__nv_bfloat16*)p->xn, p->part);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void k1a(torch::Tensor y, torch::Tensor rs, torch::Tensor post, torch::Tensor comb, torch::Tensor fn, torch::Tensor xn,
          torch::Tensor part) {
   const int R = (int)y.size(0);
   TORCH_CHECK(MHC_ROWS_OK(R), "mhc k1a: rows per call");
-  mhc::k_mhc_post_mix2<false><<<dim3(mhc::NCH / 2, (R + MHC_RPC - 1) / MHC_RPC), mhc::THR, 0, at::cuda::getCurrentCUDAStream()>>>(
-      (const __nv_bfloat16*)y.data_ptr(), (const __nv_bfloat16*)rs.data_ptr(), post.data_ptr<float>(),
-      comb.data_ptr<float>(), (const float2*)fn.data_ptr(), R, (__nv_bfloat16*)xn.data_ptr(), part.data_ptr<float>());
+  FprHeadMhc2K1aArgs ca{{at::cuda::getCurrentCUDAStream(), (int)y.get_device(), 0}, y.data_ptr(), rs.data_ptr(),
+                        post.data_ptr<float>(), comb.data_ptr<float>(), fn.data_ptr(), xn.data_ptr(), part.data_ptr<float>(), R};
+  TORCH_CHECK(k1a_core(&ca) == FPR_OK, "mhc k1a: CUDA launch error");
+}
+static int k1a_rs_core(const FprHeadMhc2K1aRsArgs* p) {   // C ABI "head_mhc2.k1a_rs"
+  try {
+    const int R = (int)p->R;
+    if (!MHC_ROWS_OK(R)) return FPR_E_SHAPE;
+    mhc::Fold fo{(const __nv_bfloat16*)p->recv, (const unsigned*)p->flag, (const unsigned*)p->epoch, (unsigned)p->signals,
+                 (long long)p->recv_sstride};
+    mhc::k_mhc_post_mix2<true><<<dim3(mhc::NCH / 2, (R + MHC_RPC - 1) / MHC_RPC), mhc::THR, 0, p->c.stream>>>(
+        nullptr, (const __nv_bfloat16*)p->rs, p->post, p->comb, (const float2*)p->fn, R, (__nv_bfloat16*)p->xn, p->part, fo);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
 }
 void k1a_rs(torch::Tensor recv, torch::Tensor flag, torch::Tensor epoch, int64_t signals, torch::Tensor rs,
             torch::Tensor post, torch::Tensor comb, torch::Tensor fn, torch::Tensor xn, torch::Tensor part) {
   const int R = (int)recv.size(1);
   TORCH_CHECK(MHC_ROWS_OK(R) && recv.size(0) == 4 && recv.size(2) == mhc::D && recv.stride(2) == 1 && recv.stride(1) == mhc::D,
               "mhc k1a_rs: recv [4, R, D] (rows contiguous; a row-chunk view of [4, R_total, D] is fine)");
-  mhc::Fold fo{(const __nv_bfloat16*)recv.data_ptr(), (const unsigned*)flag.data_ptr(), (const unsigned*)epoch.data_ptr(),
-               (unsigned)signals, (long long)recv.stride(0)};
-  mhc::k_mhc_post_mix2<true><<<dim3(mhc::NCH / 2, (R + MHC_RPC - 1) / MHC_RPC), mhc::THR, 0, at::cuda::getCurrentCUDAStream()>>>(
-      nullptr, (const __nv_bfloat16*)rs.data_ptr(), post.data_ptr<float>(), comb.data_ptr<float>(),
-      (const float2*)fn.data_ptr(), R, (__nv_bfloat16*)xn.data_ptr(), part.data_ptr<float>(), fo);
+  FprHeadMhc2K1aRsArgs ca{{at::cuda::getCurrentCUDAStream(), (int)recv.get_device(), 0}, recv.data_ptr(),
+                          (int64_t)recv.stride(0), (const uint32_t*)flag.data_ptr(), (const uint32_t*)epoch.data_ptr(),
+                          (uint32_t)signals, rs.data_ptr(), post.data_ptr<float>(), comb.data_ptr<float>(), fn.data_ptr(),
+                          xn.data_ptr(), part.data_ptr<float>(), R};
+  TORCH_CHECK(k1a_rs_core(&ca) == FPR_OK, "mhc k1a_rs: CUDA launch error");
+}
+static int k1b_out_core(const FprMhcK1bOutArgs* p) {   // C ABI "head_mhc2.k1b_out": the launch of pybind k1b_out
+  try {
+    const int R = (int)p->R;
+    mhc::k_mhc_finish<1><<<R, mhc::THR, 0, p->c.stream>>>(
+        nullptr, (const __nv_bfloat16*)p->xn, const_cast<float*>(p->lag), nullptr, nullptr, const_cast<float*>(p->normw), R,
+        p->norm_eps, 0.f, 0, nullptr, nullptr, nullptr, (__nv_bfloat16*)p->out, mhc::Push{}, (int*)p->ptok_o);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
 }
 void k1b_out(torch::Tensor xn, torch::Tensor lag, torch::Tensor normw, double norm_eps, torch::Tensor out,
              torch::Tensor ptok_o) {
   const int R = (int)xn.size(0);
-  mhc::k_mhc_finish<1><<<R, mhc::THR, 0, at::cuda::getCurrentCUDAStream()>>>(
-      nullptr, (const __nv_bfloat16*)xn.data_ptr(), lag.data_ptr<float>(), nullptr, nullptr, normw.data_ptr<float>(), R,
-      (float)norm_eps, 0.f, 0, nullptr, nullptr, nullptr, (__nv_bfloat16*)out.data_ptr(), mhc::Push{},
-      ptok_o.numel() ? ptok_o.data_ptr<int>() : nullptr);
+  FprMhcK1bOutArgs ca{{at::cuda::getCurrentCUDAStream(), (int)xn.get_device(), 0}, xn.data_ptr(), lag.data_ptr<float>(),
+                      normw.data_ptr<float>(), (float)norm_eps, out.data_ptr(), ptok_o.numel() ? ptok_o.data_ptr<int>() : nullptr,
+                      R};
+  TORCH_CHECK(k1b_out_core(&ca) == FPR_OK, "mhc k1b_out: CUDA launch error");
+}
+static int k1b_mix_core(const FprHeadMhc2K1bMixArgs* p) {   // C ABI "head_mhc2.k1b_mix"
+  try {
+    const int R = (int)p->R;
+    mhc::k_mhc_finish<2><<<R, mhc::THR, 0, p->c.stream>>>(
+        p->part, nullptr, nullptr, p->scale, p->base, nullptr, R, p->norm_eps, p->hc_eps, (int)p->iters, p->pre_o,
+        p->post_o, p->comb_o, nullptr, mhc::Push{}, nullptr);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
 }
 void k1b_mix(torch::Tensor part, int64_t R, torch::Tensor scale, torch::Tensor base, double norm_eps, double hc_eps,
              int64_t iters, torch::Tensor pre_o, torch::Tensor post_o, torch::Tensor comb_o) {
-  mhc::k_mhc_finish<2><<<(int)R, mhc::THR, 0, at::cuda::getCurrentCUDAStream()>>>(
-      part.data_ptr<float>(), nullptr, nullptr, scale.data_ptr<float>(), base.data_ptr<float>(), nullptr, (int)R,
-      (float)norm_eps, (float)hc_eps, (int)iters, pre_o.data_ptr<float>(), post_o.data_ptr<float>(),
-      comb_o.data_ptr<float>(), nullptr, mhc::Push{}, nullptr);
+  FprHeadMhc2K1bMixArgs ca{{at::cuda::getCurrentCUDAStream(), (int)part.get_device(), 0}, part.data_ptr<float>(),
+                           scale.data_ptr<float>(), base.data_ptr<float>(), (float)norm_eps, (float)hc_eps, (int32_t)iters,
+                           pre_o.data_ptr<float>(), post_o.data_ptr<float>(), comb_o.data_ptr<float>(), (int32_t)R};
+  TORCH_CHECK(k1b_mix_core(&ca) == FPR_OK, "mhc k1b_mix: CUDA launch error");
 }
 
 // K1a split: k1a_x (phase 1, xn only; the critical path) + k1a_mix (part from xn; side stream) = k1a.
+static int k1a_x_core(const FprMhcK1aXArgs* p) {   // C ABI "head_mhc2.k1a_x"
+  try {
+    const int R = (int)p->R;
+    if (!MHC_ROWS_OK(R)) return FPR_E_SHAPE;
+    mhc::k_mhc_post_mix2<false, 1><<<dim3(mhc::NCH / 2, (R + MHC_RPC - 1) / MHC_RPC), mhc::THR, 0, p->c.stream>>>(
+        (const __nv_bfloat16*)p->y, (const __nv_bfloat16*)p->rs, const_cast<float*>(p->post), const_cast<float*>(p->comb),
+        nullptr, R, (__nv_bfloat16*)p->xn, nullptr);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void k1a_x(torch::Tensor y, torch::Tensor rs, torch::Tensor post, torch::Tensor comb, torch::Tensor xn) {
   const int R = (int)y.size(0);
   TORCH_CHECK(MHC_ROWS_OK(R), "mhc k1a_x: rows per call");
-  mhc::k_mhc_post_mix2<false, 1><<<dim3(mhc::NCH / 2, (R + MHC_RPC - 1) / MHC_RPC), mhc::THR, 0, at::cuda::getCurrentCUDAStream()>>>(
-      (const __nv_bfloat16*)y.data_ptr(), (const __nv_bfloat16*)rs.data_ptr(), post.data_ptr<float>(), comb.data_ptr<float>(),
-      nullptr, R, (__nv_bfloat16*)xn.data_ptr(), nullptr);
+  FprMhcK1aXArgs ca{{at::cuda::getCurrentCUDAStream(), (int)y.get_device(), 0}, y.data_ptr(), rs.data_ptr(), post.data_ptr<float>(),
+                    comb.data_ptr<float>(), xn.data_ptr(), R};
+  TORCH_CHECK(k1a_x_core(&ca) == FPR_OK, "mhc k1a_x: CUDA launch error");
 }
 void k1a_x_rs(torch::Tensor recv, torch::Tensor flag, torch::Tensor epoch, int64_t signals, torch::Tensor rs,
               torch::Tensor post, torch::Tensor comb, torch::Tensor xn) {
@@ -787,6 +877,36 @@ torch::Tensor prep_fn(torch::Tensor fn) {
     out.select(3, pidx).copy_(src.reshape({-1}).index({flat}));
   }
   return out;
+}
+
+// ---- C ABI (fpr_cabi.h): table. No init entry: no per-device state (no dynamic SMEM, no attributes; g_attr is unused).
+// prep_fn (load time, torch ops that allocate) and boundary2 / boundary_push / k1a_x_rs / k1a_mix stay pybind only.
+extern "C" {
+static int c_boundary(const void* a) { return boundary_core((const FprHeadMhc2BoundaryArgs*)a); }
+static int64_t c_boundary_ws(const void* a) {   // part: [160 chunks, R, 25] fp32
+  return (int64_t)mhc::NCH * mhc::NP * (int64_t)sizeof(float) * ((const FprHeadMhc2BoundaryArgs*)a)->R;
+}
+static int c_boundary_rs(const void* a) { return boundary_rs_core((const FprHeadMhc2BoundaryRsArgs*)a); }
+static int64_t c_boundary_rs_ws(const void* a) {
+  return (int64_t)mhc::NCH * mhc::NP * (int64_t)sizeof(float) * ((const FprHeadMhc2BoundaryRsArgs*)a)->R;
+}
+static int c_k1a(const void* a) { return k1a_core((const FprHeadMhc2K1aArgs*)a); }
+static int c_k1a_rs(const void* a) { return k1a_rs_core((const FprHeadMhc2K1aRsArgs*)a); }
+static int c_k1a_x(const void* a) { return k1a_x_core((const FprMhcK1aXArgs*)a); }
+static int c_k1b_out(const void* a) { return k1b_out_core((const FprMhcK1bOutArgs*)a); }
+static int c_k1b_mix(const void* a) { return k1b_mix_core((const FprHeadMhc2K1bMixArgs*)a); }
+static const FprFnEntry k_head_mhc2_fns[] = {
+    {"head_mhc2.boundary", c_boundary, c_boundary_ws, (int64_t)sizeof(FprHeadMhc2BoundaryArgs)},
+    {"head_mhc2.boundary_rs", c_boundary_rs, c_boundary_rs_ws, (int64_t)sizeof(FprHeadMhc2BoundaryRsArgs)},
+    {"head_mhc2.k1a", c_k1a, nullptr, (int64_t)sizeof(FprHeadMhc2K1aArgs)},
+    {"head_mhc2.k1a_rs", c_k1a_rs, nullptr, (int64_t)sizeof(FprHeadMhc2K1aRsArgs)},
+    {"head_mhc2.k1a_x", c_k1a_x, nullptr, (int64_t)sizeof(FprMhcK1aXArgs)},
+    {"head_mhc2.k1b_out", c_k1b_out, nullptr, (int64_t)sizeof(FprMhcK1bOutArgs)},
+    {"head_mhc2.k1b_mix", c_k1b_mix, nullptr, (int64_t)sizeof(FprHeadMhc2K1bMixArgs)},
+};
+static const FprExtTable k_head_mhc2_table = {FPR_CABI_VERSION, "head_mhc2", "3b745f641ef35d4cf1c3821dd5b03219", 7,
+                                              k_head_mhc2_fns};
+__attribute__((visibility("default"))) const FprExtTable* fpr_head_mhc2_table(void) { return &k_head_mhc2_table; }
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

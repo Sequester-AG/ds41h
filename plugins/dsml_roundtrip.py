@@ -1,6 +1,6 @@
-"""DeepSeek-V4.1 DeepSeek-API PARITY plugin for vLLM 0.32's serving path (v2.2).
+"""DeepSeek-V4.1 DeepSeek-API PARITY plugin for vLLM 0.32's serving path. v2.2.
 
-Load in the API server with  --tool-parser-plugin /path/to/dsml_roundtrip.py  (scripts/serve_ds41h.sh: DSML_RT=1, the default). Importing this file
+Load in the API server with  --tool-parser-plugin /path/to/dsml_roundtrip.py  (serve_cert.sh: DSML_RT=1). Importing this file
 patches vLLM classes; every parser patch is gated on the parser config name "deepseek_v41".
 
 v1 -- assistant-turn ROUND TRIP. The OFFICIAL DSv4.1 encoder (model/encoding/encoding.py) renders an assistant turn as
@@ -31,6 +31,14 @@ v2.1 -- PROMPT: the tools' "strict" field is not rendered into the DSv4.1 system
 v2.2 -- OPTION DSML_STRICT (env of the API server; default "vllm" = v2.1 behaviour): "api" sets every tool's strict to None
   before vLLM builds its structural tag -> no grammar-constrained tool calls for strict tools (the DeepSeek API documents strict
   as a beta-endpoint feature). Test hook: a request may carry "dsml_strict": "api" | "vllm" (extra body) to override per request.
+
+v2.3 -- NO-TOOLS REQUESTS: a request without tools never enters
+  tool-call parsing. Stock vLLM 0.32 lexes a DSML calls block the model writes anyway into tool states; the call's name is not a
+  request tool, so streaming returns None for the whole block (thousands of tokens: a silent stream, and the text never arrives
+  if the block does not close) and non-streaming drops the block from content. Now the engine runs with skip_tool_parsing for
+  such requests: the block is plain content, stream == non-stream. With tools, nothing changes.
+  KEEP-ALIVE: when the request asked for stream_options.continuous_usage_stats, a delta the parser holds back (None) becomes an
+  empty delta, so serving_chat still sends that token's usage chunk (a long tool-call parameter is buffered until its end tag).
 """
 
 from __future__ import annotations
@@ -43,6 +51,7 @@ import regex as re
 from vllm.entrypoints.generate.base.protocol import DeltaMessage
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.logger import init_logger
+from vllm.parser import abstract_parser as _ap
 from vllm.parser import deepseek_v4 as _dv4
 from vllm.parser.engine import parser_engine as _pe
 from vllm.parser.engine import streaming_parser_engine as _spe
@@ -185,6 +194,8 @@ if not getattr(_PE, "_dsml_rt_patched", False):
     _orig_compute_arg_delta = _PE._compute_arg_delta
     _orig_flush_arg_converter = _PE._flush_arg_converter
     _orig_convert_args = _dv4.DeepSeekV4Parser._convert_args
+    _orig_check_skip = _PE._check_skip_tool_parsing
+    _orig_dp_parse_delta = _ap.DelegatingParser.parse_delta
 
     # ---- v1: content delimiter + verbatim reasoning ------------------------------------------------------------------
     def __init__(self, *args, **kwargs):
@@ -289,6 +300,29 @@ if not getattr(_PE, "_dsml_rt_patched", False):
         slot.streamed_json += diff
         return diff
 
+    # ---- v2.3: no-tools requests never parse tool calls; usage keep-alive --------------------------------------------------
+    def _check_skip_tool_parsing(self, request):
+        if _is_v41(self) and not getattr(request, "tools", None) and not getattr(self, "_v41_notools", False):
+            self._v41_notools = True   # set once per parser (one parser per request / choice), before its first _feed
+            self.skip_tool_parsing = True
+        return _orig_check_skip(self, request)
+
+    def _dp_is_v41(self) -> bool:
+        for sub in (getattr(self, "_tool_parser", None), getattr(self, "_reasoning_parser", None)):
+            for o in (sub, getattr(sub, "_parser_engine", None)):
+                if o is not None and _is_v41(o):
+                    return True
+        return False
+
+    def _dp_parse_delta(self, delta_text, delta_token_ids, request, prompt_token_ids=None, *, finished):
+        # serving_chat's parser is a DelegatingParser around the engine parsers: the keep-alive lives here
+        r = _orig_dp_parse_delta(self, delta_text, delta_token_ids, request, prompt_token_ids, finished=finished)
+        if r is None and not finished and _dp_is_v41(self):
+            so = getattr(request, "stream_options", None)
+            if so is not None and getattr(so, "continuous_usage_stats", False):
+                return DeltaMessage()  # an empty delta: serving_chat sends the chunk (with its usage) instead of skipping it
+        return r
+
     # ---- v2: lexer -- an invoke / calls end tag inside an open parameter value is value text ----------------------------
     _orig_spe_reset = _SPE.reset
     _orig_spe_emit = _SPE._emit_for_state
@@ -374,6 +408,8 @@ if not getattr(_PE, "_dsml_rt_patched", False):
     _PE._compute_arg_delta = _compute_arg_delta
     _PE._flush_arg_converter = _flush_arg_converter
     _dv4.DeepSeekV4Parser._convert_args = _convert_args
+    _PE._check_skip_tool_parsing = _check_skip_tool_parsing
+    _ap.DelegatingParser.parse_delta = _dp_parse_delta
     _SPE.reset = _spe_reset
     _SPE._emit_for_state = _spe_emit_for_state
     _SPE._on_terminal = _spe_on_terminal
@@ -381,6 +417,7 @@ if not getattr(_PE, "_dsml_rt_patched", False):
     ChatCompletionRequest.build_chat_params = build_chat_params
     _dtok.encode_messages = _encode_messages_no_strict
     _PE._dsml_rt_patched = True
-    logger.info("dsml_roundtrip v2.2: DeepSeek-V4.1 API parity installed (round trip, official tool arguments, "
-                "reasoning_effort / thinking mapping, tools rendered without strict; DSML_STRICT=%s)",
+    logger.info("dsml_roundtrip v2.3: DeepSeek-V4.1 API parity installed (round trip, official tool arguments, "
+                "reasoning_effort / thinking mapping, tools rendered without strict, no-tools requests never parse tool "
+                "calls, usage keep-alive; DSML_STRICT=%s)",
                 os.environ.get("DSML_STRICT", "vllm"))

@@ -1,4 +1,4 @@
-"""Warm the fork endpoint's prefill paths right after /health. The first mixed step of a server process costs
+"""The first mixed step of a server process costs
 ~2.0-2.4 s more than the cost model (step 0 of a 192-sequence replay; a 1-user bench's TTFT 2.1-2.4 s against
 159-186 ms on its second run), and the first small mixed step ~0.15 s. The endpoint launcher sends these requests before
 it reports "warm-up done", and its `start` waits for that line, so the first real request gets the warm path.

@@ -11,6 +11,8 @@ PHYS_STEP_TIMES=<file.jsonl>   one JSON line per engine step, written when vLLM'
     rows / seqs / dec (decode sequences) / pf (prefill rows); worker (copies, tables, ctx, engine ms: serve's Worker);
     eng (Engine.stats["decode_last"]: the split decode step's own host split + GPU span from CUDA events, sync steps);
     d13 (StepHandle.t: prep, launch_l, wait_prev, pos_wait, head, host_total; ASYNC steps).
+PHYS_GC_TIMES=1 (with PHYS_STEP_TIMES): + gc_ms / gc_n (per generation) / gc_max, the EngineCore's Python GC pauses since
+    the previous step's start (gc.callbacks; default off).
 PHYS_PROFILE_DIR=<dir>         torch.profiler (CPU + CUDA) over N consecutive steps, started when <dir>/go exists (its
     content: N, default 40; the file is removed). Writes <dir>/prof_<step>.json (per device: GPU busy ms over the window,
     per step: wall and GPU busy per device; kernel categories via engine/profutil.py) and <dir>/trace_<step>.json.gz.
@@ -26,7 +28,34 @@ import time
 
 PATH = os.environ.get("PHYS_STEP_TIMES", "")
 PROF_DIR = os.environ.get("PHYS_PROFILE_DIR", "")
+GC_TIMES = os.environ.get("PHYS_GC_TIMES", "") == "1"    # with PHYS_STEP_TIMES: Python GC pauses per cycle (gc.callbacks)
 pc = time.perf_counter
+
+
+class _GC:
+    """PHYS_GC_TIMES=1: wall time of every collection of this process (gc.callbacks start / stop), per generation."""
+
+    def __init__(self):
+        import gc
+        self.t = None
+        self.ms = [0.0, 0.0, 0.0]
+        self.n = [0, 0, 0]
+        self.mx = 0.0
+        gc.callbacks.append(self._cb)
+
+    def _cb(self, phase, info):
+        if phase == "start":
+            self.t = pc()
+        elif self.t is not None:
+            dt = (pc() - self.t) * 1e3
+            g = int(info.get("generation", 0))
+            self.ms[g] += dt
+            self.n[g] += 1
+            self.mx = max(self.mx, dt)
+            self.t = None
+
+    def snap(self):
+        return (list(self.ms), list(self.n))
 
 
 class _Times:
@@ -37,11 +66,20 @@ class _Times:
         self.last_u1 = None
         self.n = 0
         self.t_flush = 0.0
+        self.gc = _GC() if GC_TIMES else None
+        self.gc_last = self.gc.snap() if self.gc else None
 
     def start(self, step: int, t: float) -> dict:
         r = self.recs[step] = {"step": step, "t": round(t, 6), "_t0": t}
         if self.last_u1 is not None:
             r["gap"] = round((t - self.last_u1) * 1e3, 3)
+        if self.gc is not None:                      # collections since the previous step's start (one engine-loop cycle)
+            (m0, n0), (m1, n1) = self.gc_last, self.gc.snap()
+            r["gc_ms"] = round(sum(m1) - sum(m0), 3)
+            r["gc_n"] = [b - a for a, b in zip(n0, n1)]
+            r["gc_max"] = round(self.gc.mx, 3)
+            self.gc.mx = 0.0
+            self.gc_last = (m1, n1)
         return r
 
     def get(self, step: int):

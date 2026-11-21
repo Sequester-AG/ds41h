@@ -476,10 +476,13 @@ __global__ void __launch_bounds__(F_THREADS) k_one(const int* __restrict__ ids, 
 }  // namespace msr2
 
 // ------------------------------------------------------------------------------------------------ bindings
+#include "head_route2_cabi.h"
 using namespace msr2;
 static int g_sms = 0;
 static int g_pdl = 3;   // bit 0: k_fill with programmatic dependent launch, bit 1: k_rank too
-static int g_attr_dev = -1;
+// k_fill / k_one dynamic-SMEM opt-ins: one bit per device, set atomically (4 driver threads). (Was g_attr_dev, one device
+// id: the attributes were re-set at every change of device.)
+static unsigned long long g_attr_mask = 0;
 static int g_fill = 1;  // k_fill CTAs (512 threads) per SM, cap (sweep: 1 >= 2 = 4 > fewer)
 static int g_ipt = 0;   // k_rank pairs per thread; 0 = auto
 static int g_one_max_t = 1365;  // T <= this: single-kernel k_one (<= 1365); 0 = always the two-kernel path
@@ -498,6 +501,83 @@ void route2x(torch::Tensor ids, torch::Tensor w, int64_t T, torch::Tensor ecs, t
 void route2(torch::Tensor ids, torch::Tensor w, int64_t T, torch::Tensor ecs, torch::Tensor t1, torch::Tensor t2,
             torch::Tensor counts, torch::Tensor slotmap, torch::Tensor rts, int64_t grid, torch::Tensor inv) {
   route2x(ids, w, T, ecs, t1, t2, counts, slotmap, rts, grid, inv, torch::Tensor());
+}
+// C ABI: per-device setup without exceptions (g_sms: the SM count of device dq, once; the k_fill / k_one dynamic-SMEM
+// opt-ins on the current device, once per device), shared by "head_route2.init" and the launches
+static int setup_c(int dq) {
+  int sms = __atomic_load_n(&g_sms, __ATOMIC_ACQUIRE);
+  if (!sms) {
+    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dq) != cudaSuccess) return FPR_E_CUDA;
+    __atomic_store_n(&g_sms, sms, __ATOMIC_RELEASE);
+  }
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return FPR_E_CUDA;
+  if (!(__atomic_load_n(&g_attr_mask, __ATOMIC_ACQUIRE) >> dev & 1ull)) {
+    if (cudaFuncSetAttribute(k_fill, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)(MAXG * NEXP * sizeof(unsigned short))) != cudaSuccess ||
+        cudaFuncSetAttribute(k_one, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(ONE_MAXS * NEXP * sizeof(int))) !=
+            cudaSuccess)
+      return FPR_E_CUDA;
+    __atomic_fetch_or(&g_attr_mask, 1ull << dev, __ATOMIC_RELEASE);
+  }
+  return FPR_OK;
+}
+// a cudaLaunchKernelEx result -> FPR_OK / FPR_E_CUDA (cudaGetLastError also clears a failed launch's error, as C10_CUDA_CHECK)
+static int launched(cudaError_t e) {
+  const cudaError_t l = cudaGetLastError();
+  return e == cudaSuccess && l == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+}
+static int route2x_core(const FprRoute2Args* p) {   // C ABI "head_route2.route2": the launches of pybind route2x (ec8 NULL: route2)
+  try {
+    const int64_t T = p->T;
+    if (T < 0 || T > MAXT) return FPR_E_ARG;
+    if (p->rts_bytes < (int64_t)RS_INTS * (int64_t)sizeof(int)) return FPR_E_WS;
+    const int P = (int)T * TOPK, mec = max_ec(P);
+    int* ec8 = (int*)p->ec8;
+    const int rc = setup_c(p->c.device);
+    if (rc != FPR_OK) return rc;
+    const int sms = __atomic_load_n(&g_sms, __ATOMIC_ACQUIRE);
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    const float* invp = p->inv;
+    const int sg = p->grid > 0 ? (int)p->grid : sms;
+    if (T > 0 && T <= g_one_max_t) {  // ---- one kernel
+      const int S = (P + ONE_SEG - 1) / ONE_SEG, nE = mec * (NMAX + 49);
+      cudaLaunchConfig_t c0 = {};
+      c0.gridDim = dim3(std::max(S, std::min((nE + F_THREADS - 1) / F_THREADS, sms)));
+      c0.blockDim = dim3(F_THREADS);
+      c0.dynamicSmemBytes = (size_t)S * NEXP * sizeof(int);
+      c0.stream = p->c.stream;
+      c0.attrs = at;
+      c0.numAttrs = (g_pdl & 2) ? 1 : 0;
+      return launched(cudaLaunchKernelEx(&c0, k_one, (const int*)p->ids, (const float*)p->w, invp, P, S, mec, (EC*)p->ecs,
+                                         (Tile*)p->t1, (Tile*)p->t2, (int*)p->counts, (int*)p->slotmap, sg, ec8, 0));
+    }
+    const int ipt = (int)route2_ipt(T), tshift = 10 + __builtin_ctz(ipt), tile = R1_THREADS * ipt;
+    const int G = P > 0 ? (P + tile - 1) / tile : 1;
+    cudaLaunchConfig_t c1 = {};
+    c1.gridDim = dim3(G);
+    c1.blockDim = dim3(R1_THREADS);
+    c1.stream = p->c.stream;
+    c1.attrs = at;
+    c1.numAttrs = (g_pdl & 2) ? 1 : 0;
+    auto* kr = ipt == 1 ? k_rank<1> : ipt == 2 ? k_rank<2> : ipt == 4 ? k_rank<4> : ipt == 8 ? k_rank<8> : k_rank<16>;
+    if (launched(cudaLaunchKernelEx(&c1, kr, (const int*)p->ids, P, (int*)p->rts)) != FPR_OK) return FPR_E_CUDA;
+    const int items = P + mec * (NMAX + 49);
+    const int g2 = std::max(1, std::min((items + F_THREADS - 1) / F_THREADS, g_fill > 0 ? g_fill * sms : -g_fill));
+    cudaLaunchConfig_t c2 = {};
+    c2.gridDim = dim3(g2);
+    c2.blockDim = dim3(F_THREADS);
+    c2.dynamicSmemBytes = (size_t)G * NEXP * sizeof(unsigned short);
+    c2.stream = p->c.stream;
+    c2.attrs = at;
+    c2.numAttrs = (g_pdl & 1) ? 1 : 0;
+    return launched(cudaLaunchKernelEx(&c2, k_fill, (const int*)p->rts, (const float*)p->w, invp, P, G, mec, tshift,
+                                       (EC*)p->ecs, (Tile*)p->t1, (Tile*)p->t2, (int*)p->counts, (int*)p->slotmap, sg, ec8));
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
 }
 void route2x(torch::Tensor ids, torch::Tensor w, int64_t T, torch::Tensor ecs, torch::Tensor t1, torch::Tensor t2,
              torch::Tensor counts, torch::Tensor slotmap, torch::Tensor rts, int64_t grid, torch::Tensor inv,
@@ -523,56 +603,39 @@ void route2x(torch::Tensor ids, torch::Tensor w, int64_t T, torch::Tensor ecs, t
                 "route2x: ec8 int32 >= route2_max_ec(T), counts >= 7");
     ec8 = ec8t.data_ptr<int>();
   }
-  auto stream = at::cuda::getCurrentCUDAStream();
-  if (!g_sms) cudaDeviceGetAttribute(&g_sms, cudaDevAttrMultiProcessorCount, ids.get_device());
-  if (g_attr_dev != ids.get_device()) {  // k_fill: up to MAXG x 384 uint16 of dynamic SMEM (+ ~14 KB static)
-    C10_CUDA_CHECK(cudaFuncSetAttribute(k_fill, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        (int)(MAXG * NEXP * sizeof(unsigned short))));
-    C10_CUDA_CHECK(cudaFuncSetAttribute(k_one, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        (int)(ONE_MAXS * NEXP * sizeof(int))));
-    g_attr_dev = ids.get_device();
-  }
-  cudaLaunchAttribute at[1];
-  at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  at[0].val.programmaticStreamSerializationAllowed = 1;
-  const float* invp = inv.numel() ? inv.data_ptr<float>() : nullptr;
-  const int sg = grid > 0 ? (int)grid : g_sms;
-  if (T > 0 && T <= g_one_max_t) {  // ---- one kernel
+  FprRoute2Args ca{{at::cuda::getCurrentCUDAStream(), (int)ids.get_device(), 0}, ids.data_ptr<int>(), w.data_ptr<float>(), T,
+                   ecs.data_ptr(), t1.data_ptr(), t2.data_ptr(), counts.data_ptr<int>(), slotmap.data_ptr<int>(),
+                   rts.data_ptr<int>(), (int64_t)rts.nbytes(), (int32_t)grid, inv.numel() ? inv.data_ptr<float>() : nullptr,
+                   ec8};
+  TORCH_CHECK(route2x_core(&ca) == FPR_OK, "route2: CUDA launch error");
+}
+static int route2r_core(const FprRoute2rArgs* p) {   // C ABI "head_route2.route2r"
+  try {
+    const int64_t T = p->T;
+    if (T <= 0 || T > g_one_max_t) return FPR_E_SHAPE;
+    const int P = (int)T * TOPK, mec = max_ec(P);
+    const int rc = setup_c(p->c.device);
+    if (rc != FPR_OK) return rc;
+    const int sms = __atomic_load_n(&g_sms, __ATOMIC_ACQUIRE);
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    const int sg = p->grid > 0 ? (int)p->grid : sms;
     const int S = (P + ONE_SEG - 1) / ONE_SEG, nE = mec * (NMAX + 49);
     cudaLaunchConfig_t c0 = {};
-    c0.gridDim = dim3(std::max(S, std::min((nE + F_THREADS - 1) / F_THREADS, g_sms)));
+    c0.gridDim = dim3(std::max(S, std::min((nE + F_THREADS - 1) / F_THREADS, sms)));
     c0.blockDim = dim3(F_THREADS);
     c0.dynamicSmemBytes = (size_t)S * NEXP * sizeof(int);
-    c0.stream = stream;
+    c0.stream = p->c.stream;
     c0.attrs = at;
     c0.numAttrs = (g_pdl & 2) ? 1 : 0;
-    C10_CUDA_CHECK(cudaLaunchKernelEx(&c0, k_one, (const int*)ids.data_ptr<int>(), (const float*)w.data_ptr<float>(),
-                                      invp, P, S, mec, (EC*)ecs.data_ptr(), (Tile*)t1.data_ptr(), (Tile*)t2.data_ptr(),
-                                      counts.data_ptr<int>(), slotmap.data_ptr<int>(), sg, ec8, 0));
-    return;
+    const int* r32 = (const int*)p->rows;
+    return launched(cudaLaunchKernelEx(&c0, k_one, r32, (const float*)(r32 + 6), (const float*)nullptr, P, S, mec,
+                                       (EC*)p->ecs, (Tile*)p->t1, (Tile*)p->t2, (int*)p->counts, (int*)p->slotmap, sg,
+                                       (int*)nullptr, 16));
+  } catch (...) {
+    return FPR_E_CUDA;
   }
-  const int ipt = (int)route2_ipt(T), tshift = 10 + __builtin_ctz(ipt), tile = R1_THREADS * ipt;
-  const int G = P > 0 ? (P + tile - 1) / tile : 1;
-  cudaLaunchConfig_t c1 = {};
-  c1.gridDim = dim3(G);
-  c1.blockDim = dim3(R1_THREADS);
-  c1.stream = stream;
-  c1.attrs = at;
-  c1.numAttrs = (g_pdl & 2) ? 1 : 0;
-  auto* kr = ipt == 1 ? k_rank<1> : ipt == 2 ? k_rank<2> : ipt == 4 ? k_rank<4> : ipt == 8 ? k_rank<8> : k_rank<16>;
-  C10_CUDA_CHECK(cudaLaunchKernelEx(&c1, kr, (const int*)ids.data_ptr<int>(), P, rts.data_ptr<int>()));
-  const int items = P + mec * (NMAX + 49);
-  const int g2 = std::max(1, std::min((items + F_THREADS - 1) / F_THREADS, g_fill > 0 ? g_fill * g_sms : -g_fill));
-  cudaLaunchConfig_t c2 = {};
-  c2.gridDim = dim3(g2);
-  c2.blockDim = dim3(F_THREADS);
-  c2.dynamicSmemBytes = (size_t)G * NEXP * sizeof(unsigned short);
-  c2.stream = stream;
-  c2.attrs = at;
-  c2.numAttrs = (g_pdl & 1) ? 1 : 0;
-  C10_CUDA_CHECK(cudaLaunchKernelEx(&c2, k_fill, (const int*)rts.data_ptr<int>(), (const float*)w.data_ptr<float>(),
-                                    invp, P, G, mec, tshift, (EC*)ecs.data_ptr(), (Tile*)t1.data_ptr(),
-                                    (Tile*)t2.data_ptr(), counts.data_ptr<int>(), slotmap.data_ptr<int>(), sg, ec8));
 }
 // route2 reading ids / weights straight from the routing rows [T, 64 B] (int32 ids at bytes 0..23, fp32 weights at
 // 24..47; sp_layer's gather buffer gr): no .contiguous() copies. One-kernel path only (T <= the k_one limit).
@@ -584,31 +647,9 @@ void route2r(torch::Tensor rows, int64_t T, torch::Tensor ecs, torch::Tensor t1,
                   t2.nbytes() >= (size_t)mec * 40 * sizeof(Tile) && counts.numel() >= 6 && slotmap.numel() >= P &&
                   rts.numel() >= RS_INTS,
               "route2r: buffers");
-  auto stream = at::cuda::getCurrentCUDAStream();
-  if (!g_sms) cudaDeviceGetAttribute(&g_sms, cudaDevAttrMultiProcessorCount, rows.get_device());
-  if (g_attr_dev != rows.get_device()) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(k_fill, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        (int)(MAXG * NEXP * sizeof(unsigned short))));
-    C10_CUDA_CHECK(cudaFuncSetAttribute(k_one, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        (int)(ONE_MAXS * NEXP * sizeof(int))));
-    g_attr_dev = rows.get_device();
-  }
-  cudaLaunchAttribute at[1];
-  at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  at[0].val.programmaticStreamSerializationAllowed = 1;
-  const int sg = grid > 0 ? (int)grid : g_sms;
-  const int S = (P + ONE_SEG - 1) / ONE_SEG, nE = mec * (NMAX + 49);
-  cudaLaunchConfig_t c0 = {};
-  c0.gridDim = dim3(std::max(S, std::min((nE + F_THREADS - 1) / F_THREADS, g_sms)));
-  c0.blockDim = dim3(F_THREADS);
-  c0.dynamicSmemBytes = (size_t)S * NEXP * sizeof(int);
-  c0.stream = stream;
-  c0.attrs = at;
-  c0.numAttrs = (g_pdl & 2) ? 1 : 0;
-  const int* r32 = (const int*)rows.data_ptr();
-  C10_CUDA_CHECK(cudaLaunchKernelEx(&c0, k_one, r32, (const float*)(r32 + 6), (const float*)nullptr, P, S, mec,
-                                    (EC*)ecs.data_ptr(), (Tile*)t1.data_ptr(), (Tile*)t2.data_ptr(), counts.data_ptr<int>(),
-                                    slotmap.data_ptr<int>(), sg, (int*)nullptr, 16));
+  FprRoute2rArgs ca{{at::cuda::getCurrentCUDAStream(), (int)rows.get_device(), 0}, rows.data_ptr(), T, ecs.data_ptr(),
+                    t1.data_ptr(), t2.data_ptr(), counts.data_ptr<int>(), slotmap.data_ptr<int>(), (int32_t)grid};
+  TORCH_CHECK(route2r_core(&ca) == FPR_OK, "route2r: CUDA launch error");
 }
 int64_t route2_max_ec(int64_t T) { return max_ec((int)T * TOPK); }
 int64_t route2_scratch_ints() { return RS_INTS; }
@@ -654,6 +695,22 @@ void route2_dbg_reset() {
   C10_CUDA_CHECK(cudaMemcpyToSymbol(g_dbg, h, sizeof(h)));
 }
 #endif
+
+// ---- C ABI (fpr_cabi.h): init + table
+static int init_core(const FprRoute2InitArgs* p) { return setup_c(p->c.device); }
+extern "C" {
+static int c_init(const void* a) { return init_core((const FprRoute2InitArgs*)a); }
+static int c_route2(const void* a) { return route2x_core((const FprRoute2Args*)a); }
+static int64_t c_route2_ws(const void* a) { (void)a; return (int64_t)RS_INTS * (int64_t)sizeof(int); }
+static int c_route2r(const void* a) { return route2r_core((const FprRoute2rArgs*)a); }
+static const FprFnEntry k_route2_fns[] = {
+    {"head_route2.init", c_init, nullptr, (int64_t)sizeof(FprRoute2InitArgs)},
+    {"head_route2.route2", c_route2, c_route2_ws, (int64_t)sizeof(FprRoute2Args)},
+    {"head_route2.route2r", c_route2r, nullptr, (int64_t)sizeof(FprRoute2rArgs)},
+};
+static const FprExtTable k_route2_table = {FPR_CABI_VERSION, "head_route2", "a9e5cbdec3f61bb5218c25e45c5ae252", 3, k_route2_fns};
+__attribute__((visibility("default"))) const FprExtTable* fpr_head_route2_table(void) { return &k_route2_table; }
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("route2", &route2);

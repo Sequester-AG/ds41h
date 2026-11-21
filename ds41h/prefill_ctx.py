@@ -1,8 +1,8 @@
 """DSpark context work of an eager prefill step on the replay rows only .
 
 DS41H_PREFILL_CTX_TRIM (default 1; 0 = stock) or the prefill control key "ctx_trim" = 0/1, read per
-step, with DS41H_PREFILL_CTL. Same-server A/B on the certified cert350k7p config (350 W, ab_ctx2): PP c16 16K 41,494 -> 42,032
-(+1.3%, 4 pairs, each +1.0..1.8%); TTFT and decode unchanged; drafter cache bytes and target numerics unchanged by construction.
+step, with DS41H_PREFILL_CTL.
+TTFT and decode unchanged; drafter cache bytes and target numerics unchanged by construction.
 
 After an eager prefill step with the decoder SWA bounded replay (stock vLLM 0.32.0 decoder_replay_layers.py
 DecoderReplayLayers._run, ds41h prefill_sp._replay_sp), every output of the replay layers is ZERO outside the replay rows

@@ -27,6 +27,19 @@
 #include "common.cuh"
 #include "host.cuh"
 
+// C ABI for the FPR C++ mixed-step driver: act_quant_128's launch is one
+// function (launch_aq) used by the pybind path and, when fpr's fpr_cabi.h is in the tree, by the C entry exported through
+// fpr_fp8_linear_table(). Kernels unchanged.
+#if defined(__has_include)
+#if __has_include("../../fpr/engine/mixed_cxx/fpr_cabi.h")
+#define DS41H_FPR_CABI 1
+#include "fp8_linear_cabi.h"
+#endif
+#endif
+#ifndef DS41H_FPR_CABI
+#define DS41H_FPR_CABI 0
+#endif
+
 namespace {
 
 constexpr int QB = 128;          // quantization block along K (DeepGEMM 1D2D granularity)
@@ -205,6 +218,19 @@ std::vector<torch::Tensor> inv_rope_fp8_quant(torch::Tensor o, torch::Tensor pos
 // x bf16 [M, K] (unit stride along K, row stride % 8 == 0, 16-byte aligned) ->
 //   q  float8_e4m3fn [M, KP] (contiguous, columns [K, KP) = +0)
 //   s  float32 [M, KP/128] view with strides (1, MA) of a [KP/128 * MA] buffer (MN-major, TMA aligned)
+// act_quant_128's one launch (pybind and C ABI): m >= 1, kp <= 16,384; cudaGetLastError right after it
+static cudaError_t launch_aq(const __nv_bfloat16* xp, long ldx, long M, long K, long kp, bool ue8m0, uint8_t* qp, float* sp,
+                             cudaStream_t stream) {
+  const long MA = (M + 3) / 4 * 4;
+  const int threads = int((kp / QB * TPB + 31) / 32 * 32);
+  const dim3 grid(static_cast<unsigned>(M));
+  if (ue8m0)
+    act_quant_128_kernel<true><<<grid, threads, 0, stream>>>(xp, ldx, int(K), int(kp), qp, sp, int(MA));
+  else
+    act_quant_128_kernel<false><<<grid, threads, 0, stream>>>(xp, ldx, int(K), int(kp), qp, sp, int(MA));
+  return cudaGetLastError();
+}
+
 std::vector<torch::Tensor> act_quant_128(torch::Tensor x, int64_t kp, bool ue8m0) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16 && x.dim() == 2, "x must be a 2-D CUDA bf16 tensor");
   TORCH_CHECK(x.stride(1) == 1 && x.stride(0) % 8 == 0 && reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
@@ -219,19 +245,41 @@ std::vector<torch::Tensor> act_quant_128(torch::Tensor x, int64_t kp, bool ue8m0
   auto s = sbuf.as_strided({M, kp / QB}, {1, MA});
   if (M == 0) return {q, s};
   TORCH_CHECK(kp <= MAX_THREADS / TPB * QB, "kp too large for one CTA per row");
-  const int threads = int((kp / QB * TPB + 31) / 32 * 32);
-  const dim3 grid(static_cast<unsigned>(M));
-  auto stream = c10::cuda::getCurrentCUDAStream();
-  const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
-  auto* qp = reinterpret_cast<uint8_t*>(q.data_ptr());
-  if (ue8m0)
-    act_quant_128_kernel<true><<<grid, threads, 0, stream>>>(xp, x.stride(0), int(K), int(kp), qp, sbuf.data_ptr<float>(), int(MA));
-  else
-    act_quant_128_kernel<false><<<grid, threads, 0, stream>>>(xp, x.stride(0), int(K), int(kp), qp, sbuf.data_ptr<float>(), int(MA));
-  const cudaError_t err = cudaGetLastError();
+  const cudaError_t err = launch_aq(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), x.stride(0), M, K, kp, ue8m0,
+                                    reinterpret_cast<uint8_t*>(q.data_ptr()), sbuf.data_ptr<float>(),
+                                    c10::cuda::getCurrentCUDAStream());
   TORCH_CHECK(err == cudaSuccess, "act_quant_128 launch failed: ", cudaGetErrorString(err));
   return {q, s};
 }
+
+#if DS41H_FPR_CABI
+// C ABI entry: the pybind path's value checks, then the same launch (caller-owned q / scales)
+static int c_act_quant_128(const void* p) {
+  if (p == nullptr) return FPR_E_ARG;
+  const auto& a = *static_cast<const FprFp8LinearActQuant128Args*>(p);
+#ifdef FPR_CABI_DEBUG
+  int d = -1;
+  if (cudaGetDevice(&d) != cudaSuccess || d != a.call.device) return FPR_E_ARG;
+#endif
+  if (a.ldx % 8 || reinterpret_cast<uintptr_t>(a.x) % 16 || a.k % 16 || a.kp % QB || a.kp < a.k || a.kp - a.k >= QB ||
+      a.m < 0 || !(a.m < (1L << 31) / 4 && a.kp < (1L << 30)))
+    return FPR_E_ARG;
+  if (a.m == 0) return FPR_OK;
+  if (a.kp > MAX_THREADS / TPB * QB || a.x == nullptr || a.q == nullptr || a.scales == nullptr) return FPR_E_ARG;
+  return launch_aq(static_cast<const __nv_bfloat16*>(a.x), a.ldx, a.m, a.k, a.kp, a.ue8m0 != 0, a.q, a.scales, a.call.stream) ==
+                 cudaSuccess
+             ? FPR_OK
+             : FPR_E_CUDA;
+}
+
+extern "C" __attribute__((visibility("default"))) const FprExtTable* fpr_fp8_linear_table(void) {
+  static const FprFnEntry fns[] = {
+      {"fp8_linear.act_quant_128", c_act_quant_128, nullptr, static_cast<int64_t>(sizeof(FprFp8LinearActQuant128Args))},
+  };
+  static const FprExtTable t = {FPR_CABI_VERSION, "fp8_linear", "6d6fedb6d4a06e8f6106540974cfae05", 1, fns};
+  return &t;
+}
+#endif
 
 // ---------------------------------------------------------------------------------------------------------------
 // LOSSLESS W8A16 support (default prefill path, see ds41h/linear.py "LINEAR16").

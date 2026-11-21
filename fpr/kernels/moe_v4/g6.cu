@@ -10,6 +10,7 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include "../pdl2.cuh"
 
 #ifndef G6_NSLOT
 #define G6_NSLOT 8
@@ -80,6 +81,7 @@ struct Meta {
 __global__ void __launch_bounds__(THR, G6_B) k_gather6(const __nv_bfloat16* __restrict__ x, EC* __restrict__ ecs,
                                                        const int* __restrict__ ptok, char* __restrict__ img,
                                                        const int* __restrict__ counts, int pstride) {
+  pdl2::enter();  // ENG_PDL2: launched early, waits here for the previous kernel (no-op otherwise)
   extern __shared__ __align__(128) unsigned char sm[];
   unsigned char* ring = sm;                                     // [NSLOT][ROW]
   Meta* meta = (Meta*)(sm + NSLOT * ROW);                       // [NSLOT]
@@ -184,7 +186,7 @@ void gather6(torch::Tensor x, torch::Tensor ecs, torch::Tensor counts, torch::Te
     C10_CUDA_CHECK(cudaFuncSetAttribute(k_gather6, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
     g_attr |= 1ull << dev;
   }
-  k_gather6<<<(unsigned)(G6_B * sms), THR, SMEM, at::cuda::getCurrentCUDAStream()>>>(
+  pdl2::launch(k_gather6, dim3((unsigned)(G6_B * sms)), dim3(THR), SMEM, at::cuda::getCurrentCUDAStream(),
       (const __nv_bfloat16*)x.data_ptr(), (EC*)ecs.data_ptr(), (const int*)rows.data_ptr() + 12, (char*)img.data_ptr(),
       counts.data_ptr<int>(), 16);
   C10_CUDA_KERNEL_LAUNCH_CHECK();

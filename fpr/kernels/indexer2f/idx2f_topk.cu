@@ -27,6 +27,8 @@
 
 #include <cub/block/block_scan.cuh>
 
+#include "idx2f_topk_cabi.h"
+
 namespace idx2f_topk {
 
 constexpr int kTPB = 1024;
@@ -479,20 +481,141 @@ __global__ void __launch_bounds__(kPrepT, 1) prep2_kernel(const int* __restrict_
 }
 
 // ------------------------------------------------------------------------------------------------ host
+// C ABI: the launches are run_* functions on
+// plain argument structs and an explicit stream, used by the pybind functions (checks / messages / CUDAGuard / lazy SMEM
+// attributes unchanged) and by the C entries of fpr_idx2f_topk_table(). Kernels unchanged.
 void check_rows(const at::Tensor& t, const char* name, at::ScalarType st) {
   TORCH_CHECK(t.is_cuda() && t.scalar_type() == st && t.dim() == 2 && t.stride(1) == 1, name, ": 2-D CUDA, stride(1) 1");
 }
 
-template <typename F>
-void set_smem_once(F* fn, int dev) {
-  static bool set[64] = {};
-  if (!set[dev]) {
-    TORCH_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(Smem))) == cudaSuccess,
-                "smem attribute");
-    set[dev] = true;
-  }
+// per (kernel, device): the dynamic SMEM attribute is set (pybind: on first use, as the old statics; C ABI: init)
+template <int K>
+bool* smem_set() {
+  static bool f[64] = {};
+  return f;
+}
+enum { kSmTopk = 0, kSmSelect = 1, kSmPrep2 = 2 };
+cudaError_t set_attr_topk() { return cudaFuncSetAttribute(topk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(Smem))); }
+cudaError_t set_attr_select() { return cudaFuncSetAttribute(select_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(Smem))); }
+cudaError_t set_attr_prep2() {
+  return cudaFuncSetAttribute(prep2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(PrepSmem)));
+}
+template <int K>
+cudaError_t ensure(int dev, bool lazy, cudaError_t (*set)()) {   // cudaErrorNotReady = not initialized (C ABI)
+  if (smem_set<K>()[dev & 63]) return cudaSuccess;
+  if (!lazy) return cudaErrorNotReady;
+  const cudaError_t e = set();
+  if (e == cudaSuccess) smem_set<K>()[dev & 63] = true;
+  return e;
+}
+int cur_dev() {
+  int d = 0;
+  cudaGetDevice(&d);
+  return d;
 }
 
+// ---- the launches (both paths)
+cudaError_t run_block_max(const FprIdx2fTopkBlockMaxArgs& a) {
+  const int rows = int(a.rows);
+  const int nb = int((a.max_len + kBlock - 1) / kBlock);
+  if (!rows || !nb) return cudaSuccess;
+  int sms = 0;
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, cur_dev());
+  block_max_kernel<<<2 * sms, kBMThreads, 0, a.call.stream>>>(a.logits, a.ld_logits, a.lens, rows, a.out, a.ld_out);
+  return cudaGetLastError();
+}
+
+cudaError_t run_topk(const FprIdx2fTopkTopkArgs& a, bool lazy) {
+  const int rows = int(a.rows);
+  if (!rows) return cudaSuccess;
+  const cudaError_t e = ensure<kSmTopk>(cur_dev(), lazy, set_attr_topk);
+  if (e != cudaSuccess) return e;
+  Args k{a.logits, a.ld_logits, a.lens, a.bmax, a.ld_bmax, a.out, a.ld_out, a.cblk, a.cblk ? a.ld_cblk : 0, int(a.k), a.slow,
+         int(a.stop)};
+  topk_kernel<<<rows, kTPB, sizeof(Smem), a.call.stream>>>(k);
+  return cudaGetLastError();
+}
+
+cudaError_t run_select_blocks(const FprIdx2fTopkSelectBlocksArgs& a, bool lazy) {
+  const int rows = int(a.rows);
+  if (!rows) return cudaSuccess;
+  const cudaError_t e = ensure<kSmSelect>(cur_dev(), lazy, set_attr_select);
+  if (e != cudaSuccess) return e;
+  SelArgs k{a.bmax, a.ld_bmax, a.nb_lens, a.out, a.ld_out, int(a.k)};
+  select_kernel<<<rows, kTPB, sizeof(Smem), a.call.stream>>>(k);
+  return cudaGetLastError();
+}
+
+cudaError_t run_prep2(const FprIdx2fTopkPrep2Args& a, bool lazy) {
+  const int B = int(a.rows) / kPrepNN;
+  if (!B) return cudaSuccess;
+  const cudaError_t e = ensure<kSmPrep2>(cur_dev(), lazy, set_attr_prep2);
+  if (e != cudaSuccess) return e;
+  prep2_kernel<<<B, kPrepT, sizeof(PrepSmem), a.call.stream>>>(a.cand, a.ld_cand, a.lens, a.ublk, a.uslot, a.nunion, a.clen,
+                                                                a.block_table, a.block_table ? a.ld_bt : 0, a.upk);
+  return cudaGetLastError();
+}
+
+// ---- C ABI entries
+int rc_of(cudaError_t e) { return e == cudaSuccess ? FPR_OK : e == cudaErrorNotReady ? FPR_E_INIT : FPR_E_CUDA; }
+#ifdef FPR_CABI_DEBUG
+#define DEV_CHECK(a) \
+  if (cur_dev() != (a).call.device) return FPR_E_ARG;
+#else
+#define DEV_CHECK(a)
+#endif
+
+int c_init(const void* p) {
+  if (p == nullptr) return FPR_E_ARG;
+  const int dev = cur_dev();
+  if (dev != static_cast<const FprIdx2fTopkInitArgs*>(p)->call.device) return FPR_E_ARG;
+  cudaError_t e = ensure<kSmTopk>(dev, true, set_attr_topk);
+  if (e == cudaSuccess) e = ensure<kSmSelect>(dev, true, set_attr_select);
+  if (e == cudaSuccess) e = ensure<kSmPrep2>(dev, true, set_attr_prep2);
+  return e == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+}
+
+int c_block_max(const void* p) {
+  if (p == nullptr) return FPR_E_ARG;
+  const auto& a = *static_cast<const FprIdx2fTopkBlockMaxArgs*>(p);
+  DEV_CHECK(a)
+  if (a.rows < 0 || a.rows > kMaxRows || a.ld_logits % 4 || reinterpret_cast<uintptr_t>(a.logits) % 16) return FPR_E_ARG;
+  return rc_of(run_block_max(a));
+}
+
+int c_topk(const void* p) {
+  if (p == nullptr) return FPR_E_ARG;
+  const auto& a = *static_cast<const FprIdx2fTopkTopkArgs*>(p);
+  DEV_CHECK(a)
+  if (a.rows < 0 || a.k <= 0 || a.k > kCMax || a.nblocks > kMaxBlocks || a.slow == nullptr) return FPR_E_ARG;
+  return rc_of(run_topk(a, false));
+}
+
+int c_select_blocks(const void* p) {
+  if (p == nullptr) return FPR_E_ARG;
+  const auto& a = *static_cast<const FprIdx2fTopkSelectBlocksArgs*>(p);
+  DEV_CHECK(a)
+  if (a.rows < 0 || a.k <= 0 || a.nblocks > kMaxBlocks) return FPR_E_ARG;
+  return rc_of(run_select_blocks(a, false));
+}
+
+int c_prep2(const void* p) {
+  if (p == nullptr) return FPR_E_ARG;
+  const auto& a = *static_cast<const FprIdx2fTopkPrep2Args*>(p);
+  DEV_CHECK(a)
+  if (a.rows < 0 || a.rows % kPrepNN || ((a.block_table == nullptr) != (a.upk == nullptr))) return FPR_E_ARG;
+  return rc_of(run_prep2(a, false));
+}
+
+FprCall call_of(const at::Tensor& t) {
+  FprCall c;
+  c.stream = at::cuda::getCurrentCUDAStream();
+  c.device = t.get_device();
+  c.rank = 0;
+  return c;
+}
+
+// ---- pybind (signatures, checks, messages and behaviour unchanged)
 void block_max(at::Tensor logits, at::Tensor lens, at::Tensor out, int64_t max_len) {
   check_rows(logits, "logits", at::kFloat);
   check_rows(out, "out", at::kFloat);
@@ -505,10 +628,16 @@ void block_max(at::Tensor logits, at::Tensor lens, at::Tensor out, int64_t max_l
   TORCH_CHECK(logits.size(1) >= nb * kBlock, "logits width >= 8 * ceil(max_len / 8)");
   if (!rows || !nb) return;
   const c10::cuda::CUDAGuard guard(logits.device());
-  const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-  block_max_kernel<<<2 * sms, kBMThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
-      logits.data_ptr<float>(), logits.stride(0), lens.data_ptr<int>(), rows, out.data_ptr<float>(), out.stride(0));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FprIdx2fTopkBlockMaxArgs a{};
+  a.call = call_of(logits);
+  a.logits = logits.data_ptr<float>();
+  a.ld_logits = logits.stride(0);
+  a.lens = lens.data_ptr<int>();
+  a.rows = rows;
+  a.out = out.data_ptr<float>();
+  a.ld_out = out.stride(0);
+  a.max_len = max_len;
+  C10_CUDA_CHECK(run_block_max(a));
 }
 
 void topk(at::Tensor logits, at::Tensor lens, at::Tensor bmax, int64_t k, at::Tensor out, std::optional<at::Tensor> cblk,
@@ -525,12 +654,24 @@ void topk(at::Tensor logits, at::Tensor lens, at::Tensor bmax, int64_t k, at::Te
   if (cblk) check_rows(*cblk, "cblk", at::kInt);
   if (!rows) return;
   const c10::cuda::CUDAGuard guard(logits.device());
-  set_smem_once(topk_kernel, logits.get_device());
-  Args a{logits.data_ptr<float>(), logits.stride(0), lens.data_ptr<int>(), bmax.data_ptr<float>(), bmax.stride(0),
-         out.data_ptr<int>(), out.stride(0), cblk ? cblk->data_ptr<int>() : nullptr, cblk ? cblk->stride(0) : 0, int(k),
-         slow.data_ptr<int>(), int(stop)};
-  topk_kernel<<<rows, kTPB, sizeof(Smem), at::cuda::getCurrentCUDAStream()>>>(a);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  TORCH_CHECK(ensure<kSmTopk>(logits.get_device(), true, set_attr_topk) == cudaSuccess, "smem attribute");
+  FprIdx2fTopkTopkArgs a{};
+  a.call = call_of(logits);
+  a.logits = logits.data_ptr<float>();
+  a.ld_logits = logits.stride(0);
+  a.lens = lens.data_ptr<int>();
+  a.bmax = bmax.data_ptr<float>();
+  a.ld_bmax = bmax.stride(0);
+  a.nblocks = bmax.size(1);
+  a.out = out.data_ptr<int>();
+  a.ld_out = out.stride(0);
+  a.cblk = cblk ? cblk->data_ptr<int>() : nullptr;
+  a.ld_cblk = cblk ? cblk->stride(0) : 0;
+  a.k = k;
+  a.slow = slow.data_ptr<int>();
+  a.stop = stop;
+  a.rows = rows;
+  C10_CUDA_CHECK(run_topk(a, true));
 }
 
 void select_blocks(at::Tensor bmax, at::Tensor nb_lens, int64_t k, at::Tensor out) {
@@ -542,10 +683,18 @@ void select_blocks(at::Tensor bmax, at::Tensor nb_lens, int64_t k, at::Tensor ou
   TORCH_CHECK(bmax.size(1) <= kMaxBlocks, "at most 32,768 blocks per row");
   if (!rows) return;
   const c10::cuda::CUDAGuard guard(bmax.device());
-  set_smem_once(select_kernel, bmax.get_device());
-  SelArgs a{bmax.data_ptr<float>(), bmax.stride(0), nb_lens.data_ptr<int>(), out.data_ptr<int>(), out.stride(0), int(k)};
-  select_kernel<<<rows, kTPB, sizeof(Smem), at::cuda::getCurrentCUDAStream()>>>(a);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  TORCH_CHECK(ensure<kSmSelect>(bmax.get_device(), true, set_attr_select) == cudaSuccess, "smem attribute");
+  FprIdx2fTopkSelectBlocksArgs a{};
+  a.call = call_of(bmax);
+  a.bmax = bmax.data_ptr<float>();
+  a.ld_bmax = bmax.stride(0);
+  a.nblocks = bmax.size(1);
+  a.nb_lens = nb_lens.data_ptr<int>();
+  a.out = out.data_ptr<int>();
+  a.ld_out = out.stride(0);
+  a.k = k;
+  a.rows = rows;
+  C10_CUDA_CHECK(run_select_blocks(a, true));
 }
 
 void prep2(at::Tensor cand, at::Tensor lens, at::Tensor ublk, at::Tensor uslot, at::Tensor nunion, at::Tensor clen,
@@ -562,26 +711,42 @@ void prep2(at::Tensor cand, at::Tensor lens, at::Tensor ublk, at::Tensor uslot, 
                   nunion.numel() >= B && clen.numel() >= rows, "prep2 output sizes");
   if (!B) return;
   const c10::cuda::CUDAGuard guard(cand.device());
-  static bool set[64] = {};
-  const int dev = cand.get_device();
-  if (!set[dev]) {
-    TORCH_CHECK(cudaFuncSetAttribute(prep2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(PrepSmem))) == cudaSuccess,
-                "prep2 smem");
-    set[dev] = true;
-  }
+  TORCH_CHECK(ensure<kSmPrep2>(cand.get_device(), true, set_attr_prep2) == cudaSuccess, "prep2 smem");
   TORCH_CHECK(block_table.has_value() == upk.has_value(), "block_table and upk together");
   if (upk) {
     check_rows(*block_table, "block_table", at::kInt);
     TORCH_CHECK(upk->is_cuda() && upk->scalar_type() == at::kInt && upk->is_contiguous() && upk->numel() >= ublk.numel(), "upk");
   }
-  prep2_kernel<<<B, kPrepT, sizeof(PrepSmem), at::cuda::getCurrentCUDAStream()>>>(
-      cand.data_ptr<int>(), cand.stride(0), lens.data_ptr<int>(), ublk.data_ptr<int>(), uslot.data_ptr<int>(),
-      nunion.data_ptr<int>(), clen.data_ptr<int>(), block_table ? block_table->data_ptr<int>() : nullptr,
-      block_table ? block_table->stride(0) : 0, upk ? upk->data_ptr<int>() : nullptr);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FprIdx2fTopkPrep2Args a{};
+  a.call = call_of(cand);
+  a.cand = cand.data_ptr<int>();
+  a.ld_cand = cand.stride(0);
+  a.lens = lens.data_ptr<int>();
+  a.rows = rows;
+  a.ublk = ublk.data_ptr<int>();
+  a.uslot = uslot.data_ptr<int>();
+  a.nunion = nunion.data_ptr<int>();
+  a.clen = clen.data_ptr<int>();
+  a.block_table = block_table ? block_table->data_ptr<int>() : nullptr;
+  a.ld_bt = block_table ? block_table->stride(0) : 0;
+  a.upk = upk ? upk->data_ptr<int>() : nullptr;
+  C10_CUDA_CHECK(run_prep2(a, true));
 }
 
 }  // namespace idx2f_topk
+
+extern "C" __attribute__((visibility("default"))) const FprExtTable* fpr_idx2f_topk_table(void) {
+  using namespace idx2f_topk;
+  static const FprFnEntry fns[] = {
+      {"idx2f_topk.init", c_init, nullptr, static_cast<int64_t>(sizeof(FprIdx2fTopkInitArgs))},
+      {"idx2f_topk.block_max", c_block_max, nullptr, static_cast<int64_t>(sizeof(FprIdx2fTopkBlockMaxArgs))},
+      {"idx2f_topk.topk", c_topk, nullptr, static_cast<int64_t>(sizeof(FprIdx2fTopkTopkArgs))},
+      {"idx2f_topk.select_blocks", c_select_blocks, nullptr, static_cast<int64_t>(sizeof(FprIdx2fTopkSelectBlocksArgs))},
+      {"idx2f_topk.prep2", c_prep2, nullptr, static_cast<int64_t>(sizeof(FprIdx2fTopkPrep2Args))},
+  };
+  static const FprExtTable t = {FPR_CABI_VERSION, "idx2f_topk", "f1312e33d2d8a0ebcdac92c7cd2636b1", 5, fns};
+  return &t;
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("block_max", &idx2f_topk::block_max, "8-position block key-max of logits rows (stock select's block score)");

@@ -5,11 +5,16 @@
 // fits the 1,024-thread limit. Per-element arithmetic, layouts and build flags (--use_fast_math) are production's:
 // the bytes and scales of a (token, head) equal production's per rank.
 // Layout: out [G, T, 4096] e4m3 (group-major), scales fp32 at g * 32 * TA + t + c * TA (TA = T rounded up to 4).
+// C ABI: the launch is a C function on a plain
+// argument struct and an explicit stream (caller-owned out / scales), exported through fpr_ropeq64_table(); the pybind
+// function allocates as before and calls the same launch. Kernel unchanged.
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
 #include <cstdint>
+
+#include "ropeq64_cabi.h"
 
 namespace rq {
 
@@ -84,7 +89,39 @@ __global__ void __launch_bounds__(HPG * 32) kernel(const __nv_bfloat16* __restri
   if (sub == 0) *srow = pow2(e);
 }
 
+// the one launch (C ABI and pybind): cudaGetLastError right after it; nothing when t == 0
+static cudaError_t launch(const FprRopeq64InvRopeFp8QuantArgs& a) {
+  const long T = a.t, G = a.n_groups, TA = (T + 3) / 4 * 4;
+  if (T <= 0) return cudaSuccess;
+  const dim3 grid(static_cast<unsigned>(TA), static_cast<unsigned>(G));
+  kernel<8><<<grid, dim3(8 * 32), 0, a.call.stream>>>(static_cast<const __nv_bfloat16*>(a.o), a.o_stride_t, a.o_stride_h,
+                                                       a.positions, a.cos_sin, a.cs_stride, int(T), int(TA), a.out, a.scales);
+  return cudaGetLastError();
+}
+
+static int c_inv_rope_fp8_quant(const void* p) {
+  if (p == nullptr) return FPR_E_ARG;
+  const auto& a = *static_cast<const FprRopeq64InvRopeFp8QuantArgs*>(p);
+#ifdef FPR_CABI_DEBUG
+  int d = -1;
+  if (cudaGetDevice(&d) != cudaSuccess || d != a.call.device) return FPR_E_ARG;
+#endif
+  if (a.t < 0 || a.n_groups <= 0 || a.o_stride_t % 8 || a.o_stride_h % 8 || reinterpret_cast<uintptr_t>(a.o) % 16 ||
+      a.cs_stride % 4 || (a.t > 0 && (a.positions == nullptr || a.cos_sin == nullptr || a.out == nullptr || a.scales == nullptr)))
+    return FPR_E_ARG;
+  return launch(a) == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+}
+
 }  // namespace rq
+
+extern "C" __attribute__((visibility("default"))) const FprExtTable* fpr_ropeq64_table(void) {
+  static const FprFnEntry fns[] = {
+      {"ropeq64.inv_rope_fp8_quant", rq::c_inv_rope_fp8_quant, nullptr,
+       static_cast<int64_t>(sizeof(FprRopeq64InvRopeFp8QuantArgs))},
+  };
+  static const FprExtTable t = {FPR_CABI_VERSION, "ropeq64", "31cb5160649595f09f594802b7b8b109", 1, fns};
+  return &t;
+}
 
 std::vector<torch::Tensor> inv_rope_fp8_quant(torch::Tensor o, torch::Tensor positions, torch::Tensor cache, int64_t n_groups) {
   TORCH_CHECK(o.is_cuda() && o.scalar_type() == torch::kBFloat16 && o.dim() == 3 && o.size(2) == 512 && o.stride(2) == 1,
@@ -100,11 +137,21 @@ std::vector<torch::Tensor> inv_rope_fp8_quant(torch::Tensor o, torch::Tensor pos
   auto sbuf = torch::empty({G * 32 * TA}, o.options().dtype(torch::kFloat32));
   auto sc = sbuf.as_strided({G, T, 32}, {32 * TA, 1, TA});
   if (T > 0) {
-    const dim3 grid(static_cast<unsigned>(TA), static_cast<unsigned>(G));
-    rq::kernel<8><<<grid, dim3(8 * 32), 0, c10::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const __nv_bfloat16*>(o.data_ptr()), o.stride(0), o.stride(1), positions.data_ptr<int64_t>(),
-        cache.data_ptr<float>(), cache.stride(0), int(T), int(TA), reinterpret_cast<uint8_t*>(out.data_ptr()), sbuf.data_ptr<float>());
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    FprRopeq64InvRopeFp8QuantArgs a{};
+    a.call.stream = c10::cuda::getCurrentCUDAStream();
+    a.call.device = o.get_device();
+    a.call.rank = 0;
+    a.o = o.data_ptr();
+    a.o_stride_t = o.stride(0);
+    a.o_stride_h = o.stride(1);
+    a.positions = positions.data_ptr<int64_t>();
+    a.cos_sin = cache.data_ptr<float>();
+    a.cs_stride = cache.stride(0);
+    a.t = T;
+    a.n_groups = G;
+    a.out = reinterpret_cast<uint8_t*>(out.data_ptr());
+    a.scales = sbuf.data_ptr<float>();
+    C10_CUDA_CHECK(rq::launch(a));
   }
   return {out.transpose(0, 1), sc.transpose(0, 1)};
 }

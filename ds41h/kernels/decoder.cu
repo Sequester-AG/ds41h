@@ -3,13 +3,6 @@
 // Adapted from BRRR (github.com/fraserprice/DeepSeek-4.1-Flash-1017-BRRR, Apache-2.0,
 // src/brrr/kernels/decoder.cu layer_kernel). See LICENSES/BRRR-Apache-2.0.txt.
 //
-// One launch runs everything stock vLLM 0.32.0 does after the attention core of one
-// DeepseekV4DecoderLayer (models/deepseek_v41/nvidia/model.py:591-625) for M <= MAXM tokens:
-//   inverse RoPE on o -> wo_a (2 local groups) -> wo_b (K slice) -> NVLink IPC all-reduce #1 ->
-//   attention mHC post + FFN mHC pre (hc_ffn_fn GEMV, RMS, Sinkhorn x20) -> RMSNorm(ffn_norm) ->
-//   gate (bf16) -> sqrtsoftplus + bias top-6 (*1.5/sum) -> shared expert (FP8) + routed experts
-//   (FP4, raw checkpoint layout) -> combine -> all-reduce #2.
-//
 // Changes vs BRRR (sm120a):
 //  * No block-scaled mma on sm90: every 32-wide K block is two FP16 HMMA m16n8k16 into a
 //    temporary accumulator, post-scaled by the ue8m0 weight scale (and, for wo_b, the per-token
@@ -36,7 +29,7 @@
 // (ROUTED_MMA=1, DENSE_MMA=1, LOSSLESS=0 coarse) are LOSSY opt-ins.
 //
 // RS-wgmma variants (ds41h, compile-time switches, default off = the HMMA paths above; LOSSY):
-//  * DS41H_DECODER_ROUTED_MMA=1: routed experts (R1 w13, R2 w2) and DS41H_DECODER_DENSE_MMA=1:
+// * DS41H_DECODER_ROUTED_MMA=1: routed experts and DS41H_DECODER_DENSE_MMA=1
 //    wo_a / wo_b / shared expert run wgmma.mma_async m64n{8,16}k32 .f32.e4m3.e4m3 with the
 //    weights as the register A operand (one warpgroup = the 4 consumer warps = 64 weight rows,
 //    warp w owns rows 16w..16w+15) and the tokens as the N = 8 (16) B operand from smem.
@@ -94,15 +87,11 @@ static_assert(DS41H_DECODER_ROUTED_MMA == 0 || DS41H_DECODER_ROUTED_MMA == 1, "R
 static_assert(DS41H_DECODER_DENSE_MMA == 0 || DS41H_DECODER_DENSE_MMA == 1, "DENSE_MMA: 0 = HMMA, 1 = RS-wgmma");
 // Coarse routed path (decoder-v2) for m <= COARSE_M tokens (one 8-token wgmma tile): the FFN input x
 // is staged ONCE per CTA as a resident e4m3 B tile (40 KB, union with the f16 staging buffer bt);
-// R1 jobs stream 32 gate + 32 up rows of one expert over the full K (or K/2, R1_KP) with RS-wgmma and
-// apply SwiGLU in their epilogue (no split-K atomics, no per-job activation staging), writing h for
-// all 8 token columns into a per-expert B-tile image; R2 jobs (128 rows x K 576 of one expert) depend
-// only on their expert's R1 jobs and are interleaved with later experts' R1 jobs (lag). Default 1
-// (validated: solo + 4-GPU tests, end-to-end KL PASS, TG c1 317 vs 266 tok/s); 0 = old R1/R2 jobs.
+// Default 1
 #ifndef DS41H_DECODER_COARSE
 #define DS41H_DECODER_COARSE 1
 #endif
-// Coarse R1 inner loop: 0 = pairs of stages with a pipeline drain every 16 k32; 2 / 3 = the whole
+// 0 = pairs of stages with a pipeline drain every 16 k32; 2 / 3 = the whole
 // job as one straight-line RS-wgmma pipeline with 2 / 3 commit groups in flight.
 #ifndef DS41H_DECODER_R1C_NB
 #define DS41H_DECODER_R1C_NB 2
@@ -116,8 +105,7 @@ static_assert(DS41H_DECODER_DENSE_MMA == 0 || DS41H_DECODER_DENSE_MMA == 1, "DEN
 #define DS41H_DECODER_FUSED_AR1 1
 #endif
 // Fused z (decoder-v2): wo_a jobs only release their 512-column z range's counter (no finish_woa);
-// every wo_b job quantizes its own z slice straight from the fp32 wo_a sums (finish_woa's numerics),
-// the gate jobs clear zacc afterwards. 0 = finish_woa (last K part) + zh / zq / ze round trip.
+// 0 = finish_woa (last K part) + zh / zq / ze round trip.
 #ifndef DS41H_DECODER_FUSED_Z
 #define DS41H_DECODER_FUSED_Z 1
 #endif
@@ -126,7 +114,7 @@ static_assert(DS41H_DECODER_DENSE_MMA == 0 || DS41H_DECODER_DENSE_MMA == 1, "DEN
 #ifndef DS41H_DECODER_WOB1
 #define DS41H_DECODER_WOB1 0
 #endif
-// Coarse R1 stages by TMA (per-layer tensor maps): 2 x [32 rows x 128 B] 128B-swizzled weight boxes +
+// 2 x [32 rows x 128 B] 128B-swizzled weight boxes +
 // 2 x [32 rows x 16 B] scale boxes (the scale bytes of the stage's 2-stage pair) per 9 KB stage,
 // issued by one producer lane. 0 = cp.async per lane (16 B weights, 8 B scales).
 #ifndef DS41H_DECODER_R1C_TMA
@@ -143,7 +131,7 @@ static_assert(DS41H_DECODER_DENSE_MMA == 0 || DS41H_DECODER_DENSE_MMA == 1, "DEN
 #define DS41H_DECODER_HIER_ROUTE 1
 #endif
 // Lossless coarse path (phase 4, default 1): with COARSE=1 the m <= 8 routed path keeps its coarse job
-// structure (TMA-streamed full-K row blocks, R2 jobs lagging their expert's R1 jobs) but every GEMM gets
+// structure but every GEMM gets
 // 16-bit activations: R1F = 128 rows (64 gate + 64 up) x full K per job, FP4 -> f16 exactly (value *
 // 2^-14, integer bit placement) x f16 x (128-k slices streamed with the weights) on HMMA m16n8k16 with
 // the exact per-(row, 32 k) ue8m0 scales; R2F = 128 rows of w2 x f16 h; the shared expert takes the HMMA
@@ -169,8 +157,6 @@ static_assert(DS41H_DECODER_DENSE_MMA == 0 || DS41H_DECODER_DENSE_MMA == 1, "DEN
 #ifndef DS41H_DECODER_R1F_PIPE
 #define DS41H_DECODER_R1F_PIPE 0
 #endif
-// Coarse layout: the 80 shared-expert w2 jobs right after the SH1 jobs (they run while routing finishes and the
-// first routed weights land) instead of after the first `lag` experts' R1 jobs.
 #ifndef DS41H_DECODER_SH2_EARLY
 #define DS41H_DECODER_SH2_EARLY 0
 #endif
@@ -238,12 +224,11 @@ static_assert(DS41H_DECODER_DENSE_MMA == 0 || DS41H_DECODER_DENSE_MMA == 1, "DEN
 #ifndef DS41H_DECODER_REL_DEP
 #define DS41H_DECODER_REL_DEP 0
 #endif
-// R1SPLIT (LC coarse m, host r1kp = 1): balanced R1F overflow. With 9 n R1F row blocks > ctas (n >= 30
-// experts at 264 CTAs, typical at m = 8 / k = 7) full-K jobs leave a second R1 wave of ~40-stage jobs on a few CTAs, and the
-// R2F jobs of those experts (and XF) wait for it (~+15-20 us per layer at n = 30). R1SPLIT keeps full-K jobs for the first
+// R1SPLIT (LC coarse m, host r1kp = 1): balanced R1F overflow.
+// R1SPLIT keeps full-K jobs for the first
 // nf = floor(ctas / 9) experts and splits the row blocks of the remaining n - nf experts into kps K parts (10 / 5 / 2 parts of
 // 4 / 8 / 20 stages, the most that still fit in one CTA wave), claimed right after the full-K jobs; partial sums + SwiGLU by
-// the last part (the r1kp > 1 path). Claim order [R1 full][R1 parts][SH2][R2 x 40 n][XF]. Lossless (fp32 order only).
+// the last part (the r1kp > 1 path). Claim order[SH2][R2 x 40 n][XF]. Lossless (fp32 order only).
 #ifndef DS41H_DECODER_R1SPLIT
 #define DS41H_DECODER_R1SPLIT 0
 #endif
@@ -284,15 +269,14 @@ static_assert(DS41H_DECODER_DENSE_MMA == 0 || DS41H_DECODER_DENSE_MMA == 1, "DEN
 #endif
 // PFR1 (ROUTE1 + LC coarse m): right after the routing table is released, the router CTA issues L2
 // prefetches (TMA prefetch.tensor) of the first PFR1 stages (w13 gate + up boxes) and of scale group 0 of every R1F row
-// block of every routed expert. In-situ k=7 (dec22t): table 72.8 us -> producers see it 74.0 -> first R1 issue 75.8 ->
-// first stage landed 78.6, p50 80.7 (all CTAs request their first 6 stages at once, ~12 MB from HBM); the HBM is nearly idle
+// block of every routed expert.
+// the HBM is nearly idle
 // during routing. Prefetch only (no data or order change: lossless by construction). 0 = off.
 #ifndef DS41H_DECODER_PFR1
 #define DS41H_DECODER_PFR1 0
 #endif
 // WOB3 (FUSED_Z + FUSED_AR1, coarse m <= 8): wo_b in ONE wave. Default: 80 row blocks x 4 K parts = 320
-// jobs of 4 stages on 264 CTAs -> a second wave (in-situ dec22t critical path: WOB 21.0-31.3 then 32.4-41.5 on the same CTA,
-// its OWNA slice ends 53.4 and gates the router). WOB3: 3 K parts of 5 / 5 / 6 stages (k32 [0,20) [20,40) [40,64)) = 240
+// jobs of 4 stages on 264 CTAs -> a second wave. WOB3: 3 K parts of 5 / 5 / 6 stages (k32 [0,20) [20,40) [40,64)) = 240
 // jobs, each fits the 6-stage ring (WOB1's 8-stage jobs did not). A part waits for the C_Z ranges it spans; the z fill
 // issues all its loads before converting (one L2 round trip instead of one per 128 vectors). Same per-k32 math, fp32 sum
 // order of the red.adds only (lossless).
@@ -328,8 +312,7 @@ static_assert(DS41H_DECODER_DENSE_MMA == 0 || DS41H_DECODER_DENSE_MMA == 1, "DEN
 #endif
 // R1SK (LC coarse m <= 8): stream-K R1F. The n x 9 row blocks x 40 stages (U stage units, expert-major,
 // block, K) are cut into J = ceil(U / T) jobs of T = round4(ceil(U / ctas)) stages, i.e. ONE balanced wave whatever n is.
-// Default: one 40-stage job per row block -> 9n jobs: n < 29 leaves 264 - 9n CTAs without R1 work for the whole ~45 us R1
-// wave (their R2 work waits for it), n >= 30 needs a second wave (R1SPLIT: K parts of the overflow experts). In situ: span =
+// In situ: span =
 // 106 + 2.71 n us (traced, n = 20..40). A job's segments are row-block K ranges; a segment covering a whole row block takes
 // the full-K path (in-job SwiGLU), otherwise its partial goes to hcacc (red4) and the row block's last segment (arrival
 // count = segments covering it) runs finish_r1f -- the K-part path of r1kp > 1 / R1SPLIT. Lossless (fp32 partial order only).
@@ -352,7 +335,7 @@ static_assert(DS41H_DECODER_DENSE_MMA == 0 || DS41H_DECODER_DENSE_MMA == 1, "DEN
 // TAGX (ROUTE1 + R1SK): the router also writes each slot's expert as a u64 {expert, epoch} (own scratch xtag)
 // before releasing C_ROUTE; a producer polls C_ROUTE (lane 0) and the tagged entries (all lanes) in the same
 // relaxed loop and finishes with one fence.acquire -- no final ld.acquire round trip (poll_ge) and no separate table read after
-// the table is seen (in situ: table released 72.8 -> producers see it 74.0 -> first R1 issue 75.8 us). Control only.
+// the table is seen. Control only.
 #ifndef DS41H_DECODER_TAGX
 #define DS41H_DECODER_TAGX 0
 #endif
@@ -404,7 +387,6 @@ static_assert(DS41H_DECODER_DENSE_MMA == 0 || DS41H_DECODER_DENSE_MMA == 1, "DEN
 // WARM_ROUTE: before its griddepcontrol.wait (in the model: while the attention still runs), the LAST CTA's consumers run
 // route_block + route_all on a private warm scratch (Params::ws: own counters / table / router sums / candidates), so
 // the routing code (one-shot per launch, otherwise fetched cold from HBM by whichever CTA routes ~60 us later) is in L2.
-// In-situ trace (dec18t): gate GEMM end -> R1 weights landed = 25 us, route_block 4.5 us, route_all select 4 us.
 #ifndef DS41H_DECODER_WARM_ROUTE
 #define DS41H_DECODER_WARM_ROUTE 0
 #endif
@@ -427,10 +409,7 @@ static_assert(DS41H_DECODER_DENSE_MMA == 0 || DS41H_DECODER_DENSE_MMA == 1, "DEN
 #ifndef DS41H_DECODER_SMEM_DIET
 #define DS41H_DECODER_SMEM_DIET (DS41H_DECODER_STAGES >= 7)
 #endif
-// Deterministic router sums: the gate jobs' K-part partials are added as 64-bit fixed point (2^-32 units,
-// red.add.u64: exact and order-independent) instead of fp32 red.add, so every rank (and every CTA's producer under
-// PROUTE) sees bitwise-identical logits (stock's replicated gate GEMM is identical across ranks; fp32 atomics in
-// arrival order are not, which could split a near-tie routing between ranks). One rounding to fp32 at the end.
+// One rounding to fp32 at the end.
 #ifndef DS41H_DECODER_GDET
 #define DS41H_DECODER_GDET 1
 #endif
@@ -450,8 +429,7 @@ static_assert(DS41H_DECODER_DENSE_MMA == 0 || DS41H_DECODER_DENSE_MMA == 1, "DEN
 // words into the HMMA), 4 = no per-warp scale tables (constant scales), 8 = no HMMA (conversions XOR-folded),
 // 16 = every expert slot streams the weights of slot 0's expert (L2-resident routed weights), 32 = R1F scale groups not
 // loaded, 64 = R2F K-tail box not loaded, 128 = no routed stage copies at all (consumer math on stale smem: the in-kernel
-// consumer cost with the ring handshake but without the memory stream). 256 = streamed dense GEMM jobs (wo_a / wo_b /
-// shared expert; not the gate, so routing stays real) skip their MMAs (stage handshake, fills and epilogues kept).
+// consumer cost with the ring handshake but without the memory stream). 256 = streamed dense GEMM jobs skip their MMAs (stage handshake, fills and epilogues kept).
 #ifndef DS41H_DECODER_ABL
 #define DS41H_DECODER_ABL 0
 #endif
@@ -604,9 +582,7 @@ constexpr int GATE_BLOCKS = EXPERTS / 64;
 constexpr int SH1_BLOCKS = INTER / 32;
 constexpr int KS_WOA = 8;
 constexpr int KS_WOB = 16;
-// GATE_KS: k16 steps per router-gate job (8: 240 jobs of 2 stages; 16: 120 jobs of 4 stages -> half the
-// u64 router-sum atomics and 120 more CTAs free for the shared expert while the gate runs; pair with SH2_EARLY so the shared
-// w2 jobs finish inside the routing gap instead of the routed phase). Same products / fixed-point sums (lossless).
+// GATE_KS: k16 steps per router-gate job. Same products / fixed-point sums (lossless).
 #ifndef DS41H_DECODER_GATE_KS
 #define DS41H_DECODER_GATE_KS 8
 #endif
@@ -635,12 +611,12 @@ constexpr int R2_SCALE_BYTES = 128 * S2_ROW;
 constexpr int WS_LD = 20;  // R2 scale table row pitch (18 used)
 
 // Coarse routed path (m <= COARSE_M).
-constexpr int R1C_BLOCKS = INTER / 32;  // R1 jobs (32 gate + 32 up rows) per expert and K part
+constexpr int R1C_BLOCKS = INTER / 32;
 constexpr int R1C_STAGES = HID / 256;   // full K: 20 stages of 64 rows x 128 B (+ 64 x 8 B scales)
 constexpr int XT_BYTES = HID * TILE;    // resident x tile: 8 tokens e4m3 in the wgmma B layout
 constexpr int HQI = KS_INTER * 256;     // per-expert h image (18 k32 x 8 tokens x 32 B, B layout)
-constexpr int TAB_LD = 20;              // coarse R1 scale table row pitch (16 used, conflict-free float4 reads)
-constexpr int TAB_LD1 = 12;             // unrolled coarse R1: per-stage table row pitch (8 used, conflict-free)
+constexpr int TAB_LD = 20;
+constexpr int TAB_LD1 = 12;             // per-stage table row pitch (8 used, conflict-free)
 constexpr int R1C_NB = DS41H_DECODER_R1C_NB;
 constexpr int MAXE = COARSE_M * TOPK;   // distinct experts at m <= COARSE_M
 
@@ -659,7 +635,7 @@ constexpr int SC_OFF = XS_OFF + STAGES * XSL;    // 3-slot scale group ring in b
 constexpr int HHI = KS_INTER * TILE * 64;        // f16 h tile of one expert slot (9 KB)
 constexpr int XHI = SLICES * TILE * 64;          // f16 x image of 8 token columns (80 KB)
 constexpr float FP4_F16 = 16384.0f;              // the direct FP4 -> f16 expansion is value * 2^-14
-constexpr int R1X_BLOCKS = LC ? R1F_BLOCKS : R1C_BLOCKS;  // coarse R1 row blocks per expert
+constexpr int R1X_BLOCKS = LC ? R1F_BLOCKS : R1C_BLOCKS;
 
 // bt: f16 staging (<= OTOK x KS_INTER x 64), resident e4m3 x tile (lossy coarse only), LC x-slice / scale rings above 16 KB.
 constexpr bool WS_SEP = ROUTED_WG || LCQ || DS41H_DECODER_SMEM_DIET == 0;  // R2 scale table outside wf (SMEM_DIET)
@@ -667,8 +643,6 @@ constexpr int BT_LC_RINGS = 16384 + DS41H_DECODER_STAGES * 4 * 8 * 64 + 3 * 128 
 constexpr int BT_A = OTOK * KS_INTER * 64 > BT_LC_RINGS ? OTOK * KS_INTER * 64 : BT_LC_RINGS;
 constexpr int BT = DS41H_DECODER_SMEM_DIET ? ((DS41H_DECODER_COARSE && !DS41H_DECODER_LOSSLESS) && XT_BYTES > BT_A ? XT_BYTES : BT_A)
                                            : (OTOK * KS_INTER * 64 > XT_BYTES ? OTOK * KS_INTER * 64 : XT_BYTES);
-// Per-warp ue8m0 -> float tables of the wgmma routed jobs ([stage parity][warp][32 rows x 4]) and
-// of the coarse R1 jobs ([warp][16 rows x TAB_LD]).
 constexpr int WFT_A = 2 * GW * 128 > GW * 16 * TAB_LD ? 2 * GW * 128 : GW * 16 * TAB_LD;
 constexpr int WFT = WFT_A > 2 * GW * 16 * TAB_LD1 ? WFT_A : 2 * GW * 16 * TAB_LD1;
 constexpr int BS = OTOK * KS_WOB;         // per-(token, K block) activation scale factors (wo_b)
@@ -718,7 +692,7 @@ __host__ __device__ __forceinline__ int owna_tiles(int m) { return cdiv(tiles_of
 __host__ __device__ __forceinline__ int owna_spans(int m) { return cdiv(tiles_of(m), owna_tiles(m)); }
 
 // Job index space, in claim order: [WOA][WOB + lagged XA][OWNA][XNORM][GATE][ROUTE][SH1][MIX]
-// [R1 x entries][per chunk: SH2, R2 x entries, lagged XF].
+// [per chunk: SH2, R2 x entries, lagged XF].
 // Coarse mode (m <= COARSE_M, see coarse()): the routed section is instead
 // [R1C of experts 0..ln-1][SH2 x 80][per expert e >= ln: R1C(e), R2C(e - ln)][R2C of the last ln][XF x 40]
 // with ln = min(lag, n): an expert's R2C jobs trail its R1C jobs by `lag` experts.
@@ -895,7 +869,7 @@ __device__ __forceinline__ Job decode_coarse(const Layout& L, int n, int r) {
     if (r < CHUNKS) return {J_XF, r, 0, 0, 1};
     return {J_END, 0, 0, 0, 1};
   }
-  if (R1SPLIT && L.kps > 1) {  // [R1 full: nf experts][R1 K parts: n - nf experts][SH2][R2 x 40 n][XF] (see R1SPLIT)
+  if (R1SPLIT && L.kps > 1) {  // [SH2][R2 x 40 n][XF] (see R1SPLIT)
     const int full = R1F_BLOCKS * L.nf, parts = R1F_BLOCKS * (n - L.nf) * L.kps;
     if (r < full) return Job{J_R1C, r / R1F_BLOCKS, r % R1F_BLOCKS, 0, R1F_STAGES};
     r -= full;
@@ -981,8 +955,8 @@ constexpr int C_SF = C_HS + GROUPS;                // FFN contributions per chun
 constexpr int C_FIN = C_SF + CHUNKS;               // finished CTAs
 constexpr int CACHED = C_FIN;
 constexpr int C_PUB = C_FIN + 1;                   // exchange arrivals per (which, stage, chunk)
-constexpr int C_R1A = C_PUB + 4 * CHUNKS;          // R1 K parts per (entry, block)
-constexpr int C_R1D = C_R1A + ENTRIES * (R1_BLOCKS > R1C_BLOCKS ? R1_BLOCKS : R1C_BLOCKS); // finished R1 blocks per entry
+constexpr int C_R1A = C_PUB + 4 * CHUNKS;
+constexpr int C_R1D = C_R1A + ENTRIES * (R1_BLOCKS > R1C_BLOCKS ? R1_BLOCKS : R1C_BLOCKS);
 constexpr int C_NENT = C_R1D + ENTRIES;
 constexpr int C_ECOUNT = C_NENT + 1;
 constexpr int C_GB = C_ECOUNT + EXPERTS;           // gate jobs per 64-expert row block (hierarchical routing)
@@ -1040,7 +1014,7 @@ struct Scratch {
   __half* hh;            // [ROUTES, INTER] routed activation, f16 P8
   float* yracc;          // [MAXM, HID] routed down accumulators (weighted)
   // e4m3 copies in wg order for the RS-wgmma paths (written only when the variant is on)
-  uint8_t* xq;           // [MAXM, HID] x / xs (FFN input, R1 + shared w1/w3)
+  uint8_t* xq;           // [MAXM, HID] x / xs
   uint8_t* hq;           // [ROUTES, INTER] routed activation * H_INV (R2)
   uint8_t* zq;           // [MAXM, OA] z * 2^-(ze - 127 + 6) (wo_b; ze as for zh)
   uint8_t* hsq;          // [MAXM, INTER] shared activation * H_INV (shared w2)
@@ -1089,7 +1063,7 @@ struct Weights {
   const uint8_t* pf[PF_MAX];
   long pf_len[PF_MAX];
   long pf_total;
-  int pf_phase;  // 0: the pf ranges are prefetched during the OWNA jobs; 1: during the coarse R1 jobs (routed phase)
+  int pf_phase;  // 0: the pf ranges are prefetched during the OWNA jobs
   // Coarse mode: L2 prefetch (evict_normal, above the evict_first routed stream) of the NEXT layer's
   // latency-critical dense weights (wo_a, wo_b, gate, fn), spread over this layer's R1C jobs (the routed
   // phase streams HBM anyway, the next layer's dense chain then reads L2).
@@ -1119,10 +1093,9 @@ struct Params {
   float* ffn_post;
   float* ffn_comb;
   float* ffn_pre;
-  int r1kp;  // coarse: K parts per R1 row block (1 = full K, 2; LC also 5)
+  int r1kp;
   int lag;   // coarse: R2C jobs of expert e follow the R1C jobs of expert e + lag
   Scratch ws;  // WARM_ROUTE: copy of s with private routing buffers (counters, table, router sums, candidates, top-k, wtok)
-  // XF_P1A (optional, nullptr = off): the next layer's prologue phase P1a computed by the XF jobs (see xf_p1a):
   __nv_bfloat16* p1_resid;  // [m, 4, 5120] bf16: post-mapped residual stream (the next layer's residual)
   __nv_bfloat16* p1_xcb;    // [m, 5120] bf16: collapse with ffn_pre
   float* p1_xsq;            // [m, SLICES] fp32: per 32-column slice square sums of the bf16 collapse
@@ -1132,7 +1105,7 @@ struct Smem {
   __align__(1024) uint8_t ring[STAGES][STAGE];
   __align__(128) uint8_t bt[BT];   // f16 / e4m3 activation staging; coarse mode: resident x tile
   __align__(128) uint8_t bt2[LCQ ? HQI : 128]; // lossy coarse mode: R2C / SH2 B tiles (bt holds x)
-  __align__(16) float wf[WFT];     // per-warp scale tables (routed wgmma / coarse R1); also holds ws unless ROUTED_WG
+  __align__(16) float wf[WFT];     // per-warp scale tables; also holds ws unless ROUTED_WG
   __align__(16) float bs[BS];
   __align__(16) uint8_t ws_sep[WS_SEP ? WS : 16];  // separate R2 scale table (routed_wg users: wf = their tables)
   unsigned long long full[STAGES];
@@ -2019,7 +1992,7 @@ __device__ __forceinline__ void gemm(Ctx& c, const Span& sp, int ksteps, float (
       }
       if (!HOLD && s) c.next();
       const uint8_t* stage = HOLD ? c.held(s) : c.stage();
-      if constexpr ((ABL & 256) != 0 && !HOLD) {  // ablation: no dense math (the gate keeps its: routing must stay real)
+      if constexpr ((ABL & 256) != 0 && !HOLD) {  // ablation: no dense math
       } else if (s * 4 + 3 < ksteps) {  // full stage (the common case): no per-q bound checks
 #pragma unroll
         for (int q = 0; q < 4; ++q) step(acc[0], stage, q, c.warp, load(0, s * 4 + q));
@@ -2691,7 +2664,7 @@ __device__ CTXFN void job_xnorm(Ctx& c, int kp, int t8) {
   c.signal(C_XK + kp * GROUPS + t8 * TILE / OTOK);
 }
 
-// Router sums of this launch (buffer epoch & 1; the gate jobs clear the other buffer for the next launch).
+// Router sums of this launch.
 __device__ __forceinline__ float* gsum(const Params& p, unsigned epoch) { return p.s.gacc + long(epoch & 1u) * MAXM * EXPERTS; }
 __device__ __forceinline__ unsigned long long* gsum64(const Params& p, unsigned epoch) {
   return reinterpret_cast<unsigned long long*>(p.s.gacc) + long(epoch & 1u) * MAXM * EXPERTS;
@@ -2832,8 +2805,7 @@ __device__ __noinline__ void route_fast_nc(const Params& p, Smem& sm, int tid, u
 __device__ __noinline__ void route_lean_nc(const Params& p, Smem& sm, int tid, unsigned epoch);
 __device__ __noinline__ void route1_nc(const Params& p, Smem& sm, int tid, unsigned epoch);
 
-// Hierarchical routing: the gate job finishing a 64-expert row block (all K parts, all token groups)
-// computes the block's per-token top-6 candidates; the last of the GATE_BLOCKS block finishers
+// the last of the GATE_BLOCKS block finishers
 // merges them and builds the routing table (route_all). Exact: the global top-6 (ties -> lowest
 // expert) is the top-6 of the union of the blocks' top-6.
 __device__ CTXFN void gate_clears(Ctx& c, int rb, int kp, int tg);
@@ -4010,7 +3982,7 @@ __device__ __forceinline__ void r2_scale_table(Ctx& c, const uint8_t* stage) {
 }
 
 // FP4 x f16 GEMM for one routed entry (<= 32 routes). Each stage: 128 weight rows; warp row tile
-// rt = 32 rows = two 16-row m-tiles. R1 (w13): 4 stages x 4 K blocks. R2 (w2): stage 0 = K
+// rt = 32 rows = two 16-row m-tiles. 4 stages x 4 K blocks. R2 (w2): stage 0 = K
 // blocks 16-17 (+ scales), stages 1-4 = K blocks 4(s-1)..4(s-1)+3.
 template <bool R2, class Store>
 __device__ __forceinline__ void routed(Ctx& c, const Span& en, int ks, Store store) {
@@ -4092,8 +4064,8 @@ __device__ __forceinline__ void routed(Ctx& c, const Span& en, int ks, Store sto
   }
 }
 
-// FP4 x e4m3 RS-wgmma GEMM for one routed entry of <= 8 NT routes (ROUTED_MMA=1). Same stage
-// layout and job/stage protocol as routed(): R1 = 4 stages of 128 rows x 4 k32; R2 = stage 0 (K
+// FP4 x e4m3 RS-wgmma GEMM for one routed entry of <= 8 NT routes (ROUTED_MMA=1).
+// R2 = stage 0 (K
 // blocks 16-17 + the job's scale block), stages 1-4 = K blocks 4(s-1)... (RoutedPlan units: stage
 // x 64-row m-tile (rows 64 mt + 16 warp ..+15 of this warp) x 4 or 2 k32 blocks). Per k32 and
 // warp (16 rows x 32 k = 256 B of FP4): 0.5 ldmatrix.x4, 2 x 7 integer ops (fp4_frag), 1 wgmma,
@@ -4195,7 +4167,7 @@ __device__ __forceinline__ void routed_wg(Ctx& c, const Span& en, float post, St
     }
 }
 
-// R1 (w13) GEMM of one routed job: stage the entry's x rows and run the HMMA or wgmma loop into
+// stage the entry's x rows and run the HMMA or wgmma loop into
 // hacc. Shared by the megakernel (job_r1) and the routed micro-benchmark.
 template <bool WG>
 __device__ __forceinline__ void r1_gemm(Ctx& c, const Job& job, const Span& en) {
@@ -4285,7 +4257,7 @@ __device__ CTXFN void load_xres(Ctx& c) {
   if (c.sm.xres) return;
   const Params& p = c.p;
   c.sync();  // earlier generic accesses of bt are done
-  if (c.tid == 0) {  // one 40 KB bulk copy of the image the gate jobs wrote (token columns >= m: stale, finite, unused)
+  if (c.tid == 0) {  // stale, finite, unused)
     fence_proxy_async();
     mbar_expect_tx(&c.sm.xbar, XT_BYTES);
     bulk_g2s(c.sm.bt, p.s.xqi, XT_BYTES, &c.sm.xbar, evict_first_policy());
@@ -4295,12 +4267,11 @@ __device__ CTXFN void load_xres(Ctx& c) {
   if (c.tid == 0) c.sm.xres = 1;  // read again only in a later job (after further barriers)
 }
 
-// Coarse R1 stage tile: 64 rows (0-31 gate rows 32 b.., 32-63 up rows INTER + 32 b..) x 128 B, the
+// 64 rows (0-31 gate rows 32 b.., 32-63 up rows INTER + 32 b..) x 128 B, the
 // 16-byte chunks XOR-swizzled by row & 7 (conflict-free ldmatrix), 64 x 8 B scales at SCALE_OFF.
 __device__ __forceinline__ int fp4_off128(int row, int chunk) { return row * 128 + ((chunk ^ (row & 7)) << 4); }
 
-// One pair of coarse R1 stages (16 k32 blocks, B blocks kb..kb+15 of the resident x tile) for this
-// warp: rows 16 warp .. +15 of the 64-row tile. Pipeline of 4 units of 4 k32 (two commit groups in
+// +15 of the 64-row tile. Pipeline of 4 units of 4 k32 (two commit groups in
 // flight, drained at the end of the pair); each stage is released after its last ldmatrix.
 __device__ __forceinline__ void r1c_pair(Ctx& c, const uint8_t* s0, const uint8_t* s1, const uint32_t (&uoff)[4], uint64_t xdesc, int kb, float (&tot)[4]) {
   const int g = c.lane >> 2;
@@ -4373,7 +4344,7 @@ __device__ __forceinline__ void store_hqi(const Params& p, int slot, int b, int 
   p.s.hqi[long(slot) * HQI + b * 256 + (pos >> 4) * 128 + tok * 16 + (pos & 15)] = e4m3_byte(h * H_INV);
 }
 
-// Second K part of a coarse R1 row block (R1_KP = 2): SwiGLU of the summed partials.
+// SwiGLU of the summed partials.
 __device__ CTXFN void finish_r1c(Ctx& c, int slot, int b) {
   const Params& p = c.p;
   for (int i = c.tid; i < 32 * TILE; i += GT) {
@@ -4388,7 +4359,7 @@ __device__ CTXFN void finish_r1c(Ctx& c, int slot, int b) {
   c.signal(C_R1D + slot);
 }
 
-// Unrolled coarse R1 (R1C_NB >= 2): the job's NS stages as 2 NS units of 4 k32 in one straight-line
+// the job's NS stages as 2 NS units of 4 k32 in one straight-line
 // pipeline with NB commit groups in flight (ptxas keeps wgmma asynchronous only without loop back-
 // edges); per-stage scale tables double-buffered by stage parity; each stage is released after its
 // last ldmatrix. Stage s holds k32 blocks kb0 + 8 s .. +7.
@@ -4467,7 +4438,7 @@ __device__ __forceinline__ void r1c_unrolled(Ctx& c, const uint32_t (&uoff)[4], 
   retire(IC<U - 1>{});
 }
 
-// Coarse R1 job: expert slot a, row block b (32 gate + 32 up rows), K part c of L.kp (job.stages
+// expert slot a, row block b (32 gate + 32 up rows), K part c of L.kp (job.stages
 // stages of 128 B per row). Warps 0/1 hold gate rows 16 w + g (+8), warps 2/3 the matching up rows.
 __device__ WG_INLINE void job_r1c(Ctx& c, const Job& job) {
   const Params& p = c.p;
@@ -5150,15 +5121,11 @@ __device__ WG_INLINE void job_r2f(Ctx& c, const Job& job) {
   }
 }
 
-// XF_P1A: with p.p1_resid set, each XF job also runs
-// the next layer's prologue phase P1a for its chunk's 4 column slices (warp w = slice 4 k + w, lane = column) and all m
-// tokens, bit-identical to prologue.cu p1_collapse (MODE 0, no aux capture): new_r[j] = post[j] * y, then
-// fma(comb[k][j], resid1[k], .) for k = 0..3 (explicit RN, no contraction), bf16 -> p1_resid; xc = pre[0] * bf16(new_r[0]),
+// xc = pre[0] * bf16(new_r[0])
 // then fma(pre[j], bf16(new_r[j]), .) -> bf16 p1_xcb; p1_xsq[tok][slice] = warp_sum(xf * xf) (xor butterfly).
 // y = this layer's FFN output (y_ffn, the chunk just reduced by this CTA), post / comb / pre = its MIX outputs.
 // Staging in bt (free during XF): co = [tok][24] fp32 (post[4] | pre[4] | comb[4][4]), rr = [tok][4 streams][128 columns]
-// bf16 resid1 of the chunk. xf_p1a_pre issues them as cp.async (after the MIX acquire) BEFORE the all-reduce, so the
-// P1a tail after it only waits for the y loads.
+// bf16 resid1 of the chunk.
 constexpr int P1A_RR = COARSE_M * 24 * 4;  // byte offset of rr in bt (XF_P1A: m <= COARSE_M, checked on the host)
 static_assert(P1A_RR + COARSE_M * HC * CHUNK_COLS * 2 <= BT, "XF_P1A staging fits in bt");
 __device__ CTXFN void xf_p1a_pre(Ctx& c, int k) {
@@ -5336,7 +5303,7 @@ __device__ CTXFN void deps(Ctx& c, const Job& job) {
     }
     case J_SH2: return c.wait(C_HS + job.c, SH1_BLOCKS);
     case J_MIX: return c.wait(C_A + job.a * GW / TILE, SLICES);
-    // R1 reads xh written before C_G (gate) / C_XK; route_all acquires C_G (last arrival) and the
+    // route_all acquires C_G (last arrival) and the
     // producer acquires C_ROUTE before decoding any routed job, which orders those writes.
     case J_R2: return c.wait(C_R1D + job.a, R1_BLOCKS);
     case J_R2C:
@@ -5493,7 +5460,7 @@ __device__ __forceinline__ void issue(const Params& p, const Job job, int s, con
       }
       return;
     case J_R1: {
-      // Rows 0-63: gate (w1) rows bb*64.., rows 64-127: up (w3) rows INTER + bb*64..; bytes
+      // bytes
       // kp*256 + s*64 .. +63 (K blocks kp*16 + 4s .. +3) of each 2560-byte raw row.
       const uint8_t* base = w.w13 + job.e * w.w13_e + job.c * (KS_R1 * 16) + s * 64;
       const int bb = job.b;
@@ -5558,7 +5525,6 @@ __device__ __forceinline__ void issue(const Params& p, const Job job, int s, con
   }
 }
 
-// ------------------------------------------------------------------------------ TMA (coarse R1 stages)
 __device__ __forceinline__ void mbar_expect_tx(unsigned long long* bar, uint32_t bytes) {
   asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(bar)), "r"(bytes) : "memory");
 }
@@ -5575,7 +5541,7 @@ __device__ __forceinline__ void tma4d(void* dst, const CUtensorMap* map, int c0,
       : "memory");
 }
 
-// One coarse R1 stage by TMA (one lane): gate / up rows 32 b.. of expert e, 128-byte K chunk kc ->
+// gate / up rows 32 b.. of expert e, 128-byte K chunk kc ->
 // [32 rows][128 B] 128B-swizzled boxes at 0 / 4096 (= fp4_off128 layout), and the 16 scale bytes of
 // the stage pair kc & ~1 of the 64 rows at SCALE_OFF (row r at r * 16; the stage's 8 at (kc & 1) * 8).
 __device__ __forceinline__ void issue_r1c_tma(const Params& p, const Job& job, int s, uint8_t* st, unsigned long long* bar, uint64_t pol) {
@@ -5611,7 +5577,7 @@ __device__ __forceinline__ void issue_r2c_tma(const Params& p, const Job& job, i
 
 // One R1F stage (one lane, LC): gate / up rows 64 b.. of expert e, 64-byte K chunk kc = c * stages + s ->
 // two [64 rows][64 B] 64B-swizzled boxes at 0 / 4096 (= the fp4_off64 layout of the 128-row tile), the f16 x
-// slice of kc (k32 blocks 4 kc..+3, 2 KB of the gate jobs' xhi image) -> xs, and on every 4th stage the scale
+// slice of kc -> xs, and on every 4th stage the scale
 // group kc / 4 (16 B = 4 stages x 4 k32 per row, gate rows then up rows) -> sc (scale ring slot).
 __device__ __forceinline__ void issue_r1f(const Params& p, const Job& job, int s, uint8_t* st, uint8_t* xs, uint8_t* sc, unsigned long long* bar, uint64_t pol,
                                           uint64_t xpol) {
@@ -6001,7 +5967,7 @@ __global__ void __launch_bounds__(THREADS, PER_SM) layer_kernel(const __grid_con
 }
 
 // ------------------------------------------------------------------------------ routed micro-benchmark
-// Only the routed-expert GEMM jobs (R1 = w13, R2 = w2; no routing, SwiGLU or dependency counters)
+// Only the routed-expert GEMM jobs
 // of `slots` (expert, route list) entries, through the same producer issue(), smem ring and
 // r1_gemm / r2_gemm as the layer kernel, with the HMMA (WG = false) or RS-wgmma (WG = true) inner
 // loops. Inputs p.s.xh / xq (per token = route / TOPK), p.s.hh / hq (per route); outputs red.add
@@ -6012,8 +5978,8 @@ struct Bench {
   const int* slot_routes;  // [slots, SPAN] route ids
   const int* slot_count;   // [slots] routes of the slot (1..SPAN)
   int slots;
-  int r1;                  // R1 jobs per slot (R1_JOBS or 0)
-  int r2;                  // R2 jobs per slot (R2_BLOCKS or 0)
+  int r1;
+  int r2;                  // R2 jobs per slot
   unsigned* claim;         // job claim counter, zeroed before every launch
 };
 
@@ -6095,7 +6061,7 @@ struct Engine {
   int nranks;
   int ctas;
   int device;
-  int r1kp;  // coarse R1 K parts (0 = auto, 1, 2, LC: 5)
+  int r1kp;
   int lag;   // coarse R2C expert lag (0 = auto)
   std::vector<Layer> layers;
 };
@@ -6164,7 +6130,7 @@ void bind_experts(Layer& l, const torch::Tensor& w13, const torch::Tensor& s13, 
   l.w.s13_e = s13.stride(0);
   l.w.w2_e = w2.stride(0);
   l.w.s2_e = s2.stride(0);
-  if (R1C_TMA && COARSE) {  // coarse R1 stage boxes (see issue_r1c_tma)
+  if (R1C_TMA && COARSE) {
     const cuuint64_t E = w13.size(0);
     tmap_encode(&l.w.tm_w13, w13.data_ptr(), 4, {128, 2 * INTER, W13_ROW / 128, E}, {W13_ROW, 128, cuuint64_t(w13.stride(0))}, {128, 32, 1, 1},
                 CU_TENSOR_MAP_SWIZZLE_128B, "w13");
@@ -6344,7 +6310,6 @@ void set_prefetch(int64_t handle, int64_t layer, std::vector<torch::Tensor> tens
   }
 }
 
-// Prefetch phase of a layer's pf ranges (set_prefetch dense=false): 0 = OWNA jobs, 1 = coarse R1 jobs.
 void set_prefetch_phase(int64_t handle, int64_t layer, int64_t phase) {
   TORCH_CHECK(phase == 0 || phase == 1, "phase must be 0 (OWNA) or 1 (routed R1 jobs)");
   engines.at(handle).layers.at(layer).w.pf_phase = int(phase);
@@ -6423,7 +6388,7 @@ void run(int64_t handle, int64_t layer, torch::Tensor o, torch::Tensor positions
     p.p1_xcb = mut_ptr<__nv_bfloat16>(*p1_xcb);
     p.p1_xsq = mut_ptr<float>(*p1_xsq);
   }
-  // R1 K parts: r1kp = 0 (default) = auto: LC splits K for small m so the few experts' R1F jobs still fill
+  // r1kp = 0 (default) = auto: LC splits K for small m so the few experts' R1F jobs still fill
   // the grid (m = 1: ~6 experts x 9 row blocks = 54 full-K jobs -> 5 K parts of 8 stages each).
   p.r1kp = e.r1kp > 0 ? e.r1kp : LC && m <= 1 ? 5 : LC && m <= 3 ? 2 : (LC && R1KP_DYN && m <= COARSE_M) ? 0 : 1;
   // An expert's R2C jobs follow its R1C jobs by `lag` experts: about 1.5 grids of R1C jobs, so its
@@ -6443,8 +6408,6 @@ std::vector<torch::Tensor> debug_topk(int64_t handle) {
 
 int64_t layer_ctas(int64_t handle) { return engines.at(handle).ctas; }
 
-// Coarse routed path knobs (m <= COARSE_M): R1 K parts (0 = auto by m, 1 = full K, 2; LC also 5) and the R2
-// expert lag (0 = auto).
 void set_coarse(int64_t handle, int64_t r1kp, int64_t lag) {
   TORCH_CHECK(r1kp == 0 || r1kp == 1 || r1kp == 2 || (LC && r1kp == 5), "r1kp must be 0 (auto), 1, 2 (or 5 on the lossless path)");
   TORCH_CHECK(lag >= 0, "lag must be >= 0");
@@ -6471,7 +6434,7 @@ torch::Tensor trace_dump(int64_t handle, bool clear) {
 double layer_xs(int64_t handle, int64_t layer) { return engines.at(handle).layers.at(layer).w.xs; }
 
 // Routed-expert GEMM micro-benchmark / unit test (see routed_bench_kernel). wg: 0 = HMMA loops,
-// 1 = RS-wgmma loops. mode: 1 = R1 only, 2 = R2 only, 3 = both. Experts: raw layout with any
+// 1 = RS-wgmma loops. Experts: raw layout with any
 // expert count E. xh f16 [T, HID] (P8), xq e4m3 [T, HID] (wg order, x / xs), hh f16 [R, INTER]
 // (P8), hq e4m3 [R, INTER] (wg order, h * 4), topk_w fp32 [R], hacc fp32 [R, 2 INTER], yracc fp32
 // [T, HID] (accumulated into), claim int32 [1] scratch. Launches `reps` times on the current stream.

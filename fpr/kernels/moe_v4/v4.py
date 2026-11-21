@@ -1,16 +1,7 @@
 #!/usr/bin/env python3
 """moe_v4 drop-in: the fork's routed-MoE GEMM kernels with the moe_v4 options compiled in.
 
-    from moe_v4 import v4
-    ext, r2 = v4.load()          # torch extensions (moe_v4.cu + its route2.cu copy), built once per config
-    r2.route2(ids, w, T, ecs, t1, t2, counts, slotmap, rts, grid, inv)   # same call as route2_ext.route2
-    ext.prepr(...) / ext.prepr2(...) / ext.prepr5(...)                    # unchanged token-image builders
-    ext.gemm1r(w13, s13, ecs, t1, counts, img, himg, 0)                   # same signatures as moe_raw_ext
-    ext.gemm2r(w2, s2, ecs, t2, counts, himg, Y, 0)
-    ext.combine(Y, slotmap, sh, out)
-
-The GEMMs must be fed by THIS route2 build: with R2_G1PAIR / R2_G2PAIR its t1 / t2 lists hold pair items (q | 0x100) and
-counts[1] / counts[2] count items, not tiles. Buffer sizes are unchanged (pair lists are shorter). EC records, slot map,
+Buffer sizes are unchanged (pair lists are shorter). EC records, slot map
 image / H layouts and Y are byte-identical to moe_raw + route2, so prepr*, combine and phys_moe's buffers work as before.
 Not supported with these lists: route2x / gemm1r8 / gemm2r8 (the n_pad-8 row-stream kernels).
 """
@@ -27,11 +18,18 @@ ROUTE_KEYS = {"MS4_G1P": "R2_G1PAIR", "MS4_G2P": "R2_G2PAIR"}
 def load(defs=None, build_root=None):
     from torch.utils.cpp_extension import load as _load
     d = dict(DEFAULT if defs is None else defs)
+    if defs is None and os.environ.get("MOE_V4_DEFS"):   # MOE_V4_DEFS=MS3_S=4,MS4_PDL=1
+        d.update(kv.split("=", 1) for kv in os.environ["MOE_V4_DEFS"].split(",") if "=" in kv)
     root = build_root or os.environ.get("MOE_V4_BUILD", os.path.join(HERE, "build"))
     tag = "".join(f"_{k.lower()}{v}" for k, v in sorted(d.items()))
+    # MOE_V4_SRC: another source file in this directory (e.g.
+    # moe_v4_dqmix.cu); its name goes into the extension tag, so the served build is never overwritten
+    src = os.environ.get("MOE_V4_SRC", "moe_v4.cu")
+    if src != "moe_v4.cu":
+        tag += "_src" + os.path.splitext(os.path.basename(src))[0].replace("moe_v4_", "")
     bd = os.path.join(root, "v4api" + tag)
     os.makedirs(bd, exist_ok=True)
-    ext = _load(name="moe_v4_api" + tag, sources=[os.path.join(HERE, "moe_v4.cu")], build_directory=bd, verbose=False,
+    ext = _load(name="moe_v4_api" + tag, sources=[os.path.join(HERE, src)], build_directory=bd, verbose=False,
                 extra_cuda_cflags=CFLAGS + [f"-D{k}={v}" for k, v in sorted(d.items())])
     rd = {ROUTE_KEYS[k]: v for k, v in d.items() if k in ROUTE_KEYS}
     rtag = "".join(f"_{k.lower()}{v}" for k, v in sorted(rd.items()))

@@ -1,13 +1,8 @@
-"""Rank-aware scheduler of the ds41h-phys serving engine: sequence-to-rank placement, per-rank prefill quota,
-admission, preemption, migration.
-
-Pure policy over abstract requests (stdlib only, CPU-testable). The vLLM adapter (adapter/phys_scheduler.py) wraps it in
+"""Pure policy over abstract requests (stdlib only, CPU-testable). The vLLM adapter (adapter/phys_scheduler.py) wraps it in
 a vLLM SchedulerInterface; a CPU simulation can drive it with a long-context agentic workload.
 
 One step:
-  1. every decoding sequence gets its k + 1 = 4 rows on its owner rank (KV for 4 more positions; on a full rank:
-     free cached pages are evicted first, then the newest sequence of THAT rank is moved to another rank, or preempted
-     by recompute if no rank has room -- never a sequence on another rank);
+  1. every decoding sequence gets its k + 1 = 4 rows on its owner rank
   2. optional rebalance: when the per-rank load spread stays above a threshold, one decoding sequence moves from the
      heaviest to the lightest rank (pages copied rank-to-rank, the sequence skips one step);
   3. admission, FCFS: each waiting request goes to the rank that minimizes the largest projected rank load (its rows,
@@ -26,13 +21,14 @@ Image prompts (Request.images: one (offset, length, identifier) per image, the i
   * every prefill work item lists the images overlapping its positions (SeqWork.images), the bounded replay below a
     cache hit included: the engine needs those images' encoder outputs for that step;
   * a prompt with images prefills on its owner rank only (no context-parallel chunks) and is never moved (stolen,
-    rebalanced or relieved by a move) before its prefill completes; a memory-relief victim among them is preempted
-    (recomputed) instead. After the prefill it moves like any other sequence. This is a performance limit only: a long
+    rebalanced or relieved by a move) before its prefill completes
+After the prefill it moves like any other sequence. This is a performance limit only: a long
     image prompt prefills at one rank's speed. SchedConfig.image_pin (default on) holds these two rules.
 """
 from __future__ import annotations
 
 import bisect
+import os
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Hashable, Optional
@@ -42,6 +38,13 @@ from geometry import SLIDING_WINDOW, Geometry
 from kv_manager import CopyOp, OwnedKVManager
 
 WAITING, PREFILL, DECODE, FINISHED = "waiting", "prefill", "decode", "finished"
+
+# FPR_C1_KMAX: k_max > geometry.spec_k widens a
+# step whose ONLY work is one decoding sequence to 1 + k_max rows (a "C1 step"); every other step keeps k + 1 rows per
+# sequence. Decided at the end of schedule(), once admission / prefill can no longer add work (_c1_widen). Not in
+# SchedConfig: the C++ port and the gtrace recorder serialize every SchedConfig field (and the C++ scheduler has no
+# widened path: RankScheduler stays Python while it is on).
+C1_KMAX = int(os.environ.get("FPR_C1_KMAX", "0") or 0)
 
 
 @dataclass(eq=False)          # identity equality: `q in running` / remove() must not compare every field
@@ -63,8 +66,7 @@ class Request:
     rank: Optional[int] = None
     num_computed: int = 0                  # positions whose KV is final (window + paged)
     num_output: int = 0
-    prefill_end: int = 0                   # positions to (re)compute before decoding: prompt_len, or after a
-                                           # preemption prompt_len + num_output (vLLM recompute semantics)
+    prefill_end: int = 0
     cached_tokens: int = 0                 # prefix-cache hit of the current admission (positions)
     replay_start: int = 0
     skip_until_step: int = -1              # migrated: resumes at this step
@@ -83,10 +85,13 @@ class Request:
     n_preempt: int = 0
     n_migrate: int = 0
     inflight: int = 0                      # async mode: scheduled decode steps not settled yet
+    inflight_rows: int = 0                 # async mode: their rows (k + 1 each; 1 + k_max for a widened C1 step)
+    c1_wide_ok: bool = True                # FPR_C1_KMAX: this sequence may run widened C1 steps (the adapter clears it
+                                           # for structured-output requests: grammar rows are built for k drafts)
     first_pending: bool = False            # async mode: last prefill chunk scheduled, its sampled token not known yet
     uid: int = -1                          # global sequence slot 0 .. max_seqs - 1, stable across rank moves (the
                                            # engine keys rank-independent per-sequence state by it, e.g. the head's
-                                           # vocab-sharded sampler state); new uid after a preemption
+                                           # vocab-sharded sampler state)
     hit_tokens_total: int = 0              # accounting: prompt tokens served from the prefix cache (incl. copies)
     copied_tokens_total: int = 0
 
@@ -243,8 +248,6 @@ class SchedConfig:
                                            # short prefills (> 64K TTFT: served 20-30 s at 6-16K tok/s per prompt)
     cp_force_room_frac: float = 0.5
     cp_force_srpt_min_left: int = 0        # ... and a prompt in CP with fewer tokens left than this is never overtaken
-                                           # (131072: only a huge prompt yields; 32-64K arrivals preempting a 100K one
-                                           # cost the 64-128K class in the sim)
     cp_force_srpt_hold: float = 1.0        # ... cp_force_order "srpt": a prompt already in CP keeps its slot until a
                                            # waiting forced prompt has fewer than hold x its tokens left (1.0: plain
                                            # srpt; 0.5: an 89K prompt overtakes a 240K one mid-prefill, not a 100K one;
@@ -273,6 +276,25 @@ class SchedConfig:
     steal: bool = True                     # a rank without prefill backlog takes a not-yet-started prefill elsewhere
     steal_min_backlog_steps: float = 2.0   # ... if the donor's backlog exceeds this many steps of prefill slack
     max_steals_per_step: int = 2
+    bucket_aware: bool = False             # decode-bucket-aware seats. The engine runs a
+                                           # decode step on the smallest graph bucket >= the LARGEST per-rank row count,
+                                           # the same bucket on every rank, so one seat over an edge (33 / 31 seats at
+                                           # 128 rows) pads every rank to the next bucket. Goal bucket G = the bucket of a balanced split of the seats (with the
+                                           # new one). On: balanced placement tries the ranks whose next seat stays
+                                           # within G before the others (the tolerance among them), and a request whose
+                                           # within-G rank waits for copy budget waits a step instead of falling through
+                                           # to a rank past G; memory-relief
+                                           # moves prefer ranks within G; a load rebalance never moves past G; sync
+                                           # mode: each rebalance check moves one decoding sequence from the fullest to
+                                           # the emptiest rank while the bucket exceeds G. Steals stay as they are (sim,
+                                           # saturated 128 seats: guarding them cost prefill throughput, +2 % run time,
+                                           # while placement re-fills an under-full rank at the next admissions).
+                                           # Seats = running sequences (prefilling ones decode soon) x (k + 1) rows
+    decode_buckets: str = ""               # ... the engine's decode buckets (rows per rank, "4:8:32:...:320"; the adapter
+                                           # fills it from EngineConfig.buckets when bucket_aware is on; "" = off)
+    bucket_min_rows: int = 64              # ... only while G is >= this many rows: smaller decode steps are weight-bound (a
+                                           # bigger bucket costs ~nothing) and keeping them small could send a request
+                                           # away from its cached prefix for no gain
 
 
 @dataclass
@@ -310,6 +332,19 @@ class StepPlan:
 
 
 class RankScheduler:
+    def __new__(cls, *a, **k):
+        import os as _os
+        if cls is RankScheduler and _os.environ.get("PHYS_CXX_SCHED") == "1" and C1_KMAX <= 3:
+            import sys as _sys                                                   # scheduler behind this Python surface
+            _d = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "core", "src", "scheduler")
+            if _d not in _sys.path:
+                _sys.path.insert(0, _d)
+            import cxx_sched                                  # fpr/core/src/scheduler/cxx_sched.py (None: not portable,
+            s = cxx_sched.make(*a, **k)                       # e.g. ProdCostModel -> this Python class)
+            if s is not None:
+                return s
+        return super().__new__(cls)
+
     def __init__(self, geom: Geometry, cost: CostModel, cfg: SchedConfig | None = None):
         self.g, self.cost, self.cfg = geom, cost, cfg or SchedConfig()
         self.kv = OwnedKVManager(geom)
@@ -324,11 +359,22 @@ class RankScheduler:
                           copy_over_budget=0, rejected_too_long=0, cp_chunks=0, cp_rows=0, cp_copy_pages=0)
         self.rejected: dict = {}                  # rid -> reason (add_request: no rank could ever hold it)
         self.free_uids: deque[int] = deque(range(geom.max_seqs))
-        self.prefilling: set = set()              # running requests in phase PREFILL (host time: no O(n) scans)
+        self.prefilling: dict = {}                # running requests in phase PREFILL (host time: no O(n) scans); a dict
+                                                  # for its insertion order (a set of identity-hashed requests iterates
+                                                  # by address: _steal's per-rank backlog sums were not reproducible)
         self.pf_credit = 0.0                      # banked prefill time (us) while the mixed-step fixed cost is amortized
         self.dec_since_mixed = 1 << 30            # decode-only steps since the last step that carried prefill
         self.free_shadow_uids: deque[int] = deque(range(geom.max_seqs, 4 * geom.max_seqs))   # CP shadows' uids
         self.lam = 1.0                            # load-adaptive target mode: this step's batching factor (0 .. 1)
+        self.c1_n = C1_KMAX + 1 if C1_KMAX > geom.spec_k else 0   # FPR_C1_KMAX: rows of a widened C1 step (0: off)
+        import os as _os
+        if _os.environ.get("PHYS_GTRACE"):        # golden-trace recorder (fpr/core/GTRACE.md; default off): wraps add_request /
+            import sys as _sys                    # abort / schedule / update and self.kv's methods on this instance
+            _d = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "core", "src", "scheduler")
+            if _d not in _sys.path:
+                _sys.path.insert(0, _d)
+            import gtrace_sched
+            gtrace_sched.install(self)
 
     def take_uid(self, q: Request) -> None:
         q.uid = self.free_uids.popleft()
@@ -346,11 +392,19 @@ class RankScheduler:
         wm = int(self.g.reserve_watermark * pool)
         return min(self.g.max_model_len, (pool - wm) * self.g.page_tokens - self.g.rows_per_decode_seq - self.g.draft_window_tokens)
 
+    def max_new_cap(self, prompt_len: int) -> int:
+        """Most output tokens a request may get: max_model_len - prompt - (k - 1), at least 1. Every decode
+        step is k + 1 rows at positions < max_model_len, so a sequence's last step must start at <= max_model_len - k - 1;
+        a request that would run to the context limit stops k - 1 tokens short of it (finish "length" either way). The
+        vLLM adapter applies the same cap to vLLM's own max_tokens (adapter/phys_scheduler.py), so both stop together."""
+        return max(1, self.g.max_model_len - prompt_len - max(0, self.g.spec_k - 1))
+
     def add_request(self, req: Request) -> bool:
         """Queue a request. A request no rank could ever hold (prompt + max output > max_request_tokens) is NOT queued:
         at the head of the FCFS queue it would block every request behind it forever (e.g. a 398K-token item on
         2 GB mock pools). Returns False and records the reason in self.rejected[rid]; the caller reports it (vLLM: an
         error output, as for max_model_len)."""
+        req.max_new_tokens = min(req.max_new_tokens, self.max_new_cap(req.prompt_len))
         cap = self.max_request_tokens()
         if req.prompt_len + req.max_new_tokens > cap:
             self.rejected[req.rid] = (f"prompt {req.prompt_len} + max_tokens {req.max_new_tokens} tokens > {cap} "
@@ -381,7 +435,7 @@ class RankScheduler:
                 self._drop_shadows(req)
             self.kv.free(rid, defer_until=self._defer())
             self.free_uid(req)
-        self.prefilling.discard(req)
+        self.prefilling.pop(req, None)
         req.phase = FINISHED
 
     def seats_per_rank(self) -> int:
@@ -390,6 +444,39 @@ class RankScheduler:
 
     def on_rank(self, r: int) -> list[Request]:
         return [q for q in self.running if q.rank == r]
+
+    # ------------------------------------------------------------------------------------------ decode buckets
+    def _buckets(self) -> tuple:
+        """SchedConfig.bucket_aware: the engine's decode buckets (rows per rank, ascending), else ()."""
+        if not self.cfg.bucket_aware or not self.cfg.decode_buckets:
+            return ()
+        return tuple(sorted(int(x) for x in self.cfg.decode_buckets.split(":") if x.strip()))
+
+    @staticmethod
+    def _bucket_of(n: int, buckets: tuple) -> int:
+        """The engine's bucket_of: the smallest bucket >= n (past the largest: n itself)."""
+        for b in buckets:
+            if n <= b:
+                return b
+        return n
+
+    def _seat_rows(self) -> list[int]:
+        """Decode rows per rank once every running sequence decodes: seats x (k + 1)."""
+        rows = [0] * self.g.n_ranks
+        for q in self.running:
+            rows[q.rank] += self.g.rows_per_decode_seq
+        return rows
+
+    def _goal_bucket(self, B: tuple, rows: list, add: int) -> int:
+        """bucket_aware: G, the decode bucket of a balanced split of the seats (+ `add` rows: k + 1 for a new seat, 0
+        for a move); 0 (no limit) when G < bucket_min_rows (light load)."""
+        R, k1 = self.g.n_ranks, self.g.rows_per_decode_seq
+        G = self._bucket_of(-(-(sum(rows) + add) // (R * k1)) * k1, B)
+        return G if G >= self.cfg.bucket_min_rows else 0
+
+    def _past_goal(self, B: tuple, rows: list, G: int, r: int) -> bool:
+        """bucket_aware: would one more seat on rank r put it past the goal bucket G?"""
+        return bool(B) and G > 0 and self._bucket_of(rows[r] + self.g.rows_per_decode_seq, B) > G
 
     # ------------------------------------------------------------------------------------------ loads
     def _decode_load(self, q: Request) -> float:
@@ -427,16 +514,26 @@ class RankScheduler:
                 # D13 (d): skip if the in-flight steps certainly finish it (each appends >= 1 token)
                 if q.num_output + q.inflight + int(q.first_pending) >= q.max_new_tokens:
                     continue
-                lead = (q.inflight + 1) * k1               # worst case: every in-flight step accepted k + 1
-                n = min(k1, max(1, self.g.max_model_len - q.num_computed - q.inflight * k1))
+                lead = q.inflight_rows + k1                # worst case: every in-flight step accepted all its rows
+                room = self.g.max_model_len - q.num_computed - q.inflight_rows
+                if room < k1:
+                    # max_model_len: every decode step is exactly k + 1 rows per sequence (the engine's decode
+                    # path / idx2f hook require it: release-B gate 1 died on "decode rows only (4 per sequence)" with
+                    # n = min(k + 1, room) < 4), and no row may sit at >= max_model_len. So: wait for the in-flight steps when their worst case leaves < k + 1 positions.
+                    # With nothing in flight room >= k + 1 for every unfinished sequence, because add_request caps
+                    # max_new_tokens at max_model_len - prompt - (k - 1) (max_new_cap).
+                    continue
+                n = k1
                 end = min(q.num_computed + lead, self.g.max_model_len)
                 # resolved on the device (rowexp); forced sequences accept every row, so their start is known here
-                start = q.num_computed + q.inflight * k1 if q.forced else -1
+                start = q.num_computed + q.inflight_rows if q.forced else -1
             else:
-                n = min(k1, self.g.max_model_len - q.num_computed)
+                n = min(k1, self.g.max_model_len - q.num_computed)   # = k1 under max_new_cap
                 end = min(q.num_computed + n, self.g.max_model_len)
                 start = q.num_computed
-            wend = min(end + self.g.draft_window_tokens, self.g.max_model_len)    # + the drafter's block (window only)
+            # + the drafter's block (window only). Not capped at max_model_len: the drafter writes window KV up
+            # to start + 2k, past the last row; rows stay < max_model_len, so this is at most one extra window page
+            wend = end + self.g.draft_window_tokens
             if not self._allocate_or_relieve(q, q.num_computed, end, plan, copy_budget, wend):
                 continue
             if q.phase != DECODE or q.skip_until_step > step:     # moved while relieving
@@ -446,6 +543,7 @@ class RankScheduler:
             plan.loads[q.rank].add_decode(n, q.num_tokens)
             if self.cfg.async_mode:
                 q.inflight += 1
+                q.inflight_rows += n
         loads = plan.loads
 
         # 2. rebalance (every rebalance_every steps)
@@ -454,7 +552,7 @@ class RankScheduler:
             self._maybe_rebalance(plan, copy_budget)
         loads = plan.loads
 
-        # 3. admission (not in a step that had to preempt: vLLM does the same, it avoids preempt / re-admit thrash)
+        # 3. admission
         if not plan.preempted:
             self._admit(now, plan, copy_budget)
 
@@ -466,6 +564,12 @@ class RankScheduler:
         # 4. prefill quota
         self._fill_prefill(plan, loads, now)
 
+        # 5. FPR_C1_KMAX: a step whose only work is one decoding sequence runs it at 1 + k_max rows
+        if self.c1_n and len(plan.work) == 1 and plan.work[0].kind == "decode":
+            self._c1_widen(plan)
+
+        if plan.work and hasattr(self.kv, "tier_copies"):   # tiered paged pools (kv_manager.hbm_pages): demotions
+            plan.copies.extend(self.kv.tier_copies(plan.step))
         cb = sum(self.kv._pool(o.pool, o.dst_rank).spec.bytes_per_page for o in plan.copies)
         c = self.cost.step(loads, cb)
         plan.loads, plan.est_us, plan.idle_frac = loads, c.total_us, c.idle_fraction
@@ -487,14 +591,38 @@ class RankScheduler:
                 self._preempt(victim, plan)
             self._unschedule(plan, victim.rid)
             if victim is q or moved or self.cfg.async_mode:
-                # a moved victim's source pages stay pinned until its copies ran, and in async mode a preempted
-                # victim's pages are freed only after the in-flight step settles: the room appears next step
-                # (without this, async mode would preempt the whole rank in one step: a livelock)
                 return False
         return True
 
+    def _c1_widen(self, plan: StepPlan) -> None:
+        """FPR_C1_KMAX: widen the step's only work item (one decoding sequence, k + 1 rows) to 1 + k_max rows. Exact
+        set: nothing joins a step after schedule() (arrivals wait for the next one; async mode plans N + 1 before N
+        settles, and N's results never add work to N + 1). Kept at k + 1 when the sequence is forced or not allowed
+        (structured output), when 1 + k_max rows would reach max_model_len (the engine runs every decode row below it;
+        add_request's max_new_cap guarantees only k + 1), or when the extra pages are not free without relieving
+        another sequence (allocate() is all-or-nothing: on failure the k + 1 allocation stands)."""
+        w = plan.work[0]
+        q = self.reqs.get(w.rid)
+        k1, n = self.g.rows_per_decode_seq, self.c1_n
+        if q is None or w.n != k1 or q.forced or not q.c1_wide_ok:
+            return
+        before = q.inflight_rows - w.n if self.cfg.async_mode else 0     # rows of the steps still in flight
+        if self.g.max_model_len - q.num_computed - before < n:
+            return
+        end = q.num_computed + before + n
+        wend = end + self.g.draft_window_tokens + (n - k1)              # the drafter writes k_max past the last row
+        if not self.kv.allocate(q.rid, q.num_computed, end, wend):
+            return
+        w.n = n
+        if self.cfg.async_mode:
+            q.inflight_rows += n - k1
+        ld = RankLoad()
+        ld.add_decode(n, q.num_tokens)
+        plan.loads[w.rank] = ld
+        self.stats["c1_wide"] = self.stats.get("c1_wide", 0) + 1
+
     def _unschedule(self, plan: StepPlan, rid) -> None:
-        """Drop work already planned this step for a sequence that moved or was preempted; rebuild its rank's load."""
+        """rebuild its rank's load."""
         gone = [w for w in plan.work if w.rid == rid]
         if not gone:
             return
@@ -508,7 +636,7 @@ class RankScheduler:
 
     def _defer(self, in_schedule: bool = False):
         """async mode: frees wait until no dispatched step can touch the pages (D13 guarantee b). From inside
-        schedule() (a preemption) the victim is not in the plan being built, so only the in-flight step N matters
+        schedule() the victim is not in the plan being built, so only the in-flight step N matters
         (step_id - 2); from update() (a finish) the sequence may be in the newest dispatched plan (step_id - 1)."""
         if not self.cfg.async_mode:
             return None
@@ -518,10 +646,10 @@ class RankScheduler:
         if q.cp_shadows:
             self._drop_shadows(q)
         self.kv.free(q.rid, defer_until=self._defer(in_schedule=True))
-        q.inflight, q.first_pending = 0, False
+        q.inflight, q.inflight_rows, q.first_pending = 0, 0, False
         self.running.remove(q)
         self.free_uid(q)
-        self.prefilling.discard(q)
+        self.prefilling.pop(q, None)
         q.phase, q.rank, q.num_computed, q.cached_tokens, q.replay_start = WAITING, None, 0, 0, 0
         q.n_preempt += 1
         self.waiting.appendleft(q)
@@ -539,8 +667,13 @@ class RankScheduler:
                       + len(self.kv.window_table(q.rid)) * self.kv.window[0].spec.bytes_per_page)
         if need_bytes > budget[0]:
             return False
+        B = self._buckets() if dst is None else ()
+        rows = self._seat_rows() if B else None
+        G = self._goal_bucket(B, rows, 0) if B else 0
+        # most free pages first; bucket_aware: the ranks within the goal bucket before the rest
         cands = [dst] if dst is not None else sorted(
-            (r for r in range(self.g.n_ranks) if r != exclude), key=lambda r: -self.kv.free_pages(r))
+            (r for r in range(self.g.n_ranks) if r != exclude),
+            key=lambda r: (self._past_goal(B, rows, G, r), -self.kv.free_pages(r)))
         for r in cands:
             if len(self.on_rank(r)) >= self.seats_per_rank():
                 continue
@@ -559,7 +692,32 @@ class RankScheduler:
         return False
 
     # -- 2. rebalance
+    def _bucket_rebalance(self, plan: StepPlan, budget: list, B: tuple) -> bool:
+        """bucket_aware (sync mode): while the fullest rank pads the decode step past the goal bucket of a balanced
+        split, move one decoding sequence (the smallest KV) from the fullest rank to the emptiest."""
+        R = self.g.n_ranks
+        rows = self._seat_rows()
+        G = self._goal_bucket(B, rows, 0)
+        if G == 0 or self._bucket_of(max(rows), B) <= G:
+            return False
+        hi, lo = max(range(R), key=rows.__getitem__), min(range(R), key=rows.__getitem__)
+        if self._past_goal(B, rows, G, lo):
+            return False
+        cands = [q for q in self.on_rank(hi) if q.phase == DECODE and q.skip_until_step <= plan.step]
+        if not cands:
+            return False
+        q = min(cands, key=lambda x: len(self.kv.block_table(x.rid)))
+        if not self._move(q, plan, budget, exclude=hi, dst=lo):
+            return False
+        self._unschedule(plan, q.rid)
+        self.imbalance_steps = 0
+        self.stats["bucket_moves"] = self.stats.get("bucket_moves", 0) + 1
+        return True
+
     def _maybe_rebalance(self, plan: StepPlan, budget: list) -> None:
+        B = self._buckets()
+        if B and self._bucket_rebalance(plan, budget, B):
+            return
         dec = [0.0] * self.g.n_ranks
         for q in self.running:
             if q.phase == DECODE:
@@ -585,6 +743,10 @@ class RankScheduler:
                 best, best_after = q, after
         if best is None:
             return
+        if B:                          # bucket_aware: a load move never takes `lo` past the goal bucket
+            rows = self._seat_rows()
+            if self._past_goal(B, rows, self._goal_bucket(B, rows, 0), lo):
+                return
         # the sequence skips this step (its pages are copied before the step's kernels) and resumes on `lo`
         if self._move(best, plan, budget, exclude=hi, dst=lo):
             self._unschedule(plan, best.rid)
@@ -593,15 +755,21 @@ class RankScheduler:
     # -- 3. admission
     def _admit(self, now: float, plan: StepPlan, budget: list) -> None:
         n_admit = 0
+        B = self._buckets()
+        rows = self._seat_rows() if B else None          # bucket_aware: seat rows, kept up to date per admission
         while self.waiting and n_admit < self.cfg.max_waiting_admit_per_step:
             if len(self.running) >= self.g.max_seqs:
                 return
             q = self.waiting[0]
-            q.prefill_end = q.num_tokens                 # prompt, or prompt + outputs after a preemption
+            q.prefill_end = q.num_tokens
             hashes = q.block_hashes(q.prefill_end)
             hits = self.kv.lookup(hashes)
             res, wait = None, False
-            for r, src in self._placement_order(q, hits):
+            G = self._goal_bucket(B, rows, self.g.rows_per_decode_seq) if B else 0
+            for r, src in self._placement_order(q, hits, rows):
+                if wait and self._past_goal(B, rows, G, r):
+                    self.stats["bucket_waits"] = self.stats.get("bucket_waits", 0) + 1
+                    break              # bucket_aware: wait a step for the copy budget rather than go past the goal bucket
                 if src is not None:
                     cb = (hits[src] - hits[r]) * self.kv.paged[0].spec.bytes_per_page
                     # a copy beyond what is left of this step's budget waits for the next step (one step of delay)
@@ -634,11 +802,14 @@ class RankScheduler:
             plan.copies.extend(res.copies)
             self.take_uid(q)
             self.running.append(q)
-            self.prefilling.add(q)
+            if B:
+                rows[q.rank] += self.g.rows_per_decode_seq
+            self.prefilling[q] = None
             self.stats["admitted"] += 1
 
-    def _placement_order(self, q: Request, hits: list[int]):
-        """Ranks to try, best first, each with the rank to copy a longer cached prefix from (or None)."""
+    def _placement_order(self, q: Request, hits: list[int], rows: list | None = None):
+        """Ranks to try, best first, each with the rank to copy a longer cached prefix from (or None). bucket_aware:
+        `rows` = the caller's current seat rows (_admit keeps them per admission), else computed here."""
         R = self.g.n_ranks
         seats = [len(self.on_rank(r)) < self.seats_per_rank() for r in range(R)]
         mode = self.cfg.placement
@@ -671,9 +842,16 @@ class RankScheduler:
             cands.append([peak, pf, src is not None, r, src])
         if not cands:
             return []
-        best = min(c[0] for c in cands)
+        B = self._buckets()
+        if B and rows is None:
+            rows = self._seat_rows()
+        G = self._goal_bucket(B, rows, self.g.rows_per_decode_seq) if B else 0
+        for c in cands:            # bucket_aware: would this rank's next seat go past the goal bucket?
+            c.append(self._past_goal(B, rows, G, c[3]))
+        keep = [c for c in cands if not c[5]] or cands
+        best = min(c[0] for c in keep)
         tol = self.cfg.placement_tol * max(best, 1.0)
-        cands.sort(key=lambda c: (c[0] > best + tol, c[1], c[2], c[0], c[3]))
+        cands.sort(key=lambda c: (c[5], c[0] > best + tol, c[1], c[2], c[0], c[3]))
         return [(c[3], c[4]) for c in cands]
 
     # -- 3b. prefill stealing
@@ -888,7 +1066,7 @@ class RankScheduler:
             # one rank each passing a can_allocate check could together overrun the window pool (seen with forced CP:
             # the shadows' scratch windows); an accepted chunk is never rolled back, so this is the same decision
             if not self.kv.allocate(q.rid, st[0], pos + n,
-                                    min(pos + n + (self.g.draft_window_tokens if last else 0), self.g.max_model_len)):
+                                    pos + n + (self.g.draft_window_tokens if last else 0)):   # window: not capped (decode)
                 if share:
                     big_left[r] = 0
                     continue
@@ -913,8 +1091,7 @@ class RankScheduler:
         for rid, (start, n) in sched.items():
             q = self.reqs[rid]
             ok = self.kv.allocate(rid, start, start + n,
-                                  min(start + n + (self.g.draft_window_tokens if start + n >= q.prefill_end else 0),
-                                      self.g.max_model_len))
+                                  start + n + (self.g.draft_window_tokens if start + n >= q.prefill_end else 0))
             assert ok, rid
             last = start + n >= q.prefill_end
             plan.work.append(SeqWork(rid, q.rank, "prefill", start, n, q.cached_tokens, q.replay_start,
@@ -925,7 +1102,7 @@ class RankScheduler:
                 q.num_computed = start + n
                 if last:
                     q.phase, q.first_pending = DECODE, True
-                    self.prefilling.discard(q)
+                    self.prefilling.pop(q, None)
                     self.kv.shrink_reservation(q.rid)
 
     def _cp_force_min(self) -> int:
@@ -1029,7 +1206,7 @@ class RankScheduler:
             if new > limit and any_sched:
                 continue
             owner_start = subs[-1][1]
-            wend = min(end + (self.g.draft_window_tokens if last else 0), self.g.max_model_len)
+            wend = end + (self.g.draft_window_tokens if last else 0)       # window: not capped (see decode)
             if not self.kv.can_allocate(q.rid, owner_start, end, wend):
                 continue
             # shadows: open on the prompt's first CP chunk, replica pages up to `end`, scratch window for the sub-chunk
@@ -1105,7 +1282,7 @@ class RankScheduler:
                 q.num_computed = end
                 if last:                                  # (its shadows go when this step settles: update())
                     q.phase, q.first_pending = DECODE, True
-                    self.prefilling.discard(q)
+                    self.prefilling.pop(q, None)
                     self.kv.shrink_reservation(q.rid)
             self.stats["cp_chunks"] += 1
             self.stats["cp_rows"] += N
@@ -1136,6 +1313,7 @@ class RankScheduler:
                 q.num_output += a
                 if self.cfg.async_mode:
                     q.inflight -= 1
+                    q.inflight_rows -= w.n
             elif self.cfg.async_mode:                    # already advanced when scheduled
                 if w.last_chunk:
                     q.num_output += 1
@@ -1147,7 +1325,7 @@ class RankScheduler:
                 q.num_computed = w.start + w.n
                 if w.last_chunk:
                     q.phase = DECODE
-                    self.prefilling.discard(q)
+                    self.prefilling.pop(q, None)
                     q.num_output += 1                   # the first token, sampled from the last prompt row
                     q.first_token_time = now
                     self.kv.shrink_reservation(q.rid)
@@ -1159,7 +1337,7 @@ class RankScheduler:
             settled = (w.start + w.n) if (self.cfg.async_mode and w.kind == "prefill") else q.num_computed
             self.kv.commit(q.rid, settled, q.hash_fn)
             if q.num_output >= q.max_new_tokens:
-                self.prefilling.discard(q)
+                self.prefilling.pop(q, None)
                 q.phase, q.finish_time = FINISHED, now
                 self.kv.free(q.rid, defer_until=self._defer())
                 self.running.remove(q)

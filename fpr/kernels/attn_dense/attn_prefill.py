@@ -48,6 +48,8 @@ import torch
 # ATTN2B_PF=1 (default 0): the switch the engine reads to route a step's prefill rows here (bucket A, layers 0..20).
 # Nothing in this module or attn_half changes behaviour by itself; the engine decides per step.
 ENABLED = os.environ.get("ATTN2B_PF", "0") == "1"
+PRESTEP = os.environ.get("ENG_MIXED_PRESTEP", "0") == "1"           # stage 1a (engine.py MIXED_PRESTEP): no host syncs in Plan
+PRESTEP_CHECK = os.environ.get("ENG_MIXED_PRESTEP_CHECK", "0") == "1"  # debug: also read the device value and compare
 
 WIN = 128
 TOPK = 512
@@ -56,6 +58,11 @@ WPT = 32                      # window page tokens
 PREFILL_CHUNK_SIZE = 4        # production's requests per workspace (deepseek_v41/attention.py)
 WS_CAP = int(float(os.environ.get("ATTN2B_PF_WS_MB", "1024")) * 2**20)   # bf16 workspace per request group (bytes)
 WS_TOTAL = int(float(os.environ.get("ATTN2B_PF_WS_TOTAL_MB", "3072")) * 2**20)   # all groups kept apart (reuse) below this
+# ENG_PF_WS_ROUND_MB: the
+# per-step workspace allocation is rounded UP to a multiple of this many MiB. The 0.7-2.1 GB per-step sizes then fall into a few
+# reusable block sizes instead of a new size every step (the rank stream's caching-allocator fragmentation: 2-4 GB reserved
+# above the step's allocation at 128 seats). The views are the same first `need` elements: same bits, only the buffer is larger.
+WS_ROUND = int(float(os.environ.get("ENG_PF_WS_ROUND_MB", "0")) * 2**20) // 2    # bf16 elements; 0 = no rounding
 i32, bf = torch.int32, torch.bfloat16
 
 
@@ -76,7 +83,8 @@ def _view3(k: torch.Tensor) -> torch.Tensor:
 class Plan:
     """The step's prefill sequences on one rank (host ints + small device tables), shared by every layer of the step."""
 
-    def __init__(self, dev, seqs: list, si: torch.Tensor, sl: torch.Tensor, bt: torch.Tensor, n_pool_pages: int):
+    def __init__(self, dev, seqs: list, si: torch.Tensor, sl: torch.Tensor, bt: torch.Tensor, n_pool_pages: int,
+                 ws_buf: torch.Tensor | None = None):
         self.dev = torch.device(dev)
         self.S = len(seqs)
         assert self.S, "no prefill sequences"
@@ -93,9 +101,13 @@ class Plan:
         self.row_hi, self.n = r, r - self.row_lo
         self.ends, self.g0s, self.qsl_h = ends, g0s, qsl
         self.gls = [e - g for e, g in zip(ends, g0s)]
-        self.seq_lens = torch.tensor(ends, dtype=i32, device=self.dev)
-        self.gather_lens = torch.tensor(self.gls, dtype=i32, device=self.dev)
-        self.qsl = torch.tensor(qsl, dtype=i32, device=self.dev)
+        if PRESTEP:   # ENG_MIXED_PRESTEP: pinned + non-blocking (torch.tensor(device=) syncs the rank's stream)
+            up = lambda xs: torch.tensor(xs, dtype=i32).pin_memory().to(self.dev, non_blocking=True)  # noqa: E731
+            self.seq_lens, self.gather_lens, self.qsl = up(ends), up(self.gls), up(qsl)
+        else:
+            self.seq_lens = torch.tensor(ends, dtype=i32, device=self.dev)
+            self.gather_lens = torch.tensor(self.gls, dtype=i32, device=self.dev)
+            self.qsl = torch.tensor(qsl, dtype=i32, device=self.dev)
         self.bt = bt[: self.S].to(self.dev, i32).contiguous()
         # window block table [S, end // 32 + 1] from the rows' window lists (blocks outside the region: page 0, never read)
         wmax = max(ends) // WPT + 1
@@ -103,7 +115,12 @@ class Plan:
         si2 = si.view(si.shape[0], -1)
         for s, (row0, n, first, rs) in enumerate(seqs):
             row0, n = int(row0), int(n)
-            k0 = int(sl[row0])
+            if PRESTEP:   # the row tables' window length of the first row: pos - max(replay_start, pos - 127) + 1 = first - g0
+                k0 = int(first) - self.g0s[s] + 1      # + 1 (no device read-back; ENG_MIXED_PRESTEP_CHECK=1 compares it)
+                if PRESTEP_CHECK:
+                    assert k0 == int(sl[row0]), (k0, int(sl[row0]), int(first), self.g0s[s])
+            else:
+                k0 = int(sl[row0])
             head = si2[row0, :k0]                                                     # positions g0 .. first
             tail = si2[row0 + 1: row0 + n].gather(1, (sl[row0 + 1: row0 + n].long() - 1)[:, None]).squeeze(1)
             slots = torch.cat([head, tail]).long()                                    # positions g0 .. end - 1
@@ -119,6 +136,11 @@ class Plan:
         self.loc = torch.empty(self.n, TOPK, dtype=i32, device=self.dev)
         self.groups, self.gws = {}, {}
         self.buf = None
+        # ws_buf: a persistent bf16 workspace allocated before
+        # the KV pools were sized; every group layout lives in it (the shared layout when the disjoint one does not fit),
+        # so a mixed step allocates nothing here at runtime
+        self.ws_buf = ws_buf
+        self.stats_ws = dict(shared_fallbacks=0, alloc_fallbacks=0)
         self.ws_ratio = None      # the ratio whose group layout the workspace holds
         self.comp_src = None      # the kv source whose compressed region is resident in the workspace (None: not valid)
         self.stats = dict(comp_gathers=0, comp_reused=0, combines=0, comb_reused=0)
@@ -150,8 +172,21 @@ class Plan:
             areas = [(b - a) * M * 512 for a, b, N, M in gp]
             disjoint = len(gp) == 1 or sum(areas) * 2 <= WS_TOTAL
             need = sum(areas) if disjoint else max(areas)
-            if self.buf is None or self.buf.numel() < need:
-                self.buf = torch.empty(need, dtype=bf, device=self.dev)
+            if self.ws_buf is not None:
+                if need > self.ws_buf.numel() and disjoint and len(gp) > 1:   # shared layout instead (same bits)
+                    disjoint, need = False, max(areas)
+                    self.stats_ws["shared_fallbacks"] += 1
+                if need <= self.ws_buf.numel():
+                    if self.buf is None:
+                        self.buf = self.ws_buf
+                else:   # one request group larger than the preallocation (cannot happen with >= WS_CAP): allocate, count it
+                    self.stats_ws["alloc_fallbacks"] += 1
+                    self.buf = torch.empty(need, dtype=bf, device=self.dev)
+                    self.gws.clear()
+                    self.ws_ratio = self.comp_src = None
+            elif self.buf is None or self.buf.numel() < need:
+                alloc = need if WS_ROUND <= 0 else -(-need // WS_ROUND) * WS_ROUND   # ENG_PF_WS_ROUND_MB (default: need)
+                self.buf = torch.empty(alloc, dtype=bf, device=self.dev)
                 self.gws.clear()
                 self.ws_ratio = self.comp_src = None
             views, off = [], 0

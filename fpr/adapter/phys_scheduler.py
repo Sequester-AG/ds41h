@@ -9,7 +9,7 @@ What is vLLM's and what is ours:
     accept_tokens; logprobs slicing; EngineCoreOutputs, events, stats), finish_requests (aborts, stop strings from the
     detokenizer), get_grammar_bitmask (StructuredOutputManager), update_draft_token_ids (grammar validation of drafts),
     make_stats, the request queues used for counts.
-  * ours: schedule() -- RankScheduler places, admits, preempts, migrates and fills prefill per rank; the plan becomes a
+  * ours: schedule() -- the plan becomes a
     vLLM SchedulerOutput (num_scheduled_tokens = rows, k spec placeholders per decode group, new / cached request data)
     plus `so.phys` (adapter/bridge.py PhysStep: one StepBatch per rank, row token ids, new requests, frees).
   * self.kv_cache_manager is a facade (PhysKVFacade): the calls vLLM's scheduler makes outside schedule() (free,
@@ -17,16 +17,6 @@ What is vLLM's and what is ours:
     KVCacheManager is built on the executor's dummy spec (one small 64-token group) and only serves EngineCore's
     start-up introspection (its single_type_managers).
 
-Lifecycle mapping (vLLM status <-> RankScheduler phase):
-  add_request               vLLM WAITING (queue mirror) -> rs.add_request (after the grammar compiled, if any)
-  rs admits                 vLLM RUNNING, num_computed_tokens = replay_start (bounded replay after a prefix hit),
-                            prefill_stats = the hit (prompt_tokens_details.cached_tokens)
-  rs schedules work         num_scheduled_tokens[rid] = chunk rows (prefill) or k + 1 (decode, spec = k x -1, or the
-                            grammar-validated drafts for structured outputs)
-  update_from_output        vLLM appends tokens + stop checks first, then rs.update(plan, accepted) with accepted =
-                            tokens vLLM kept this step (so commits never pass the token stream vLLM's block hashes cover)
-  vLLM finishes / aborts    rs.abort(rid) (deferred until rs.update ran when it happens inside update_from_output)
-  rs preempts               vLLM _preempt_request (PREEMPTED, num_computed_tokens = 0, back to the waiting mirror);
                             rs keeps the request and re-admits it as a recompute of prompt + outputs
   rs migrates / steals      invisible to vLLM (the sequence skips a step; copies run before the next step's kernels)
 
@@ -70,6 +60,7 @@ from cost_model import CostModel, params_from_env  # noqa: E402  (serve/)
 from interfaces import build_step_batch  # noqa: E402
 from kv_manager import OwnedKVManager  # noqa: E402
 from scheduler import DECODE, FINISHED, RankScheduler, Request as RSRequest, SchedConfig  # noqa: E402
+import scheduler as _rs_mod  # noqa: E402  (FPR_C1_KMAX: scheduler.C1_KMAX)
 
 logger = init_logger("vllm.phys_adapter")
 CHECK = os.environ.get("PHYS_ADAPTER_CHECK", "0") == "1"
@@ -192,6 +183,15 @@ class PhysScheduler(Scheduler):
             f"phys adapter: vLLM hashes {self.hash_block_size}-token blocks, the paged pool has "
             f"{self.geom.page_tokens}-token pages (the executor's KV spec must use block_size {self.geom.page_tokens})")
         cfg = sched_config_from_env()
+        if getattr(cfg, "bucket_aware", False) and not cfg.decode_buckets:   # the engine's decode buckets (bridge),
+            b = bridge.get_decode_buckets()                                 # set before the scheduler is built
+            if b:
+                cfg.decode_buckets = ":".join(str(x) for x in b)
+            else:
+                logger.warning("phys adapter: PHYS_SCHED bucket_aware=1 but the worker reports no decode buckets: off")
+        if getattr(cfg, "bucket_aware", False) and cfg.decode_buckets:
+            logger.info("phys adapter: bucket-aware placement on (decode buckets %s; acts while the goal bucket is >= "
+                        "%d rows per rank)", cfg.decode_buckets, cfg.bucket_min_rows)
         if self.async_mode:
             assert hasattr(cfg, "async_mode"), "serve/scheduler.py has no SchedConfig.async_mode (D13 pending step)"
             cfg.async_mode = True
@@ -199,6 +199,14 @@ class PhysScheduler(Scheduler):
         # chunk boundaries follow from it, and the served fork matches the offline one only on the same boundaries
         self.cost_params = params_from_env(bridge.get_cost_default())
         self.rs = RankScheduler(self.geom, CostModel(self.cost_params), cfg)
+        # FPR_C1_KMAX: a step whose only work is one decoding sequence runs it at
+        # 1 + k_max rows (serve/scheduler.py _c1_widen). vLLM sizes its spec-decode stats by num_spec_tokens (k) and
+        # asserts num_accepted <= k: build them at k_max instead (make_spec_decoding_stats, add_request). k itself
+        # stays: the geometry, the max_new cap and every other step use it
+        self.c1_kmax = getattr(self.rs, "c1_n", 0) and self.rs.c1_n - 1
+        if self.c1_kmax:
+            logger.info("phys adapter: FPR_C1_KMAX=%d: one-sequence decode steps at %d rows (k=%d elsewhere)",
+                        self.c1_kmax, self.c1_kmax + 1, self.geom.spec_k)
         logger.info("phys adapter: cost model %s", self.cost_params)
         self._stock_kv = self.kv_cache_manager
         self.kv_cache_manager = PhysKVFacade(self, self._stock_kv)
@@ -246,6 +254,17 @@ class PhysScheduler(Scheduler):
         self._gc_every = int(os.environ.get("PHYS_GC_FREEZE_EVERY", "64"))
         self._gc_full_s = float(os.environ.get("PHYS_GC_FULL_S", "900"))
         self._gc_last_full = time.monotonic()
+        # PHYS_GC_THRESHOLDS="g0,g1,g2": the collector's thresholds.
+        # ~117 young collections per 10 s at 1.14 ms each (1.3 % of the loop) plus gen-2
+        # collections in 1 window of 5 (+112 ms each) and the PHYS_GC_FULL_S full collect (670-870 ms, 38-65K cyclic objects
+        # per 15 min). Larger thresholds = fewer collections of the objects created since the last freeze; served A/B
+        # t-113a/b (tok/s, p99 step, host RSS growth >= 30 min) decides.
+        th = os.environ.get("PHYS_GC_THRESHOLDS", "")
+        if th:
+            old = gc.get_threshold()
+            gc.set_threshold(*(int(x) for x in th.split(",")))
+            logger.info("phys adapter: PHYS_GC_THRESHOLDS %s (was %s); freeze every %d steps, full collect every %.0f s",
+                        gc.get_threshold(), old, self._gc_every, self._gc_full_s)
         logger.info("phys adapter: PhysScheduler on %d ranks, k=%d, max_seqs %d (%d per rank), paged pool %s pages per "
                     "rank, prefill <= %d rows per rank", self.geom.n_ranks, self.geom.spec_k, self.geom.max_seqs,
                     self.geom.max_seqs_per_rank, self.geom.pools()[0].num_pages, self.geom.max_prefill_tokens_per_rank)
@@ -257,6 +276,9 @@ class PhysScheduler(Scheduler):
             self._reject(request, "streaming input continuations are not supported by the phys engine")
             return
         super().add_request(request)
+        if self.c1_kmax and getattr(request, "spec_decode_metrics", None) is not None:   # FPR_C1_KMAX: k_max + 1 buckets
+            from vllm.v1.metrics.stats import RequestSpecDecodeMetrics
+            request.spec_decode_metrics = RequestSpecDecodeMetrics.new(self.c1_kmax)
         why = self._unsupported(request)
         if why:
             self._reject(request, why)
@@ -328,12 +350,20 @@ class PhysScheduler(Scheduler):
                 self._reject(req, got)
                 return
             images = self.mm.add(req.request_id, got)
-        max_new = max(1, min(req.max_tokens, self.max_model_len - req.num_prompt_tokens))
+        # max_model_len tail: the engine runs every decode step as k + 1 rows below max_model_len, so a
+        # request stops k - 1 tokens short of the context limit (serve/scheduler.py RankScheduler.max_new_cap, the same
+        # formula). vLLM's own max_tokens follows, so its check_stop ends the request there as FINISHED_LENGTH_CAPPED
+        # (finish_reason "length"), exactly when the rank scheduler does.
+        max_new = max(1, min(req.max_tokens, self.max_model_len - req.num_prompt_tokens - max(0, self.num_spec_tokens - 1)))
+        if max_new < req.max_tokens:
+            req.max_tokens = max_new
         q = _RSReq(req.request_id, req.num_prompt_tokens, max_new, req.arrival_time - self._wall0(),
                       _HashFn(req, private=bool(req.skip_reading_prefix_cache)), priority=req.priority)
         if images is not None:
             assert hasattr(q, "images"), "serve/scheduler.py has no Request.images (the image-aware rank scheduler)"
             q.images = tuple((im.offset, im.length, im.key) for im in images.images)
+        if self.c1_kmax and req.use_structured_output:
+            q.c1_wide_ok = False                          # FPR_C1_KMAX: grammar rows / drafts are built for k drafts
         if sp is not None and sp.prompt_logprobs is not None and hasattr(q, "score"):
             q.score = True                                # teacher-forced scoring: every prompt row runs the head
         if self.force.enabled:
@@ -350,6 +380,15 @@ class PhysScheduler(Scheduler):
                 self.mm.forget(req.request_id)
             why = getattr(self.rs, "rejected", {}).get(req.request_id, "no rank can hold this request")
             self._reject(req, f"request too large for the phys engine's KV pools: {why}")
+
+    def make_spec_decoding_stats(self, spec_decoding_stats, num_draft_tokens: int, num_accepted_tokens: int,
+                                 num_invalid_spec_tokens, request_id: str):
+        """FPR_C1_KMAX: vLLM's own, with the stats sized for k_max drafts (a widened C1 step accepts up to k_max)."""
+        if self.c1_kmax and spec_decoding_stats is None and self.log_stats and num_draft_tokens:
+            from vllm.v1.spec_decode.metrics import SpecDecodingStats
+            spec_decoding_stats = SpecDecodingStats.new(self.c1_kmax)
+        return super().make_spec_decoding_stats(spec_decoding_stats, num_draft_tokens, num_accepted_tokens,
+                                                num_invalid_spec_tokens, request_id)
 
     def _wall0(self) -> float:
         return time.time() - (time.monotonic() - self._t0)
@@ -424,6 +463,9 @@ class PhysScheduler(Scheduler):
                 plan = self.rs.schedule(now)
             finally:
                 if hidden is not None:
+                    # requests the rank scheduler (re)queued during the paused step
+                    # go back in front of the hidden queue, in order: restoring `hidden` alone dropped them
+                    hidden.extendleft(reversed(self.rs.waiting))
                     self.rs.waiting = hidden
 
         # rs -> vLLM request states
@@ -656,7 +698,7 @@ class PhysScheduler(Scheduler):
                     continue
                 q = self.rs.reqs.get(w.rid)
                 if q is None or q.phase == FINISHED or q not in self.rs.running:
-                    continue                                # gone, or preempted with its in-flight output stale
+                    continue
                 req, n0 = before[w.rid]
                 a = req.num_output_tokens - n0              # tokens vLLM kept (stop / max_tokens trimmed)
                 assert 1 <= a <= w.n, (w.rid, a, w.n, "the worker returned no token for a decode group")
@@ -682,6 +724,8 @@ class PhysScheduler(Scheduler):
             assert req is not None and req.status == RequestStatus.RUNNING, (q.rid, req and req.status)
             if q.phase == DECODE:
                 ahead = getattr(q, "inflight", 0) * self.geom.rows_per_decode_seq    # async: vLLM counts in-flight rows
+                if self.c1_kmax:                                                     # (widened C1 steps: their own)
+                    ahead = q.inflight_rows
                 assert q.num_computed + ahead == req.num_computed_tokens, (
                     q.rid, q.num_computed, ahead, req.num_computed_tokens)
                 assert q.num_output + ahead + int(getattr(q, "first_pending", False)) == \
@@ -703,7 +747,7 @@ class PhysScheduler(Scheduler):
                 fut = self._mm_keys.pop(rid, None)
                 if fut is not None:
                     fut.cancel()
-        if self._preempting:                 # rs already released the KV of the sequences it preempts
+        if self._preempting:
             return
         fr = self.forced.pop(rid, None)
         if fr is not None and not fr.flushed:
@@ -782,11 +826,9 @@ class PhysScheduler(Scheduler):
     # tokens and rolls rejected drafts back in update_from_output. The rank scheduler's native async mode
     # (SchedConfig.async_mode, D13) keeps the SETTLED num_computed per sequence plus `inflight` decode steps:
     # in-flight decode groups get start = -1 (positions / slots resolved on the device by the engine's row expansion),
-    # forced ones their known start; prefill progress and the first token are advanced at schedule time; frees and
-    # preemptions are deferred until the newest scheduled step settled.
+    # forced ones their known start; prefill progress and the first token are advanced at schedule time
     def _sync_waiting(self) -> None:
-        """Preempted requests wait in the rank scheduler with vLLM's output count: in-flight (stale) outputs that vLLM
-        appended after the preemption are recomputed as prefill on re-admission (vLLM recompute semantics)."""
+        """"""
         for q in self.rs.waiting:
             req = self.requests.get(q.rid)
             if req is not None and q.num_output != req.num_output_tokens:
@@ -826,3 +868,20 @@ class PhysAsyncScheduler(PhysScheduler, AsyncScheduler):
         super()._update_after_schedule(scheduler_output)
         if scheduler_output.pending_structured_output_tokens:       # vLLM will defer this step's sampling (serialized)
             self.phys_stats["deferred_steps"] = self.phys_stats.get("deferred_steps", 0) + 1
+
+
+if os.environ.get("PHYS_CXX_CORE", "0") == "1":   # stage 2a: the request lifecycle in C++
+    import importlib.util as _ilu                    # (fpr/core/src/core/core_sched.py: needs PHYS_CXX_SCHED=1 + PHYS_CXX_KV=1),
+    import sys as _sys                               # loaded by path: nothing on sys.path
+    _core_sched = _sys.modules.get("core_sched")
+    if _core_sched is None:
+        _spec = _ilu.spec_from_file_location("core_sched", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                                                                         "core", "src", "core", "core_sched.py"))
+        _core_sched = _ilu.module_from_spec(_spec)
+        _sys.modules["core_sched"] = _core_sched
+        try:
+            _spec.loader.exec_module(_core_sched)
+        except BaseException:
+            _sys.modules.pop("core_sched", None)   # no half-built module left behind
+            raise
+    _core_sched.install(_sys.modules[__name__])

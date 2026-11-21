@@ -16,7 +16,7 @@ import time
 _WATCH: dict = {}
 _N = {"i": 0}
 _HIST: list = []          # the host's entries of the last dispatches: [(dispatch, {rid: entry})] (finish tracking)
-_DROPWATCH = {"left": 0}  # dispatches still to sync + range-check after one that carried drops (finishes / preemptions)
+_DROPWATCH = {"left": 0}  # dispatches still to sync + range-check after one that carried drops
 
 
 def _eng(executor):

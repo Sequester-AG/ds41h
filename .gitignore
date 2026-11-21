@@ -13,3 +13,5 @@ runs/
 fpr/**/build/
 fpr/**/build_*/
 fpr/engine/build/
+# local deployment settings (copy of deploy/h200/site.env.example)
+deploy/h200/site.env

@@ -805,7 +805,7 @@ struct Args {
   const uint4* ss13;       // [UPE][KB1] u16 (gate byte | up byte << 8), read 8 kb (16 B) at a time
   const uint4* sh2;        // [H / 16 tiles][KB2][32 lanes]
   const uint8_t* ss2;      // [H / 16][KB2]
-  // optional fused router (moe13 computes the gate GEMV + sqrtsoftplus/bias top-k and writes ids / wts for moe2):
+  // optional fused router
   const __nv_bfloat16* gate_w;  // [E, H] bf16, or null (ids / wts are inputs)
   const float* gate_bias;       // [E] e_score_correction_bias
   float* glog;                  // [MAXM][E] fp32 scratch (router logits)
@@ -1623,8 +1623,6 @@ __global__ void __launch_bounds__(T, 1) moe13v_kernel(const Args a) {
 #pragma unroll 1
   for (int j = 0; j < D - 1; ++j) issue(j);
   stage_x<H, T, true>(a.x, a.ldx, a.m, xs, xsc);  // overlaps the first stages' loads; ends with __syncthreads
-  // unit-end reduction (warps 0-1, one stage later): thread (lane l, token half c2) sums gate (reg c2) / up (reg 2 + c2) of
-  // the 16 warp partials in warp order, then the clamped SwiGLU -> hb
   auto reduce_unit = [&](int fp8, int unit, int par) {
     const int rl = tid & 31, c2 = tid >> 5;                       // tid < 64
     const int rg = rl >> 2, rt = rl & 3;

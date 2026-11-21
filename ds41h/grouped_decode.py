@@ -6,7 +6,7 @@ KV entries the 8 positions share are dequantized and multiplied once per positio
 indexer top-512 sets of 4 consecutive rows have a union of ~780 keys (vs 4 x 512) and their 128-key SWA windows a union of
 131. Here one 64-row tile = 4 consecutive decode rows x 16 heads, over the UNION of their key sets, with a 4-bit membership
 mask per key (a row's score for a key outside its own set is -inf before the softmax): ~2.9x less attention work per row
-and no head padding. c64: FlashMLA ~230 us / layer, 13 % of the step at the 350 W cap.
+and no head padding. FlashMLA ~230 us / layer, 13 % of the step at the 350 W cap.
 
 Numerics (lossless class): the same FlashMLA kernel code (legacy/sm90/decode/sparse at e2afa5f) with two edits -- the key
 validity byte becomes the group's membership bits and the softmax masks with the row's bit -- so every row attends exactly

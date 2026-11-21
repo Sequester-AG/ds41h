@@ -92,6 +92,22 @@ def build_attn(layer: int, model: str = MODEL) -> dict:
     return W
 
 
+def build_attn8(layer: int, model: str = MODEL) -> dict:
+    """the checkpoint's raw fp8 weights + ue8m0 32 x 32 scales of q_a | wkv (concatenated as the
+    bf16 copy is), wo_a ([8 x 1024, 4096]) and wo_b, for kernels/attn_dense/skw8.cu (ENG_SKW8_DENSE in engine/attn.py)."""
+    _paths()
+    import torch
+    import bench2b as B
+
+    rd = B.CheckpointReader(model)
+    g = lambda n, k: rd.get(f"layers.{layer}.attn.{n}.{k}")  # noqa: E731
+    out = dict(wqkv_a=(torch.cat([g("wq_a", "weight"), g("wkv", "weight")], 0).contiguous(),
+                       torch.cat([g("wq_a", "scale"), g("wkv", "scale")], 0).contiguous()),
+               wo_a=(g("wo_a", "weight").reshape(8192, 4096).contiguous(), g("wo_a", "scale").reshape(256, 128).contiguous()),
+               wo_b=(g("wo_b", "weight").contiguous(), g("wo_b", "scale").contiguous()))
+    return out
+
+
 def build_cos_sin(ratio: int):
     """Stock RoPE table of a compress ratio (attn_half / bench2b.stock_cos_sin), shared by all layers of that ratio."""
     _paths()
@@ -108,6 +124,26 @@ def build_dense(layer: int, rank: int, model: str = MODEL) -> dict:
 
     w1, w3, w2, gw, gb = block.load_dense(bench.Ckpt(model), layer, rank, "cpu")
     return dict(sw13=torch.cat([w1, w3], 0).contiguous(), sw2=w2, gate_w=gw, gate_b=gb)
+
+
+def build_dense8(layer: int, rank: int, model: str = MODEL) -> dict:
+    """ENG_C128_DENSE8_ADD sh: this rank's shared-expert slice as the checkpoint's e4m3 + ue8m0 32 x 32 scales (uint8
+    CPU), the same slice as build_dense: sh13 = [w1 rows 576r ..; w3 rows 576r ..] ([1152][5120]), sh2 = w2 columns 576r ..
+    ([5120][576]). The engine folds them (attn_act8.prepare = production's fold_weight)."""
+    _paths()
+    import torch
+    import bench
+
+    ck = bench.Ckpt(model)
+    p = f"layers.{layer}.ffn.shared_experts."
+    g = lambda n, k: ck.get(p + f"{n}.{k}")  # noqa: E731  (uint8 views)
+    i, s = 576, 576 // 32
+    w1, w3, w2 = g("w1", "weight"), g("w3", "weight"), g("w2", "weight")
+    s1, s3, s2 = g("w1", "scale"), g("w3", "scale"), g("w2", "scale")
+    assert w1.shape[0] == 4 * i and s1.shape[0] * 32 == w1.shape[0] and s2.shape[1] * 32 == w2.shape[1], (w1.shape, s1.shape)
+    rs, ss = slice(i * rank, i * (rank + 1)), slice(s * rank, s * (rank + 1))
+    return dict(sh13=(torch.cat([w1[rs], w3[rs]], 0).contiguous(), torch.cat([s1[ss], s3[ss]], 0).contiguous()),
+                sh2=(w2[:, rs].contiguous(), s2[:, ss].contiguous()))
 
 
 def build_mhc(layer: int, model: str = MODEL) -> dict:

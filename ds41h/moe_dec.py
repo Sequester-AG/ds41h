@@ -1,7 +1,6 @@
 """ds41h moe_dec: decode-shaped W4A16 routed-MoE path for small calls.
 
-Multi-request decode at c2..c64 with k=7 runs the vLLM layer path with 16..512 tokens per MoE call (prefill replay chunks
-<= SMALL_T too). There the routed experts are a weight stream (~1.5-1.8 GB per layer per GPU, nearly every expert touched
+There the routed experts are a weight stream (~1.5-1.8 GB per layer per GPU, nearly every expert touched
 from ~128 tokens on) and the old small-T kernel (moe_prefill.cu moe_small16_kernel, forward variant 0x500) is bound by its
 FP4 -> bf16 expansion on the ALU pipe. ds41h/kernels/moe_dec.cu keeps small16's numerics BIT FOR BIT (same exact
 expansion, same lane -> physical-k map and k16 order, fp32 accumulation over the whole K, same epilogues and moe_combine)
@@ -24,7 +23,6 @@ import functools
 import os
 
 DEFAULT_CFG = 0x55  # KPS 2 (64-byte boxes), 3 stages, 32-token units, 3 CTAs / SM for both GEMMs: in situ (ab1q / ab2q, 350 W)
-# 0x55 beat 0x22 at c64 (5,781 vs 5,591 tok/s; hot experts expand once per 32 rows) and matched it at c16 / c32
 CFG = int(os.environ.get("DS41H_MOE_DEC_CFG", hex(DEFAULT_CFG)), 0)
 MAX_E = 512
 # DS41H_MOE_DEC_CHECK=1 (debug, in-situ proof of bit identity): every call ALSO runs the certified small16 path (variant

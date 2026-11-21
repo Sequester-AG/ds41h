@@ -44,6 +44,52 @@ class CopyOp:
     step: int
 
 
+def hbm_pages() -> int:
+    """FPR_KV_HBM_PAGES = the leading paged-pool pages of each rank that
+    live in the GPU's HBM. With it the paged
+    pool keeps running sequences on HBM pages: allocation takes HBM pages first, a cached prefix in host pages is copied
+    to HBM pages when a request admits on it, and a finished sequence's cached HBM pages are copied to host pages
+    (OwnedKVManager.tier_copies). Copies keep the bytes: outputs stay bitwise."""
+    import os as _os
+    return int(_os.environ.get("FPR_KV_HBM_PAGES", "0") or 0)
+
+
+class TierFree:
+    """Free (uncached) page ids of a two-tier paged pool: HBM ids [0, n_hbm) handed out first (lowest first), then
+    host ids (FIFO). The deque interface PagePool uses: popleft(), append(p), len(), iteration."""
+
+    def __init__(self, n: int, n_hbm: int):
+        self.n_hbm = n_hbm
+        self.hbm = list(range(min(n_hbm, n)))
+        heapq.heapify(self.hbm)
+        self.host = deque(range(min(n_hbm, n), n))
+
+    def __len__(self):
+        return len(self.hbm) + len(self.host)
+
+    def __iter__(self):
+        yield from self.hbm
+        yield from self.host
+
+    def __bool__(self):
+        return bool(self.hbm) or bool(self.host)
+
+    def popleft(self) -> int:
+        return heapq.heappop(self.hbm) if self.hbm else self.host.popleft()
+
+    def pop_hbm(self) -> Optional[int]:
+        return heapq.heappop(self.hbm) if self.hbm else None
+
+    def pop_host(self) -> Optional[int]:
+        return self.host.popleft() if self.host else None
+
+    def append(self, p: int) -> None:
+        if p < self.n_hbm:
+            heapq.heappush(self.hbm, p)
+        else:
+            self.host.append(p)
+
+
 class PagePool:
     """Pages of one pool kind on one rank: ref counts, hashes, free list, LRU of cached free pages."""
 
@@ -55,7 +101,12 @@ class PagePool:
         # state slots are handed out lowest-first (a heap): indices stay <= live sequences + in-flight copy pins, so
         # engine-side tables keyed by the slot stay small (the engine's, HSD's); the other pools stay FIFO / LRU
         self.low_first = spec.kind == "state"
-        self.free_uncached = list(range(n)) if self.low_first else deque(range(n))
+        self.n_hbm = hbm_pages() if spec.kind == "paged" else 0
+        self.demote_q: list[int] = []
+        if self.n_hbm:
+            self.free_uncached = TierFree(n, self.n_hbm)
+        else:
+            self.free_uncached = list(range(n)) if self.low_first else deque(range(n))
         self.lru: OrderedDict[int, None] = OrderedDict()   # ref == 0 and hashed; evict from the front
         self.cached: dict[Hashable, int] = {}              # block hash -> page (at most one page per hash per rank)
         self.reserved = 0                                   # pages promised to admitted prefills (see OwnedKVManager)
@@ -114,6 +165,8 @@ class PagePool:
         if self.ref[p] == 0:
             if self.hash_of[p] is not None and self.cached.get(self.hash_of[p]) == p:
                 self.lru[p] = None            # to the back: most recently freed = evicted last
+                if p < self.n_hbm:
+                    self.demote_q.append(p)   # tiered pool: copy to a host page at the next step (tier_copies)
             else:
                 self.hash_of[p] = None
                 if self.poison_on:
@@ -122,6 +175,33 @@ class PagePool:
                     heapq.heappush(self.free_uncached, p)
                 else:
                     self.free_uncached.append(p)
+
+    def host_dst(self) -> Optional[int]:
+        """Tiered pool: a host page to receive a copy (a free one, else the oldest cached-free host page, evicted)."""
+        q = self.free_uncached.pop_host()
+        if q is None:
+            for c in self.lru:
+                if c >= self.n_hbm:
+                    q = c
+                    break
+            if q is None:
+                return None
+            self.lru.pop(q)
+            h = self.hash_of[q]
+            if h is not None and self.cached.get(h) == q:
+                del self.cached[h]
+            self.hash_of[q] = None
+            if self.poison_on:
+                self.poison.append(q)
+        assert self.ref[q] == 0
+        return q
+
+    def move_hash(self, src: int, dst: int) -> None:
+        """The cache entry of src's block now names dst (same bytes after this step's copy); src keeps no hash."""
+        h = self.hash_of[src]
+        self.hash_of[src] = None
+        self.hash_of[dst] = h
+        self.cached[h] = dst
 
     def register(self, p: int, h: Hashable) -> bool:
         """Mark page p (ref > 0, full) as holding block hash h. If another page already holds h on this rank the cache
@@ -251,20 +331,36 @@ class OwnedKVManager:
         pool = self.paged[rank]
         wm = int(self.geom.reserve_watermark * pool.num_pages)
         # the request's own prefix-hit pages that sit in the LRU (ref 0) count as free in num_free(), but touching them
-        # below takes them out of it: count them as used BEFORE granting the reservation (otherwise a preempted request
-        # re-admitted onto its own cached pages leaves reserved > num_free, a prefill deadlock)
+        # below takes them out of it: count them as used BEFORE granting the reservation
         lru_hits = sum(1 for h in block_hashes[:n_local] if pool.ref[pool.cached[h]] == 0)
         if need_total + wm > self.free_pages(rank) - lru_hits or not self.state[rank].num_free():
             return None
         sk = SeqKV(seq_id, rank)
         self._inc += 1
         sk.inc = self._inc
+        copies: list[CopyOp] = []
+        promote = 0
+        if pool.n_hbm:   # tiered pool: the hit's host pages move to HBM pages if the whole prompt fits there
+            n_host_hits = sum(1 for h in block_hashes[:n_local] if pool.cached[h] >= pool.n_hbm)
+            if n_host_hits and len(pool.free_uncached.hbm) >= n_host_hits + need_total and \
+                    need_total + wm + n_host_hits <= self.free_pages(rank) - lru_hits:
+                promote = n_host_hits
         for h in block_hashes[:n_local]:
             p = pool.cached[h]
-            pool.touch(p)
-            sk.pages.append(p)
+            if promote and p >= pool.n_hbm:
+                d = pool.free_uncached.pop_hbm()
+                assert d is not None and pool.ref[d] == 0
+                pool.ref[d] = 1                                   # the sequence's reference
+                pool.touch(p)                                     # the copy's source: pinned until release_copies
+                self.pinned.setdefault(step, []).append(("paged", rank, p))
+                copies.append(self._copy("paged", rank, p, rank, d, step))
+                pool.move_hash(p, d)
+                sk.pages.append(d)
+                self.stats["promoted"] = self.stats.get("promoted", 0) + 1
+            else:
+                pool.touch(p)
+                sk.pages.append(p)
         sk.num_registered = n_local
-        copies: list[CopyOp] = []
         if n_copy:
             dst = pool.alloc(n_copy)
             assert dst is not None
@@ -394,7 +490,7 @@ class OwnedKVManager:
             sk.wver += 1
 
     def free(self, seq_id, defer_until: int | None = None) -> None:
-        """Sequence finished or preempted: release everything. Registered full pages stay in the rank's prefix cache
+        """release everything. Registered full pages stay in the rank's prefix cache
         (LRU, the sequence's LAST blocks are evicted first); unregistered pages go back to the free list.
         defer_until=s (async scheduling, D13 guarantee b): the sequence leaves the tables now, but its pages stay
         referenced until flush_deferred(s') with s' >= s, i.e. until the in-flight step that may still touch them is
@@ -468,6 +564,32 @@ class OwnedKVManager:
         self.stats["copy_bytes"] += sum(self._pool(o.pool, dst).spec.bytes_per_page for o in ops)
         return ops
 
+    def tier_copies(self, step: int, max_pages: int = 4096) -> list[CopyOp]:
+        """Tiered paged pools: copy cached-free HBM pages (finished sequences' prefix cache) to host pages before
+        `step`, so HBM pages stay for running sequences. The HBM page is pinned until release_copies(step) and then
+        returns to the free list; the cache entry names the host page from this step on."""
+        ops: list[CopyOp] = []
+        for r, pool in enumerate(self.paged):
+            if not pool.n_hbm or not pool.demote_q:
+                continue
+            q_, pool.demote_q = pool.demote_q, []
+            for i, p in enumerate(q_):
+                if len(ops) >= max_pages:
+                    pool.demote_q.extend(q_[i:])
+                    break
+                if pool.ref[p] != 0 or p not in pool.lru or pool.hash_of[p] is None:
+                    continue                                       # re-used or evicted since it was queued
+                d = pool.host_dst()
+                if d is None:
+                    break
+                pool.touch(p)                                      # out of the LRU, pinned until release_copies
+                self.pinned.setdefault(step, []).append(("paged", r, p))
+                ops.append(self._copy("paged", r, p, r, d, step))
+                pool.move_hash(p, d)
+                pool.lru[d] = None                                 # the host copy is the cached-free page now
+            self.stats["demoted"] = self.stats.get("demoted", 0) + len(ops)
+        return ops
+
     def release_copies(self, step: int) -> None:
         """The copies planned for `step` have executed: drop the pins on their source pages."""
         for pool, r, p in self.pinned.pop(step, []):
@@ -526,3 +648,27 @@ class OwnedKVManager:
                     # every reservation can be honoured (copy pins on this rank may hold pages back until their step ran)
                     pins = sum(1 for v in self.pinned.values() for pn, pr, _ in v if pn == "paged" and pr == r)
                     assert pool.reserved <= pool.num_free() + pins, (r, pool.reserved, pool.num_free(), pins)
+
+
+if __import__("os").environ.get("PHYS_CXX_KV") == "1":
+    import os as _os                               # an explicit switch: if the extension does not load, the import FAILS
+    import sys as _sys                             # (no silent fallback to the Python version)
+    _d = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "core", "src", "py")
+    if _d not in _sys.path:
+        _sys.path.insert(0, _d)
+    import cxx_kv as _ck
+    _ck.install_kv(_sys.modules[__name__])
+    print("kv_manager: PHYS_CXX_KV=1: " + "the C++ KV manager behind OwnedKVManager (" + _ck.X.__file__ + ")", flush=True)
+
+
+if __import__("os").environ.get("PHYS_GTRACE") and "kv" not in __import__("os").environ.get("PHYS_GTRACE_SKIP", "").split(","):
+    try:
+        import os as _os
+        import sys as _sys
+        _d = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "core", "src", "kv")
+        if _d not in _sys.path:
+            _sys.path.insert(0, _d)
+        import gtrace_kv as _gk
+        _gk.install_kv(OwnedKVManager)
+    except Exception as _e:  # noqa: BLE001
+        print(f"kv_manager: golden-trace recorder not installed ({type(_e).__name__}: {str(_e)[:200]})", flush=True)

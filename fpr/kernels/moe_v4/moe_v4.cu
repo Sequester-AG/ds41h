@@ -82,7 +82,7 @@
                      // per CTA ([token][128 rows], two 256-thread barriers per tile); same bytes
 #endif
 #ifndef MS4_G2P
-#define MS4_G2P 0  // moe_v4: GEMM2 items flagged q | 0x100 (route2.cu built with R2_G2PAIR=1: ECs with n_pad <= 16) are
+#define MS4_G2P 0  // moe_v4: GEMM2 items flagged q | 0x100 are
                    // 256-row pairs: ONE 73,728-B bulk copy of the contiguous rows, the H image once, B fragments shared
                    // by both 128-row halves, warp-staged Y; 2 ring stages of 96 KB
 #endif
@@ -96,7 +96,9 @@
 #endif
 #ifndef MS4_PDL
 #define MS4_PDL 0  // moe_v4: programmatic dependent launch: GEMM1 lets its dependents launch at once; GEMM2 is launched with
-                   // programmatic stream serialization and runs griddepcontrol.wait after its prologue (barrier init)
+                   // programmatic stream serialization and runs griddepcontrol.wait after its prologue (barrier init);
+                   // 2: BOTH GEMMs launched with PDL, each triggers its dependents at once and waits
+                   // after its prologue (same data, same arithmetic)
 #endif
 #ifndef MS4_SPOL
 #define MS4_SPOL 0  // moe_v4: GEMM1 scale boxes (16 B of each row per stage = half a 32-B sector; the next stage reads the
@@ -106,7 +108,7 @@
 #define MS4_NS2 24  // moe_v4: GEMM2 tiles with n_pad <= this take the whole K in one stage (40 fits the MS4_G2P stage)
 #endif
 #ifndef MS4_G1P
-#define MS4_G1P 0  // moe_v4: GEMM1 items flagged q | 0x100 (route2.cu R2_G1PAIR=1) are 128-intermediate pairs (blocks q, q+1):
+#define MS4_G1P 0  // moe_v4: GEMM1 items flagged q | 0x100 are 128-intermediate pairs (blocks q, q+1)
                    // MSR_G1PAIR's consumer (B fragments shared by both row sets) on a balanced item list
 #endif
 #ifndef MS4_NOIMG
@@ -155,6 +157,7 @@ struct Tile {
 static_assert(sizeof(Tile) == 24, "Tile layout must match bench.py");
 struct Hdr {
   int tile, ch, npad, nch, pair, q, ec;  // moe_v4: q = the tile's row block (no global Tile load in the epilogue), ec index
+  int ks, nks;                           // GEMM1 split-K (gemm1rk): this item's K part of the tile, parts (1 = whole K)
 };
 
 template <int MODE>
@@ -538,15 +541,23 @@ __global__ void __launch_bounds__(640) k_gather2(const __nv_bfloat16* __restrict
 #ifndef MSR_G5B
 #define MSR_G5B 1
 #endif
+// the EC slot-base table holds route2's
+// max_ec(MAXT x 6) = 1152 ECs (was 512); more (impossible for T <= 8192) -> nothing written, g_gather5_err set.
+constexpr int G5_MAXE = 384 + 8192 * 6 / 64;
+__device__ unsigned g_gather5_err = 0u;
 __global__ void __launch_bounds__(640, MSR_G5B) k_gather5(const __nv_bfloat16* __restrict__ x, EC* __restrict__ ecs,
                                                           const int* __restrict__ ptok, char* __restrict__ img,
                                                           const int* __restrict__ counts, int pstride) {
-  constexpr int U = MSR_G5U, MAXE = 512, MAXJ = 64;
+  constexpr int U = MSR_G5U, MAXE = G5_MAXE, MAXJ = 64;
   __shared__ int sbase[MAXE + 1];
   __shared__ long long soff[MAXJ];  // per slot of this batch: image byte offset of slab 0, n_pad * 128 (slab stride)
   __shared__ int sstr[MAXJ], stok[MAXJ], snn[MAXJ];
   __shared__ float ssc[MAXJ];
   const int nec = counts[0], S = counts[3] / (80 * 128), G = gridDim.x;
+  if (nec < 0 || nec > MAXE) {  // never past sbase: skip, flag (uniform per launch: every block returns)
+    if (blockIdx.x == 0 && threadIdx.x == 0) atomicOr(&g_gather5_err, 1u);
+    return;
+  }
   for (int i = threadIdx.x; i < nec; i += blockDim.x) sbase[i] = (int)(ecs[i].img_off / (80 * 128));
   if (threadIdx.x == 0) sbase[nec] = S;
   __syncthreads();
@@ -742,6 +753,12 @@ struct Args {
   alignas(64) CUtensorMap tms2;  // GEMM1 paired tiles: s13 box 16 B x 128 rows
   const int* ec8;  // gemm1r8: EC indices with n_pad 8 (route2x)
   int skip8;       // gemm1rs: the tile-stream GEMM1 skips n_pad-8 tiles (gemm1r8 runs them)
+  // gemm1rk: GEMM1 n_pad-8 tiles split into g1ks K parts when the tile count exceeds the
+  // grid (one wave) and is <= g1maxt; each part stores its fp32 accumulators to g1part, the last part to finish (ticket
+  // g1tick[tile], reset by it) sums the parts in part order and runs the epilogue. Not bitwise to gemm1r (sum order).
+  float* g1part;
+  int* g1tick;
+  int g1ks, g1maxt;
 };
 
 template <int MODE, int NT, bool PAIR = false>
@@ -780,6 +797,11 @@ __device__ __forceinline__ void run_tile(const Args<MODE>& a, char* ring, uint64
       }
     eh_off = e0->h_off, eslot = e0->pad, enr = e0->n_real;
   }
+  int ks_ = 0, nks_ = 1, ch0_ = 0;
+  if (MODE == 1) {
+    const Hdr* h0 = (const Hdr*)(ring + (size_t)(it % SS<MODE>) * Ly::STAGE + Ly::OFF_H);
+    ks_ = h0->ks, nks_ = h0->nks, ch0_ = h0->ch;
+  }
   float acc[PS][2][N / 2];
   unsigned abl_sink = 0;  // MS3_ABL: keeps ablated loads / conversions live
 #pragma unroll
@@ -788,9 +810,11 @@ __device__ __forceinline__ void run_tile(const Args<MODE>& a, char* ring, uint64
     for (int q = 0; q < 2; ++q)
 #pragma unroll
       for (int i = 0; i < N / 2; ++i) acc[ps][q][i] = 0.f;
-  for (int ch = 0; ch < NCH; ++ch) {
+  const int nloc_ = NCH / nks_;
+  for (int lc_ = 0; lc_ < nloc_; ++lc_) {
+    const int ch = ch0_ + lc_;
     const int s = it % SS<MODE>;
-    if (ch > 0) {
+    if (lc_ > 0) {
       const long long q0 = MS4_TRACE ? clock64() : 0;
       mbar_wait(smem_u32(full + s), (it / SS<MODE>) & 1);
       if (MS4_TRACE && tr) tr[0] += clock64() - q0;
@@ -913,6 +937,27 @@ __device__ __forceinline__ void run_tile(const Args<MODE>& a, char* ring, uint64
       for (int i = 0; i < N / 2; ++i) acc[ps][0][i] += acc[ps][1][i];
   }
   if (MS3_ABL && abl_sink == 0x9e3779b9u) acc[0][0][0] += 1.f;  // never true in practice; the compiler cannot know
+  if constexpr (MODE == 1 && NT == 1 && !PAIR) {
+    if (nks_ > 1) {  // gemm1rk: part exchange through g1part [tile][part][256 threads] float4, last part sums in part order
+      const int tid = 128 * c + t;
+      float4* pp = (float4*)a.g1part + (size_t)tile * nks_ * 256;
+      pp[ks_ * 256 + tid] = make_float4(acc[0][0][0], acc[0][0][1], acc[0][0][2], acc[0][0][3]);
+      __threadfence();
+      unsigned lastf = 0, nlast;
+      asm volatile("bar.sync 1, 256;" ::: "memory");
+      if (tid == 0) lastf = (atomicAdd(a.g1tick + tile, 1) == nks_ - 1) ? 1u : 0u;
+      asm volatile("{\n .reg .pred p;\n setp.ne.u32 p, %1, 0;\n bar.red.popc.u32 %0, 1, 256, p;\n}" : "=r"(nlast) : "r"(lastf) : "memory");
+      if (nlast == 0) return;
+      __threadfence();
+      float4 sm4 = make_float4(0.f, 0.f, 0.f, 0.f);
+      for (int k = 0; k < nks_; ++k) {
+        const float4 v = k == ks_ ? make_float4(acc[0][0][0], acc[0][0][1], acc[0][0][2], acc[0][0][3]) : __ldcg(pp + k * 256 + tid);
+        sm4.x += v.x, sm4.y += v.y, sm4.z += v.z, sm4.w += v.w;
+      }
+      acc[0][0][0] = sm4.x, acc[0][0][1] = sm4.y, acc[0][0][2] = sm4.z, acc[0][0][3] = sm4.w;
+      if (tid == 0) a.g1tick[tile] = 0;
+    }
+  }
   if (MS4_TRACE && tr) tr[1] = clock64();
   // ---- epilogue. acc[0][4 nb + {0,1,2,3}] = (row g, col 8nb+2tq), (g, +1), (g+8, 2tq), (g+8, +1)
   struct {
@@ -1015,7 +1060,8 @@ struct NoPoll {
 template <int MODE, class Poll = NoPoll>
 __device__ __forceinline__ void produce_item(const Args<MODE>& a, char* ring, uint64_t* full, uint64_t* empty, long& it,
                                              int tile, Tile tl, bool end, uint64_t pw, uint64_t pb, int endv = -1,
-                                             const int* dep = nullptr, int dep_target = 0, Poll poll = Poll{}) {
+                                             const int* dep = nullptr, int dep_target = 0, Poll poll = Poll{}, int ks = 0,
+                                             int KS = 1) {
   using C = Cfg<MODE>;
   using Ly = Lay<MODE>;
       const int npad = end ? 0 : tl.npad;
@@ -1028,7 +1074,10 @@ __device__ __forceinline__ void produce_item(const Args<MODE>& a, char* ring, ui
   if (pair && !g2p && !g1p && (tl.q & 1)) return;  // the even tile of the pair covers these rows
   const int CH = pair ? (MODE == 1 ? MSR_G1PAIR_CH : (g2p ? C::KB : C::CHB)) : (npad <= C::NSMALL ? C::CHS : C::CHB);
   const int nch = end ? 1 : C::KB / CH;
-  for (int ch = 0; ch < nch; ++ch, ++it) {
+  const bool split = MODE == 1 && KS > 1 && !end && !pair && npad == 8 && nch % KS == 0;
+  if (!end && KS > 1 && !split && ks > 0) return;  // unsplit tiles: part 0 runs the whole K
+  const int cb = split ? ks * (nch / KS) : 0, ce = split ? cb + nch / KS : nch;
+  for (int ch = cb; ch < ce; ++ch, ++it) {
     const int s = it % SS<MODE>;
     poll(false);
     if (it >= SS<MODE>) mbar_wait(smem_u32(empty + s), ((it / SS<MODE>) + 1) & 1);
@@ -1042,6 +1091,8 @@ __device__ __forceinline__ void produce_item(const Args<MODE>& a, char* ring, ui
     h->pair = pair ? 1 : 0;
     h->q = end ? 0 : tl.q;
     h->ec = end ? 0 : tl.ec;
+    h->ks = split ? ks : 0;
+    h->nks = split ? KS : 1;
     if (end) {
       mbar_arrive(fb);
       break;
@@ -1049,7 +1100,7 @@ __device__ __forceinline__ void produce_item(const Args<MODE>& a, char* ring, ui
     const unsigned bA = MS4_NOW ? 0u : g2p ? 256u * (IR / 2) : pair ? (MODE == 1 ? (unsigned)CH * 8192u : 256u * 96u) : CH * 4096,
                bS = MS4_NOW ? 0u : (MODE == 1 && MS3_ABL >= 8) ? 0u : MODE == 1 ? (pair ? 4096u : 2048u) : (pair ? 4608u : 2304u),
                bB = (MS3_ABL >= 6 || MS4_NOIMG) ? 0u : CH * npad * 128;
-    const unsigned bE = ch == 0 ? (unsigned)sizeof(EC) : 0u;
+    const unsigned bE = ch == cb ? (unsigned)sizeof(EC) : 0u;
     if (MS4_NOSTREAM) {  // timing only: consumer-bound time (stale stage data; only the EC record is copied)
       mbar_expect_tx(fb, bE);
       if (bE) bulk(dst + Ly::OFF_H + 128, a.ecs + tl.ec, bE, fb, pb);
@@ -1187,9 +1238,12 @@ __global__ void __launch_bounds__(32 + 32 * NCW, 1) k_gemm(const __grid_constant
     for (int s = 0; s < SS<MODE>; ++s) mbar_init(smem_u32(full + s), 1), mbar_init(smem_u32(empty + s), NCW);
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
-  if (MS4_PDL) {
+  if (MS4_PDL == 1) {
     if (MODE == 1) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     else asm volatile("griddepcontrol.wait;" ::: "memory");  // GEMM1 (and everything before it) complete and visible
+  } else if (MS4_PDL == 2) {  // both GEMMs launched with PDL: dependents may launch now; this grid waits after its prologue
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    asm volatile("griddepcontrol.wait;" ::: "memory");
   }
   __syncthreads();
   if (warp == NCW) {  // ---------------------------------------------------------------- producer (lane 0 of the last warp)
@@ -1208,6 +1262,17 @@ __global__ void __launch_bounds__(32 + 32 * NCW, 1) k_gemm(const __grid_constant
         produce_item<MODE>(a, ring, full, empty, it, item, tl, end, pw, pb);
         if (end) break;
         item = next;
+      }
+      return;
+    }
+    const int KS = (MODE == 1 && a.g1ks > 1 && ntiles > (int)gridDim.x && ntiles <= a.g1maxt && !a.skip8) ? a.g1ks : 1;
+    if (KS > 1) {  // gemm1rk: items = (tile, K part), consecutive parts of a tile on consecutive CTAs
+      for (int item = blockIdx.x;; item += gridDim.x) {
+        const bool end = item >= ntiles * KS;
+        const int tile = end ? 0 : item / KS;
+        const Tile tl = end ? Tile{0, 0, 0, 0, 0} : a.tiles[tile];
+        produce_item<MODE>(a, ring, full, empty, it, tile, tl, end, pw, pb, -1, nullptr, 0, NoPoll{}, end ? 0 : item % KS, KS);
+        if (end) break;
       }
       return;
     }
@@ -2103,7 +2168,7 @@ static void launch(Args<MODE>& a, int64_t grid) {
     cudaFuncSetAttribute(k_gemm<MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, Lay<MODE>::SMEM);
     attr = true;
   }
-  if (MS4_PDL && MODE == 2) {
+  if ((MS4_PDL == 1 && MODE == 2) || MS4_PDL == 2) {
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = dim3(grid > 0 ? (unsigned)grid : (unsigned)g_sms);
     cfg.blockDim = dim3(32 + 32 * NCW);
@@ -2133,6 +2198,30 @@ void gemm1r(torch::Tensor w13, torch::Tensor s13, torch::Tensor ecs, torch::Tens
   a.tms = tmap2d(s13.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 32, rows, 16, 64, CU_TENSOR_MAP_SWIZZLE_NONE);
   a.tmw2 = tmap2d(w13.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 2, rows, 128, 128, CU_TENSOR_MAP_SWIZZLE_128B);
   a.tms2 = tmap2d(s13.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 32, rows, 16, 128, CU_TENSOR_MAP_SWIZZLE_NONE);
+  launch<1>(a, grid);
+}
+// gemm1r with GEMM1 split-K for n_pad-8 tiles (see Args::g1part): part fp32 scratch (>= tiles x ks x 4 KB used, e.g. the
+// bucket's GEMM2 output Y, which GEMM2 overwrites afterwards), tick int32 zeros [>= tiles] (left zeroed), ks in {2, 5, 10}
+void gemm1rk(torch::Tensor w13, torch::Tensor s13, torch::Tensor ecs, torch::Tensor tiles, torch::Tensor counts,
+             torch::Tensor img, torch::Tensor himg, int64_t grid, torch::Tensor part, torch::Tensor tick, int64_t ks) {
+  TORCH_CHECK(w13.size(1) == 1152 && w13.size(2) == D / 2 && s13.size(2) == D / 32, "gemm1rk: raw w13 / s13 shapes");
+  TORCH_CHECK(ks == 2 || ks == 5 || ks == 10, "gemm1rk: ks in {2, 5, 10}");
+  TORCH_CHECK(tick.scalar_type() == torch::kInt32 && tick.is_contiguous() && part.is_contiguous() &&
+                  ((uintptr_t)part.data_ptr() % 16) == 0, "gemm1rk: tick int32 / part 16-B aligned");
+  if (!g_sms) cudaDeviceGetAttribute(&g_sms, cudaDevAttrMultiProcessorCount, w13.get_device());
+  Args<1> a{};
+  a.ecs = (const EC*)ecs.data_ptr(), a.tiles = (const Tile*)tiles.data_ptr(), a.bimg = (const char*)img.data_ptr();
+  a.himg = (char*)himg.data_ptr(), a.nt_dev = counts.data_ptr<int>() + 1;
+  a.w2 = (const unsigned char*)w13.data_ptr();
+  const uint64_t rows = (uint64_t)w13.size(0) * 1152;
+  a.tmw = tmap2d(w13.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 2, rows, 128, 64, CU_TENSOR_MAP_SWIZZLE_128B);
+  a.tms = tmap2d(s13.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 32, rows, 16, 64, CU_TENSOR_MAP_SWIZZLE_NONE);
+  a.tmw2 = tmap2d(w13.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 2, rows, 128, 128, CU_TENSOR_MAP_SWIZZLE_128B);
+  a.tms2 = tmap2d(s13.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 32, rows, 16, 128, CU_TENSOR_MAP_SWIZZLE_NONE);
+  a.g1part = (float*)part.data_ptr();
+  a.g1tick = tick.data_ptr<int>();
+  a.g1ks = (int)ks;
+  a.g1maxt = (int)std::min<int64_t>(tick.numel(), (int64_t)part.nbytes() / (ks * 256 * 16));
   launch<1>(a, grid);
 }
 // gemm1r with skip8 = 1: the tile stream leaves the n_pad-8 tiles to gemm1r8
@@ -2299,6 +2388,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("prepr", &prepr);
   m.def("gemm1r", &gemm1r);
   m.def("gemm1rs", &gemm1rs);
+  m.def("gemm1rk", &gemm1rk);
   m.def("gemm1r8", &gemm1r8);
   m.def("gemm2r", &gemm2r);
   m.def("gemm2rs", &gemm2rs);

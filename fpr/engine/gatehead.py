@@ -34,8 +34,25 @@ class GateHead:
         return ([int(f[k]) for k in range(n)] if f is not None else [0] * n,
                 [int(sc[k]) for k in range(n)] if sc is not None else [0] * n)
 
+    @staticmethod
+    def active(tab) -> bool:
+        """Any forced / score sequence in this table (one vectorized check instead of per-sequence lists)."""
+        sq = getattr(tab, "seq", None) or {}
+        for x in (sq.get("forced"), sq.get("score")):
+            if x is None:
+                continue
+            try:
+                if bool(x.any()):
+                    return True
+            except AttributeError:
+                if any(x):
+                    return True
+        return False
+
     def any_gate(self, tables) -> tuple:
         """(any gate sequence in the step, all sequences are gate sequences)."""
+        if not any(self.active(t) for t in tables):   # the common case: no gate sequence, (False, False) as below
+            return False, False
         anyg, allg, n = False, True, 0
         for t in tables:
             f, sc = self.flags(t)
@@ -51,6 +68,8 @@ class GateHead:
 
     def fill(self, r: int, s: dict, tab, res) -> None:
         """Overwrite res for the bucket's forced / score sequences (rows index the bucket = tab rows)."""
+        if not self.active(tab):
+            return
         f, sc = self.flags(tab)
         if not any(f) and not any(sc):
             return

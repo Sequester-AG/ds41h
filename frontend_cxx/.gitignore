@@ -1,0 +1,5 @@
+# frontend_cxx: never commit build outputs or third-party downloads.
+build/
+third_party/dl/
+third_party/build/
+third_party/install/

@@ -355,8 +355,7 @@ def run_offline(sched: RankScheduler, worker, max_steps: int = 10_000, on_step=N
                 require_done: bool = False, stall_steps: int = 256) -> dict:
     """Drive scheduler + worker until nothing is left (or max_steps). Time = the cost model's estimate per step (stub) or
     the measured wall time (GPU). seq_init(rid) -> (prompt_ids, output_ids, sampling dict): with it, every step goes
-    through Worker.step with the request lifecycle (D11: new sequences with their sampling params and token history,
-    dropped = finished / preempted), as the served path does; without it, Worker.run_step."""
+    through Worker.step with the request lifecycle, as the served path does; without it, Worker.run_step."""
     import gc
     import types
 

@@ -210,10 +210,10 @@ def sampling_dict(sp) -> dict:
 
 @dataclass
 class SeqInit:
-    """A sequence whose engine-side state starts this step (first scheduling, or re-admission after a preemption)."""
+    """A sequence whose engine-side state starts this step."""
     rid: object
     prompt_ids: list
-    output_ids: list                                  # non-empty after a preemption (recomputed as prefill)
+    output_ids: list
     sampling: dict                                    # sampling_dict(SamplingParams)
     structured: bool = False                          # grammar-constrained: bitmask rows arrive in StepContext.grammar
 
@@ -223,7 +223,7 @@ class StepContext:
     """Per-step request lifecycle for the engine (optional third argument of Engine.step, contract D11).
     The sequence's uid / state slot come from the same step's tables (seq_uid, seq_state_slot via seq_rows rid)."""
     new: list = field(default_factory=list)           # SeqInit
-    dropped: set = field(default_factory=set)         # rids finished or preempted since the previous step: drop state
+    dropped: set = field(default_factory=set)         # drop state
     grammar: dict = field(default_factory=dict)       # rid -> (rows int32 [num_spec + 1, ceil(V / 32)], acceptable)
     prev_tokens: dict = field(default_factory=dict)   # rid -> up to 3 token ids before its first row (Engram context)
     order: list = field(default_factory=list)         # vLLM's request order of this step (informational)
@@ -263,3 +263,27 @@ def copy_runs(copies: list[CopyOp]) -> list[tuple]:
                 continue
         out.append((c.pool, c.src_rank, c.src_page, c.dst_rank, c.dst_page, 1))
     return out
+
+
+if __import__("os").environ.get("PHYS_CXX_TABLES") == "1":   # stage 2a: build_step_batch in C++ for the C++ KV manager
+    import os as _os                               # an explicit switch: if the extension does not load, the import FAILS
+    import sys as _sys                             # (no silent fallback to the Python version)
+    _d = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "core", "src", "py")
+    if _d not in _sys.path:
+        _sys.path.insert(0, _d)
+    import cxx_kv as _ck
+    _ck.install_interfaces(_sys.modules[__name__])
+    print("interfaces: PHYS_CXX_TABLES=1: " + "build_step_batch in C++ for the C++ KV manager (" + _ck.X.__file__ + ")", flush=True)
+
+
+if __import__("os").environ.get("PHYS_GTRACE") and "tables" not in __import__("os").environ.get("PHYS_GTRACE_SKIP", "").split(","):
+    try:
+        import os as _os
+        import sys as _sys
+        _d = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "core", "src", "tables")
+        if _d not in _sys.path:
+            _sys.path.insert(0, _d)
+        import gtrace_tables as _gt
+        _gt.install_interfaces(_sys.modules[__name__])
+    except Exception as _e:  # noqa: BLE001
+        print(f"interfaces: golden-trace recorder not installed ({type(_e).__name__}: {str(_e)[:200]})", flush=True)

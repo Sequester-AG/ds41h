@@ -1,6 +1,6 @@
 #!/bin/bash
 # FPRv1 launcher: the certified configuration (fpr/config/fprv1.env) behind vLLM 0.32.0's unchanged API layer.
-# Localhost, port 8100, unless EXTRA overrides it (scripts/run_fpr_endpoint.example.sh shows HTTPS with API keys).
+# Localhost, port 8100, unless EXTRA overrides it (deploy/h200/run_native.sh shows HTTPS with API keys).
 #
 #   MODEL=<dir> scripts/serve_fpr.sh             synchronous scheduling, 224 seats (the certified serving configuration)
 #   ASYNC=1 MAX_SEQS=256 scripts/serve_fpr.sh    pipelined decode dispatch: the decode-heavy option, also certified
@@ -10,15 +10,13 @@
 #                                                "warm-up done" (the first mixed step of a process is slower than the rest)
 #   FPR_WARM_URL / FPR_WARM_CACERT / FPR_WARM_AUTH   where the warm-up requests go when EXTRA changes host, TLS or keys
 #   IMAGES=1 (default) | 0                       image input (vision tower on every GPU); 0 = text only, images rejected
-#   PHYS_MM_MARGIN_MB=1024 (default)             with images: memory kept free for the mixed steps' workspaces,
-#                                                on top of the vision tower and the encoded-image cache
 #   RESPONSES_STORE=1 (default) | 0              keep /v1/responses results for store:true follow-ups (in memory, per
 #                                                process, least recently used dropped past PHYS_RESPONSES_STORE_MAX,
 #                                                default 4096: fpr/adapter/responses_store.py); 0 = vLLM's default (off)
 #   DRYRUN=1                                     print the environment and the vllm command only
 #
 # The first start builds the CUDA extensions and the converted-weight cache unless scripts/prebuild_fpr.sh ran before.
-# Differences to production's launcher (scripts/serve_ds41h.sh), each needed by FPRv1's engine:
+# Differences to production's launcher (scripts/serve_ds41h.sh on the main branch), each needed by FPRv1's engine:
 #   --scheduler-cls adapter.phys_scheduler.PhysScheduler           the rank scheduler and sequence-owned KV (fpr/serve)
 #   --distributed-executor-backend adapter.phys_executor.PhysExecutor   FPRv1's worker inside the EngineCore process
 #   --tensor-parallel-size 1                                       vLLM runs no TP workers: the engine drives all four GPUs
@@ -30,6 +28,11 @@
 #             --mm-processor-cache-gb 0 without patches/vllm-0.32.0-mm-content-identity.patch (see README, Security)
 #   --max-num-batched-tokens 17664                                 4 GPUs x (4,096 prefill rows + 80 x 4 decode rows)
 set -euo pipefail
+# The caller's own FPR_SCHED / FPR_ENGINE and the names it exported (snapshot before env.sh and the configuration file):
+# a value the caller sets wins over the file's, with a warning.
+_CALLER_SCHED=${FPR_SCHED-__unset__}
+_CALLER_ENGINE=${FPR_ENGINE-__unset__}
+_CALLER_NAMES=" $(compgen -e | tr '\n' ' ') "
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck disable=SC1091
 source "$REPO/scripts/env.sh"
@@ -37,6 +40,14 @@ CFG=${FPR_CONFIG:-$REPO/fpr/config/fprv1.env}
 [ -f "$CFG" ] || { echo "serve_fpr: no configuration $CFG" >&2; exit 2; }
 # shellcheck disable=SC1090
 source "$CFG"
+if [ "$_CALLER_SCHED" != __unset__ ] && [ "$_CALLER_SCHED" != "${FPR_SCHED:-}" ]; then
+  echo "serve_fpr: FPR_SCHED from the environment overrides $CFG's" >&2
+  FPR_SCHED=$_CALLER_SCHED
+fi
+if [ "$_CALLER_ENGINE" != __unset__ ] && [ "$_CALLER_ENGINE" != "${FPR_ENGINE:-}" ]; then
+  echo "serve_fpr: FPR_ENGINE from the environment overrides $CFG's" >&2
+  FPR_ENGINE=$_CALLER_ENGINE
+fi
 PHYS=${PHYS_ROOT:-$REPO/fpr}   # PHYS_ROOT: the engine tree, if it is not this repository's fpr/
 # where scripts/prebuild_fpr.sh put the extensions (IDX2F_BUILD, MOE_V4_BUILD, TORCH_EXTENSIONS_DIR)
 # shellcheck disable=SC1091
@@ -61,8 +72,13 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Fa
 export PHYS_ENGINE="${PHYS_ENGINE:-$FPR_ENGINE}"
 sched="$FPR_SCHED"; [ "${FPR_CP:-0}" = 1 ] && sched="${sched:+$sched,}cp_prefill=1"
 export PHYS_SCHED="${PHYS_SCHED:-$sched}"
-# shellcheck disable=SC2086
-[ -n "${FPR_FLAGS:-}" ] && export $FPR_FLAGS
+# the file's FPR_FLAGS, except variables the caller exported itself (those keep the caller's value)
+for _kv in ${FPR_FLAGS:-}; do
+  case "$_CALLER_NAMES" in
+    *" ${_kv%%=*} "*) echo "serve_fpr: ${_kv%%=*} from the environment overrides $CFG's FPR_FLAGS" >&2 ;;
+    *) export "$_kv" ;;
+  esac
+done
 ASYNC=${ASYNC:-${FPR_ASYNC:-0}}
 MAX_SEQS=${MAX_SEQS:-$FPR_MAX_SEQS}
 SCHED_CLS=adapter.phys_scheduler.PhysScheduler; ASYNC_FLAG=--no-async-scheduling
@@ -91,6 +107,9 @@ if [ "${RESPONSES_STORE:-1}" = 1 ]; then
   export VLLM_ENABLE_RESPONSES_API_STORE=1 PHYS_RESPONSES_STORE_MAX=${PHYS_RESPONSES_STORE_MAX:-4096}
   STORE_ARGS=(--middleware adapter.responses_store.BoundedStore)
 fi
+# sampling features the phys engine cannot do -> a 400 before streaming (adapter/sampling_guard.py
+# caps from the engine over the utility channel). Python frontend only: frontend_cxx does the same check itself.
+if [ "${SAMPLING_GUARD:-1}" = 1 ]; then STORE_ARGS+=(--middleware adapter.sampling_guard.SamplingGuard); fi
 SPEC='{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false}'
 ARGS=(
   "$MODEL" --served-model-name deepseek-v41-flash-h200 --host 127.0.0.1 --port "$PORT"

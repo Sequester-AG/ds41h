@@ -13,8 +13,7 @@ Environment
   DS41H_DRAFT_FUSED=1          use MarkovFused when eligible (default 1)
   DS41H_DRAFT_FUSED_MAX_ROWS=4 requests per draft step served by the fused kernel (more -> Triton path; kernel
                                limit 4). Graph bench (bench8): rows 1/2/4 fused 44/64/104 us vs Triton+LL 101/105/117
-  DS41H_DRAFT_HEAD_FP8=1       FP8 draft head (default 1: end-to-end accept 5.16/5.22 vs 5.12/5.11 bf16, KL PASS,
-                               59 us vs 106 us in-situ; changes the draft distribution only, verification stays exact)
+  DS41H_DRAFT_HEAD_FP8=1       FP8 draft head
   DS41H_VERIFY_FUSED=0         fused verification kernel when eligible (default 0: exact either way, but in end-to-end/dr4b
                                the fused kernel took 100 us vs 74 us for the Triton + LL-gather chain on the critical rank)
   DS41H_DRAFT_TIMEOUT_S=0      device-side spin timeout (debug)

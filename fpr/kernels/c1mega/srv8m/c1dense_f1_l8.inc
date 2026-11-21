@@ -1,0 +1,86 @@
+// Other paths: c1dense_f1_l.inc verbatim
+// c1dense_f1_l.inc: c1dense_f1.inc with z written as polled data (parity buffers
+// [2][NRM][2048], the other parity reset to L16_SENT) + the C1M_TS stamp 42. Same values
+// c1dense_f1.inc: F1 wo_a: CTA c < 128 (gi = c >> 6 group, tr = (c & 63) * 16 rows).
+//  C1M_DPART 0 (producer): 8 bf16 stages (TM_WOA16, two boxes each; B16 bit 1) or 4 fp8 stages (TM_WOA + scales).
+//  C1M_DPART 1 (consumers, after the o image + cbar() + stamp(26), followed by arrive(C_Z)): in: img (the o image: natural bf16 or
+//    f16 P8 x 2^S.pv[n]); out: a.z[n * 2048 + 1024 gi + tr + row] bf16.
+// Default = the code as it was in c1mega.cu, verbatim. Variants: a wrapper .cu that defines C1M_DENSE_F1 to
+// another file, then includes the deployment wrapper (see c1mega_x2hq29.cu).
+#if C1M_DPART == 0
+    // F1 wo_a
+    if (c < 128 && B16(a, woa8, 5)) {   // (srv8x) the engine's packed wo_a: rows R0 = 1024 gi + tr of this rank's 2048
+      const int gi = c >> 6, tr = (c & 63) * 16, R0 = 1024 * gi + tr;
+      for (int kc = 0; kc < 8; ++kc) {
+        const uint32_t s = slot(L_D8S + 64), b = sbase(s), fb = su32(&S.full[s]);
+        tma5d(b, a.tm + TM_WOA8, 0, 2 * ((R0 & 127) >> 4), 0, R0 >> 7, 4 * kc, fb, pol);
+        tma3d(b + L_D8S, a.tm + TM_WOA8S, 0, R0 >> 7, 4 * kc, fb, pol);
+        ++it;
+      }
+    } else if (c < 128 && B16(a, woaT16, 1)) {   // the engine's bf16 wo_a^T: 8 chunks of 512 K, each two boxes {16 columns, 256 K}
+      const int gi = c >> 6, tr = (c & 63) * 16;
+      for (int kc = 0; kc < 8; ++kc) {
+        const uint32_t s = slot(16 * 512 * 2), b = sbase(s), fb = su32(&S.full[s]);
+        tma3d(b, a.tm + TM_WOA16, tr, 512 * kc, 2 * rank + gi, fb, pol);
+        tma3d(b + 8192, a.tm + TM_WOA16, tr, 512 * kc + 256, 2 * rank + gi, fb, pol);
+        ++it;
+      }
+    } else if (c < 128) {
+      const int gi = c >> 6, tr = (c & 63) * 16;
+      for (int kc = 0; kc < 4; ++kc) {
+        const uint32_t s = slot(16 * 1024 + 32), b = sbase(s), fb = su32(&S.full[s]);
+        tma3d(b, a.tm + TM_WOA, 0, 1024 * gi + tr, 8 * kc, fb, pol);
+        bulk(b + L_D_S, a.woa_s + (size_t)((1024 * gi + tr) / 32) * 128 + 32 * kc, 32, fb, pol);
+        ++it;
+      }
+    }
+#else
+    float acc[1][4] = {{0.f, 0.f, 0.f, 0.f}};
+    const bool w8 = B16(a, woa8, 5), b16 = B16(a, woaT16, 1) || w8;   // (srv8x: the packed path's image is natural bf16 too)
+    if (w8) {   // (srv8x) two stages per wait / release, as C1M_DU; the same k order (dense8_c1u)
+      const int rb = ((((c & 63) * 16) & 127) >> 5);
+      for (int kc = 0; kc < 8; kc += 2) {
+        const uint32_t st0 = cwait(), st1 = cwait1();
+        dense8_c1u(acc[0], st0, img, 512 * kc, NR, rb, w, lane);
+        dense8_c1u(acc[0], st1, img, 512 * (kc + 1), NR, rb, w, lane);
+        crel();
+        crel();
+      }
+    } else
+#ifdef C1M_DU
+    if (b16)   // (C1M_DU: two stages per wait / release, loads hoisted; the same MMA order)
+      for (int kc = 0; kc < 8; kc += 2) {
+        const uint32_t st0 = cwait(), st1 = cwait1();
+        dense16t_c1u(acc[0], st0, img, 512 * kc, NR, w, lane);
+        dense16t_c1u(acc[0], st1, img, 512 * (kc + 1), NR, w, lane);
+        crel();
+        crel();
+      }
+    else
+#endif
+    for (int kc = 0; kc < (b16 ? 8 : 4); ++kc) {
+      const uint32_t st = cwait();
+      if (b16) dense16t_chunk(acc[0], st, 32, img, 512 * kc, NR, w, lane);
+      else dense_chunk<1>(acc, st, 0, 32, st + L_D_S, 32, img, 1024 * kc, NR, w, lane);
+      crel();
+    }
+#ifdef C1M_TS
+    stamp(42);   // (diagnostic builds: the chunk loop done)
+#endif
+    reduce_warps<1>(acc, S.red, w, lane);
+    if (w == 0) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int row = g + 8 * (i >> 1), n = 2 * t4 + (i & 1);
+#ifdef C1M_ZL
+        if (n < NR) {   // (C1M_ZL: this layer's parity, relaxed; the other parity back to the sentinel)
+          st_rlx_h(a.z + ((size_t)par * NRM + n) * 2048 + 1024 * gi + tr + row,
+                   __float2bfloat16_rn(b16 ? acc[0][i] : acc[0][i] * pow2i(-S.pv[n])));
+          a.z[((size_t)(par ^ 1u) * NRM + n) * 2048 + 1024 * gi + tr + row] = __ushort_as_bfloat16(L16_SENT);
+        }
+#else
+        if (n < NR) a.z[(size_t)n * 2048 + 1024 * gi + tr + row] = __float2bfloat16_rn(b16 ? acc[0][i] : acc[0][i] * pow2i(-S.pv[n]));
+#endif
+      }
+    }
+#endif

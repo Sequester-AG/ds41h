@@ -812,7 +812,7 @@ struct WgmmaRS16<256> {
 // K order of the W4A16 path. Lane quad t owns the physical range [16t, 16t+16) of each 64-wide K block (FP4 bytes
 // [8t, 8t+8) of a row = words j = 0, 1); both words are rotated right by 4t bits. k16 step s = 2j + h of the block
 // uses word j: fragment register R0 (cols 2t, 2t+1) = rotated nibbles (2h, 2h+4), R2 (cols 2t+8, 2t+9) = rotated
-// nibbles (2h+1, 2h+5) of row g (R1 / R3: row g+8). Hence logical column L of a 64-block (what the B operand
+// nibbles (2h+1, 2h+5) of row g. Hence logical column L of a 64-block (what the B operand
 // holds there) is physical column a16_phys(L) = 16t + 8j + ((n + t) & 7) with s = L >> 4, j = s >> 1, t =
 // (L >> 1) & 3, n = 2 (s & 1) + ((L >> 3) & 1) + 4 (L & 1). act_perm16 (moe_route.cu) writes x and GEMM1 writes h in
 // this logical order (GEMM1's accumulator row for h column c reads weight row a16_phys(c)); the dot product over a
@@ -3466,7 +3466,6 @@ __global__ void __launch_bounds__(sm16::NTHR, S16Cfg<NT>::CTAS) moe_small16_kern
   }
 }
 
-// ------------------------------------------------------------------------------------------------------------------
 // small16 with WIDE WEIGHT BOXES / WIDER UNITS ("small16k"; GEMM1 / GEMM2 variants 18..23,
 // + 8 = chunk-fastest unit order 26..31; forward flag 0x500 | sub << 11 [| 0x4000]). The per-K-block math and the fp32
 // accumulation order of every output element are exactly those of moe_small16_kernel (same A fragments, same mma.sync per
@@ -3477,7 +3476,6 @@ __global__ void __launch_bounds__(sm16::NTHR, S16Cfg<NT>::CTAS) moe_small16_kern
 //    of stage row r sits at chunk c ^ key(r), key = (r >> 1) & 3 (64-byte rows) or r & 7 (128-byte rows) (cute Swizzle<2,4,3> /
 //    <3,4,3> on the byte offset). A K tail (GEMM2: K = 576 = 9 blocks) loads the full box (TMA zero-fills the bytes beyond the
 //    row; the transaction count is the full box) and the consumer skips the missing blocks (no extra products).
-//  * NT = 16 / 32 tokens per unit: decode batches route 8 correlated tokens per stream -> hot experts get > 16 rows at c32+;
 //    32-token units expand (FP4 -> bf16 + scale: ~70% of small16's instructions; the kernel is issue-bound, not HBM-bound) each
 //    weight once per 32 instead of 16 routed rows.
 //  * a.s16_cf: the token chunks of one (expert, weight block) are consecutive units (chunk fastest) -> neighbouring CTAs at the

@@ -134,10 +134,43 @@ __global__ void __launch_bounds__(256) k_expand(const Desc d, const int2* __rest
 
 }  // namespace rx
 
+// ---- C ABI (rowexp_cabi.h; fpr_cabi.h rules): the launches of pybind ring_ops / expand / advance, called by them and by
+// the C++ engine (stage 2b NativeDecode). Same launch configuration and arguments as before (host code only).
+#include "rowexp_cabi.h"
+#include "../../engine/mixed_cxx/fpr_cabi_rec.h"
+FPR_CABI_RECORD_DECL(rowexp)
+
+static int ring_ops_core(const FprRowexpRingOpsArgs* a) {   // "rowexp.ring_ops"
+  rx::k_ring_ops<<<1, 1024, 0, a->c.stream>>>(reinterpret_cast<int2*>(a->ring), a->ops, a->counts);
+  return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+}
+
+static int expand_core(const FprRowexpExpandArgs* a) {      // "rowexp.expand"
+  if (a->R < 0) return FPR_E_ARG;
+  if (a->R == 0) return FPR_OK;
+  rx::Desc d{a->slot, a->row0, a->nrows, a->kind, reinterpret_cast<const long long*>(a->start),
+             reinterpret_cast<const long long*>(a->replay), reinterpret_cast<const long long*>(a->cached), a->counts};
+  rx::k_expand<<<(int)((a->R * 32 + 255) / 256), 256, 0, a->c.stream>>>(
+      d, reinterpret_cast<const int2*>(a->ring), a->dbt, (long long)a->dbt_stride, a->nc, (int)a->R, (long long)a->scratch,
+      reinterpret_cast<long long*>(a->pos), reinterpret_cast<long long*>(a->own), a->si, a->sl,
+      reinterpret_cast<long long*>(a->paged), reinterpret_cast<long long*>(a->start_o), a->seq, a->err);
+  return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+}
+
+static int advance_core(const FprRowexpAdvanceArgs* a) {    // "rowexp.advance"
+  rx::k_advance<<<(int)((a->s_max + 127) / 128), 128, 0, a->c.stream>>>(
+      a->slot, a->kind, a->nrows, reinterpret_cast<const long long*>(a->start_res), a->accepted, a->counts, a->nc);
+  return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+}
+
 namespace {
 
 void chk(const torch::Tensor& t, at::ScalarType dt, const char* n) {
   TORCH_CHECK(t.is_cuda() && t.scalar_type() == dt && t.is_contiguous(), n, ": contiguous CUDA tensor of the right dtype");
+}
+
+FprCall call_of(const torch::Tensor& t) {
+  return FprCall{c10::cuda::getCurrentCUDAStream(t.device().index()).stream(), (int)t.device().index(), 0};
 }
 
 void advance(torch::Tensor slot, torch::Tensor kind, torch::Tensor nrows, torch::Tensor start_res, torch::Tensor accepted,
@@ -145,20 +178,24 @@ void advance(torch::Tensor slot, torch::Tensor kind, torch::Tensor nrows, torch:
   const c10::cuda::CUDAGuard g(nc.device());
   chk(slot, at::kInt, "slot"); chk(kind, at::kInt, "kind"); chk(nrows, at::kInt, "nrows"); chk(start_res, at::kLong, "start_res");
   chk(accepted, at::kInt, "accepted"); chk(counts, at::kInt, "counts"); chk(nc, at::kInt, "nc");
-  auto st = c10::cuda::getCurrentCUDAStream(nc.device().index()).stream();
-  rx::k_advance<<<(int)((s_max + 127) / 128), 128, 0, st>>>(slot.data_ptr<int>(), kind.data_ptr<int>(), nrows.data_ptr<int>(),
-                                                             reinterpret_cast<const long long*>(start_res.data_ptr<int64_t>()),
-                                                             accepted.data_ptr<int>(), counts.data_ptr<int>(), nc.data_ptr<int>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FprRowexpAdvanceArgs a{};
+  a.c = call_of(nc);
+  a.slot = slot.data_ptr<int>(); a.kind = kind.data_ptr<int>(); a.nrows = nrows.data_ptr<int>();
+  a.start_res = start_res.data_ptr<int64_t>(); a.accepted = accepted.data_ptr<int>(); a.counts = counts.data_ptr<int>();
+  a.nc = nc.data_ptr<int>(); a.s_max = s_max;
+  FPR_CABI_RECORD("rowexp.advance", a);
+  TORCH_CHECK(advance_core(&a) == FPR_OK, "rowexp.advance: launch error ", cudaGetErrorString(cudaPeekAtLastError()));
 }
 
 void ring_ops(torch::Tensor ring, torch::Tensor ops, torch::Tensor counts) {
   const c10::cuda::CUDAGuard g(ring.device());
   chk(ring, at::kInt, "ring"); chk(ops, at::kInt, "ops"); chk(counts, at::kInt, "counts");
   TORCH_CHECK(ring.dim() == 3 && ring.size(1) == rx::RB && ring.size(2) == 2, "ring [slots, 512, 2]");
-  auto st = c10::cuda::getCurrentCUDAStream(ring.device().index()).stream();
-  rx::k_ring_ops<<<1, 1024, 0, st>>>(reinterpret_cast<int2*>(ring.data_ptr<int>()), ops.data_ptr<int>(), counts.data_ptr<int>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FprRowexpRingOpsArgs a{};
+  a.c = call_of(ring);
+  a.ring = ring.data_ptr<int>(); a.ops = ops.data_ptr<int>(); a.counts = counts.data_ptr<int>();
+  FPR_CABI_RECORD("rowexp.ring_ops", a);
+  TORCH_CHECK(ring_ops_core(&a) == FPR_OK, "rowexp.ring_ops: launch error ", cudaGetErrorString(cudaPeekAtLastError()));
 }
 
 void expand(torch::Tensor slot, torch::Tensor row0, torch::Tensor nrows, torch::Tensor kind, torch::Tensor start,
@@ -175,19 +212,32 @@ void expand(torch::Tensor slot, torch::Tensor row0, torch::Tensor nrows, torch::
   TORCH_CHECK(pos_o.numel() >= R && own_o.numel() >= R && si_o.numel() >= R * rx::SW && sl_o.numel() >= R && paged_o.numel() >= R,
               "outputs too small for R rows");
   if (R == 0) return;
-  rx::Desc d{slot.data_ptr<int>(), row0.data_ptr<int>(), nrows.data_ptr<int>(), kind.data_ptr<int>(),
-             reinterpret_cast<const long long*>(start.data_ptr<int64_t>()), reinterpret_cast<const long long*>(replay.data_ptr<int64_t>()),
-             reinterpret_cast<const long long*>(cached.data_ptr<int64_t>()), counts.data_ptr<int>()};
-  auto st = c10::cuda::getCurrentCUDAStream(ring.device().index()).stream();
-  rx::k_expand<<<(int)((R * 32 + 255) / 256), 256, 0, st>>>(
-      d, reinterpret_cast<const int2*>(ring.data_ptr<int>()), dbt.data_ptr<int>(), dbt.stride(0), nc.data_ptr<int>(), (int)R,
-      scratch, reinterpret_cast<long long*>(pos_o.data_ptr<int64_t>()), reinterpret_cast<long long*>(own_o.data_ptr<int64_t>()),
-      si_o.data_ptr<int>(), sl_o.data_ptr<int>(), reinterpret_cast<long long*>(paged_o.data_ptr<int64_t>()),
-      reinterpret_cast<long long*>(start_o.data_ptr<int64_t>()), seq_o.data_ptr<int>(), err.data_ptr<int>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FprRowexpExpandArgs a{};
+  a.c = call_of(ring);
+  a.slot = slot.data_ptr<int>(); a.row0 = row0.data_ptr<int>(); a.nrows = nrows.data_ptr<int>(); a.kind = kind.data_ptr<int>();
+  a.start = start.data_ptr<int64_t>(); a.replay = replay.data_ptr<int64_t>(); a.cached = cached.data_ptr<int64_t>();
+  a.counts = counts.data_ptr<int>(); a.ring = ring.data_ptr<int>(); a.dbt = dbt.data_ptr<int>(); a.dbt_stride = dbt.stride(0);
+  a.nc = nc.data_ptr<int>(); a.R = R; a.scratch = scratch;
+  a.pos = pos_o.data_ptr<int64_t>(); a.own = own_o.data_ptr<int64_t>(); a.si = si_o.data_ptr<int>(); a.sl = sl_o.data_ptr<int>();
+  a.paged = paged_o.data_ptr<int64_t>(); a.start_o = start_o.data_ptr<int64_t>(); a.seq = seq_o.data_ptr<int>();
+  a.err = err.data_ptr<int>();
+  FPR_CABI_RECORD("rowexp.expand", a);
+  TORCH_CHECK(expand_core(&a) == FPR_OK, "rowexp.expand: launch error ", cudaGetErrorString(cudaPeekAtLastError()));
 }
 
 }  // namespace
+
+extern "C" {
+static int c_ring_ops(const void* a) { return ring_ops_core((const FprRowexpRingOpsArgs*)a); }
+static int c_expand(const void* a) { return expand_core((const FprRowexpExpandArgs*)a); }
+static int c_advance(const void* a) { return advance_core((const FprRowexpAdvanceArgs*)a); }
+static const FprFnEntry k_rowexp_fns[] = {
+    {"rowexp.ring_ops", c_ring_ops, nullptr, (int64_t)sizeof(FprRowexpRingOpsArgs)},
+    {"rowexp.expand", c_expand, nullptr, (int64_t)sizeof(FprRowexpExpandArgs)},
+    {"rowexp.advance", c_advance, nullptr, (int64_t)sizeof(FprRowexpAdvanceArgs)}};
+static const FprExtTable k_rowexp_table = {FPR_CABI_VERSION, "rowexp", "", 3, k_rowexp_fns};
+__attribute__((visibility("default"))) const FprExtTable* fpr_rowexp_table(void) { return &k_rowexp_table; }
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("advance", &advance);

@@ -27,6 +27,10 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include "../pdl2.cuh"
+#include "mhcf_cabi.h"
+#include "../../engine/mixed_cxx/fpr_cabi_rec.h"   // rule 9: optional record hook
+FPR_CABI_RECORD_DECL(mhcf)
 
 namespace mhcf {
 constexpr int D = 5120, HC = 4, NP = 25, CW = 32, NCH = D / CW, NG = 10, GP = NG * NP;  // gpart: [R][10][25]
@@ -552,6 +556,7 @@ __global__ void __launch_bounds__(256) k_frow(const __nv_bfloat16* __restrict__ 
                                               const float* __restrict__ lag, const float* __restrict__ normw, int R,
                                               float norm_eps, __nv_bfloat16* __restrict__ xn, __nv_bfloat16* __restrict__ out,
                                               int* __restrict__ ptok_o) {
+  pdl2::enter();
   constexpr int THRB = 256, PER = D / THRB;
   extern __shared__ __align__(128) unsigned char sm[];
   __nv_bfloat16* srs = (__nv_bfloat16*)sm;  // [4][D]: rs, then xn in place
@@ -654,11 +659,143 @@ __global__ void __launch_bounds__(256) k_frow(const __nv_bfloat16* __restrict__ 
   if (t == 0) asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");  // SMEM stays valid until both stores read it
 }
 
+// k_frow_rs: k_frow whose input y is the reduce-scatter sum of NS = 4 peer slots, summed here
+// (fp32, slot order, one bf16 rounding = comm_c1.cu's k_tp_rs_sum (F32 slots) / k_rs_sumv (bf16 slots)) after waiting for
+// the round's signals, instead of a separate sum kernel + reading y back
+template <bool F32>
+__global__ void __launch_bounds__(256) k_frow_rs(const void* __restrict__ slots, long long slot_elems,
+                                                 const unsigned* flag, const unsigned* epoch, unsigned signals,
+                                                 const __nv_bfloat16* __restrict__ rs,
+                                              const float* __restrict__ post, const float* __restrict__ comb,
+                                              const float* __restrict__ lag, const float* __restrict__ normw, int R,
+                                              float norm_eps, __nv_bfloat16* __restrict__ xn, __nv_bfloat16* __restrict__ out,
+                                              int* __restrict__ ptok_o) {
+  pdl2::enter();
+  constexpr int THRB = 256, PER = D / THRB;
+  extern __shared__ __align__(128) unsigned char sm[];
+  __nv_bfloat16* srs = (__nv_bfloat16*)sm;  // [4][D]: rs, then xn in place
+  __nv_bfloat16* sy = srs + HC * D;         // [D]: y, then out in place
+  uint64_t* mb = (uint64_t*)(sm + 5 * D * 2);
+  __shared__ float wsum[THRB / 32], wmx[THRB / 32];
+  const int r = blockIdx.x, t = threadIdx.x;
+  if (t == 0) {
+    mb_init(mb, 1);
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  __syncthreads();
+  if (t == 0) {
+    mb_expect(mb, HC * D * 2);
+    bulk_g2s(srs, rs + (size_t)r * HC * D, HC * D * 2, mb);
+    const unsigned target = *(volatile const unsigned*)epoch * signals;
+    unsigned v;
+    do {
+      asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(flag) : "memory");
+    } while ((int)(v - target) < 0);
+  }
+  float pst[HC], cmb[16], lg[HC];
+  {
+    const float4 p4 = *(const float4*)(post + (size_t)r * HC), l4 = *(const float4*)(lag + (size_t)r * HC);
+    pst[0] = p4.x, pst[1] = p4.y, pst[2] = p4.z, pst[3] = p4.w;
+    lg[0] = l4.x, lg[1] = l4.y, lg[2] = l4.z, lg[3] = l4.w;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const float4 c4 = *(const float4*)(comb + (size_t)r * 16 + 4 * q);
+      cmb[4 * q] = c4.x, cmb[4 * q + 1] = c4.y, cmb[4 * q + 2] = c4.z, cmb[4 * q + 3] = c4.w;
+    }
+  }
+  mb_wait(mb, 0);
+  __syncthreads();   // thread 0 saw the round's signals (acquire) before any thread reads the slots
+  float v[PER], ss = 0.f;
+#pragma unroll
+  for (int e = 0; e < PER; ++e) {
+    const int k = e * THRB + t;
+    float ya;
+    if (F32) {
+      const float* sl = (const float*)slots + (size_t)r * D + k;
+      ya = __ldcg(sl);
+#pragma unroll
+      for (int q = 1; q < 4; ++q) ya += __ldcg(sl + q * slot_elems);
+    } else {
+      const __nv_bfloat16* sl = (const __nv_bfloat16*)slots + (size_t)r * D + k;
+      ya = __bfloat162float(__ldcg(sl));
+#pragma unroll
+      for (int q = 1; q < 4; ++q) ya += __bfloat162float(__ldcg(sl + q * slot_elems));
+    }
+    const float yv = __bfloat162float(__float2bfloat16_rn(ya));
+    float rv[HC];
+#pragma unroll
+    for (int c = 0; c < HC; ++c) rv[c] = __bfloat162float(srs[c * D + k]);
+    float x[HC];
+#pragma unroll
+    for (int j = 0; j < HC; ++j) {
+      float a = pst[j] * yv;
+#pragma unroll
+      for (int c = 0; c < HC; ++c) a = fmaf(cmb[c * HC + j], rv[c], a);
+      const __nv_bfloat16 hb = __float2bfloat16_rn(a);
+      x[j] = __bfloat162float(hb);
+      srs[j * D + k] = hb;  // xn in place (this thread read rs[0..3][k] above)
+    }
+    float ai = 0.f;  // k1b_out's collapse
+#pragma unroll
+    for (int c = 0; c < HC; ++c) ai = fmaf(lg[c], x[c], ai);
+    v[e] = bfr(ai);
+    ss = fmaf(v[e], v[e], ss);
+  }
+  __syncthreads();  // xn row complete in SMEM
+  if (t == 0) {
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    bulk_s2g(xn + (size_t)r * HC * D, srs, HC * D * 2);
+    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+  }
+#pragma unroll
+  for (int off = 16; off; off >>= 1) ss += __shfl_xor_sync(~0u, ss, off);
+  if ((t & 31) == 0) wsum[t >> 5] = ss;
+  __syncthreads();
+  float s2 = 0.f;
+#pragma unroll
+  for (int i = 0; i < THRB / 32; ++i) s2 += wsum[i];
+  const float rr = rsqrtf(s2 / (float)D + norm_eps);
+  float mx = 0.f;
+#pragma unroll
+  for (int e = 0; e < PER; ++e) {
+    const int k = e * THRB + t;
+    const __nv_bfloat16 ob = __float2bfloat16_rn((v[e] * rr) * normw[k]);
+    sy[k] = ob;  // out in place over y (y is no longer read)
+    mx = fmaxf(mx, fabsf(__bfloat162float(ob)));
+  }
+  __syncthreads();  // out row complete in SMEM
+  if (t == 0) {
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    bulk_s2g(out + (size_t)r * D, sy, D * 2);
+    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+  }
+  if (ptok_o) {  // k1b_out's MoE prescale exponent
+#pragma unroll
+    for (int off = 16; off; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, off));
+    if ((t & 31) == 0) wmx[t >> 5] = mx;
+    __syncthreads();
+    if (t == 0) {
+      float m = wmx[0];
+#pragma unroll
+      for (int i = 1; i < THRB / 32; ++i) m = fmaxf(m, wmx[i]);
+      int p = 0;
+      if (m > 0.f) {
+        int ex;
+        frexpf(m, &ex);
+        p = 14 - ex;
+      }
+      ptok_o[r] = p;
+    }
+  }
+  if (t == 0) asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");  // SMEM stays valid until both stores read it
+}
+
 // fb_mix, one warp per row (8 rows per CTA): k_fb<2>'s per-row code (the 10-group sum by lanes t < 25 in order, split,
 // Sinkhorn on the warp) with tot[] passed by shuffles instead of SMEM; k_fb<2> ran 1 row per 256-thread CTA (1 busy warp)
 __global__ void __launch_bounds__(256) k_fbm8(const float* __restrict__ gpart, const float* __restrict__ scale,
                                               const float* __restrict__ base, int R, float norm_eps, float hc_eps, int iters,
                                               float* __restrict__ pre_o, float* __restrict__ post_o, float* __restrict__ comb_o) {
+  pdl2::enter();
   const int t = threadIdx.x & 31, r = blockIdx.x * 8 + (threadIdx.x >> 5);
   if (r >= R) return;
   float tv = 0.f;
@@ -795,7 +932,7 @@ static CUtensorMap tmap(const void* p, int rows, int box_rows) {
 }
 // cudaFuncSetAttribute is per device: one bit per (kernel, device). A process-wide flag would leave GPUs 1-3
 // without the 109 KB dynamic-SMEM opt-in -> "invalid argument" at the first launch there.
-static unsigned long long g_attr_done[7] = {0, 0, 0, 0, 0, 0, 0};
+static unsigned long long g_attr_done[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
 template <typename K>
 static void smem_attr(K kern, int bytes, int which) {
   int dev = 0;
@@ -804,6 +941,17 @@ static void smem_attr(K kern, int bytes, int which) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
     g_attr_done[which] |= 1ull << dev;
   }
+}
+// C-ABI variant: no exceptions, the per-device bit set atomically (4 driver threads)
+template <typename K>
+static bool smem_attr_c(K kern, int bytes, int which) {
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return false;
+  if (!(__atomic_load_n(&g_attr_done[which], __ATOMIC_ACQUIRE) >> dev & 1ull)) {
+    if (cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) != cudaSuccess) return false;
+    __atomic_fetch_or(&g_attr_done[which], 1ull << dev, __ATOMIC_RELEASE);
+  }
+  return true;
 }
 static int g_nrs = 0;
 static void same_dev(const torch::Tensor& a, std::initializer_list<torch::Tensor> ts) {
@@ -1109,6 +1257,23 @@ __global__ void __cluster_dims__(CL, 1, 1) __launch_bounds__(THR2, 2)
 }
 }  // namespace mhcf
 
+static int fa2_core(const FprMhcfFaArgs* p) {   // C ABI "mhcf.fa": the launch of pybind fa2, raw pointers + stream
+  using namespace mhcf;
+  try {
+    if (!smem_attr_c(k_fa2, S2_TOTAL, 2)) return FPR_E_CUDA;
+    const int R = p->R;
+    const int ns = (R + SUB - 1) / SUB;
+    int k = (int)(p->nrs > 0 ? p->nrs : (g_nrs > 0 ? g_nrs : 3));
+    k = std::max(1, std::min(k, ns));
+    Args a{p->post, p->comb, p->lag, const_cast<float*>(p->fnf), (__nv_bfloat16*)p->xn,
+           (__nv_bfloat16*)(p->scratch + in_off(R)), p->scratch, R, ns, k};
+    const CUtensorMap my = tmap(p->y, R, SUB), mr = tmap(p->rs, HC * R, HC * SUB);
+    k_fa2<<<dim3(NSL, k), THR2, S2_TOTAL, p->c.stream>>>(my, mr, a);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void fa2(torch::Tensor y, torch::Tensor rs, torch::Tensor post, torch::Tensor comb, torch::Tensor lag, torch::Tensor fnf,
          torch::Tensor xn, torch::Tensor scratch, int64_t nrs) {
   using namespace mhcf;
@@ -1127,15 +1292,11 @@ void fa2(torch::Tensor y, torch::Tensor rs, torch::Tensor post, torch::Tensor co
                   comb.scalar_type() == torch::kFloat32 && lag.scalar_type() == torch::kFloat32,
               "mhcf: dtypes");
   TORCH_CHECK(scratch.scalar_type() == torch::kFloat32 && scratch.numel() >= (int64_t)(in_off(R) + (size_t)R * D / 2), "mhcf: scratch");
-  smem_attr(k_fa2, S2_TOTAL, 2);
-  const int ns = (R + SUB - 1) / SUB;
-  int k = (int)(nrs > 0 ? nrs : (g_nrs > 0 ? g_nrs : 3));
-  k = std::max(1, std::min(k, ns));
-  Args a{post.data_ptr<float>(), comb.data_ptr<float>(), lag.data_ptr<float>(), fnf.data_ptr<float>(), (__nv_bfloat16*)xn.data_ptr(),
-         (__nv_bfloat16*)(scratch.data_ptr<float>() + in_off(R)), scratch.data_ptr<float>(), R, ns, k};
-  const CUtensorMap my = tmap(y.data_ptr(), R, SUB), mr = tmap(rs.data_ptr(), HC * R, HC * SUB);
-  k_fa2<<<dim3(NSL, k), THR2, S2_TOTAL, at::cuda::getCurrentCUDAStream()>>>(my, mr, a);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FprMhcfFaArgs ca{{at::cuda::getCurrentCUDAStream(), (int)y.get_device(), 0}, y.data_ptr(), rs.data_ptr(), post.data_ptr<float>(),
+                   comb.data_ptr<float>(), lag.data_ptr<float>(), fnf.data_ptr<float>(), xn.data_ptr(), scratch.data_ptr<float>(), R,
+                   (int32_t)nrs};
+  FPR_CABI_RECORD("mhcf.fa", ca);   // rule 9 (fpr_cabi_rec.h)
+  TORCH_CHECK(fa2_core(&ca) == FPR_OK, "mhcf fa: CUDA launch error");
 }
 int64_t smem2_bytes() { return mhcf::S2_TOTAL; }
 // ------------------------------------------------------------------------------------------------------------- fmix
@@ -1161,6 +1322,7 @@ static_assert(FX_FN % 128 == 0 && FX_PB % 16 == 0, "fmix smem alignment");
 
 __global__ void __cluster_dims__(CL, 1, 1) __launch_bounds__(FX_THR, 2)
     k_fmix(const __grid_constant__ CUtensorMap tmx, const Args A) {
+  pdl2::enter();
   extern __shared__ __align__(128) unsigned char sm[];
   uint64_t* bar = (uint64_t*)(sm + FX_BAR);
   uint64_t *full = bar, *empty = bar + NST, *sxf = bar + 2 * NST, *sxe = sxf + 2, *pfull = sxe + 2, *pempty = pfull + NPB,
@@ -1334,6 +1496,22 @@ __global__ void __cluster_dims__(CL, 1, 1) __launch_bounds__(FX_THR, 2)
 }  // namespace mhcf
 
 // fmix: xn [R, 4, D] -> gpart (scratch[0 : R * 250]); then fb_mix(scratch, R, ...) gives pre / post / comb
+static int fmix_core(const FprMhcfFmixArgs* p) {   // C ABI "mhcf.fmix"
+  using namespace mhcf;
+  try {
+    if (!smem_attr_c(k_fmix, FX_TOTAL, 5)) return FPR_E_CUDA;
+    const int R = p->R;
+    const int ns = (R + SUB - 1) / SUB;
+    int k = (int)(p->nrs > 0 ? p->nrs : (g_nrs > 0 ? g_nrs : 3));
+    k = std::max(1, std::min(k, ns));
+    Args a{nullptr, nullptr, nullptr, const_cast<float*>(p->fnf), nullptr, nullptr, p->scratch, R, ns, k};
+    const CUtensorMap mx = tmap(p->xn, HC * R, HC * SUB);
+    pdl2::launch(k_fmix, dim3(NSL, k), dim3(FX_THR), FX_TOTAL, p->c.stream, mx, a);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void fmix(torch::Tensor xn, int64_t Rr, torch::Tensor fnf, torch::Tensor scratch, int64_t nrs) {
   using namespace mhcf;
   const c10::cuda::CUDAGuard dg(xn.device());
@@ -1345,14 +1523,10 @@ void fmix(torch::Tensor xn, int64_t Rr, torch::Tensor fnf, torch::Tensor scratch
   TORCH_CHECK(fnf.scalar_type() == torch::kFloat32 && fnf.numel() == (int64_t)NCH * FN_FLOATS / 2, "mhcf: fnf (prep_f)");
   TORCH_CHECK(scratch.scalar_type() == torch::kFloat32 && scratch.numel() >= (int64_t)R * GP && ((uintptr_t)scratch.data_ptr() % 16) == 0,
               "mhcf fmix: scratch");
-  smem_attr(k_fmix, FX_TOTAL, 5);
-  const int ns = (R + SUB - 1) / SUB;
-  int k = (int)(nrs > 0 ? nrs : (g_nrs > 0 ? g_nrs : 3));
-  k = std::max(1, std::min(k, ns));
-  Args a{nullptr, nullptr, nullptr, fnf.data_ptr<float>(), nullptr, nullptr, scratch.data_ptr<float>(), R, ns, k};
-  const CUtensorMap mx = tmap(xn.data_ptr(), HC * R, HC * SUB);
-  k_fmix<<<dim3(NSL, k), FX_THR, FX_TOTAL, at::cuda::getCurrentCUDAStream()>>>(mx, a);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FprMhcfFmixArgs ca{{at::cuda::getCurrentCUDAStream(), (int)xn.get_device(), 0}, xn.data_ptr(), fnf.data_ptr<float>(),
+                     scratch.data_ptr<float>(), R, (int32_t)nrs};
+  FPR_CABI_RECORD("mhcf.fmix", ca);   // rule 9 (fpr_cabi_rec.h)
+  TORCH_CHECK(fmix_core(&ca) == FPR_OK, "mhcf fmix: CUDA launch error");
 }
 // ------------------------------------------------------------------------------------------------------------ fmix2
 // fmix2: fmix without X warps. xn arrives as 4 TMA 3D boxes per sub-tile (one per copy: [32 rows][64
@@ -1547,6 +1721,18 @@ void fmix2(torch::Tensor xn, int64_t Rr, torch::Tensor fnf, torch::Tensor scratc
 
 
 // frow: y [R, D], rs [R, 4, D], post / lag [R, 4], comb [R, 16], normw [D] -> xn [R, 4, D], out [R, D], ptok [R] (or empty)
+static int frow_core(const FprMhcfFrowArgs* p) {   // C ABI "mhcf.frow"
+  using namespace mhcf;
+  try {
+    if (!smem_attr_c(k_frow, FR_SMEM, 3)) return FPR_E_CUDA;
+    pdl2::launch(k_frow, dim3(p->R), dim3(256), FR_SMEM, p->c.stream, (const __nv_bfloat16*)p->y, (const __nv_bfloat16*)p->rs,
+                 p->post, p->comb, p->lag, const_cast<float*>(p->normw), (int)p->R, p->norm_eps, (__nv_bfloat16*)p->xn,
+                 (__nv_bfloat16*)p->out, (int*)p->ptok_o);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void frow(torch::Tensor y, torch::Tensor rs, torch::Tensor post, torch::Tensor comb, torch::Tensor lag, torch::Tensor normw,
           double norm_eps, torch::Tensor xn, torch::Tensor out, torch::Tensor ptok_o) {
   using namespace mhcf;
@@ -1565,14 +1751,57 @@ void frow(torch::Tensor y, torch::Tensor rs, torch::Tensor post, torch::Tensor c
   TORCH_CHECK(ptok_o.numel() == 0 || (ptok_o.device() == y.device() && ptok_o.scalar_type() == torch::kInt32 &&
                                       ptok_o.numel() >= R),
               "mhcf frow: ptok");
-  smem_attr(k_frow, FR_SMEM, 3);
-  k_frow<<<R, 256, FR_SMEM, at::cuda::getCurrentCUDAStream()>>>(
-      (const __nv_bfloat16*)y.data_ptr(), (const __nv_bfloat16*)rs.data_ptr(), post.data_ptr<float>(), comb.data_ptr<float>(),
-      lag.data_ptr<float>(), normw.data_ptr<float>(), R, (float)norm_eps, (__nv_bfloat16*)xn.data_ptr(),
-      (__nv_bfloat16*)out.data_ptr(), ptok_o.numel() ? ptok_o.data_ptr<int>() : nullptr);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FprMhcfFrowArgs ca{{at::cuda::getCurrentCUDAStream(), (int)y.get_device(), 0}, y.data_ptr(), rs.data_ptr(), post.data_ptr<float>(),
+                     comb.data_ptr<float>(), lag.data_ptr<float>(), normw.data_ptr<float>(), (float)norm_eps, xn.data_ptr(),
+                     out.data_ptr(), ptok_o.numel() ? ptok_o.data_ptr<int>() : nullptr, R};
+  FPR_CABI_RECORD("mhcf.frow", ca);   // rule 9 (fpr_cabi_rec.h)
+  TORCH_CHECK(frow_core(&ca) == FPR_OK, "mhcf frow: CUDA launch error");
 }
 
+
+// frow with y = the 4-slot reduce-scatter sum (slots [4, R, D] fp32 or bf16; flag / epoch / signals of the round)
+static int frow_rs_core(const FprMhcfFrowRsArgs* p) {   // C ABI "mhcf.frow_rs": the launch of pybind frow_rs
+  using namespace mhcf;
+  try {
+    const long long se = (long long)p->R * D;
+    if (p->slots_f32) {
+      if (!smem_attr_c(k_frow_rs<true>, FR_SMEM, 7)) return FPR_E_CUDA;
+      pdl2::launch(k_frow_rs<true>, dim3(p->R), dim3(256), FR_SMEM, p->c.stream, p->slots, se, (const unsigned*)p->flag,
+          (const unsigned*)p->epoch, (unsigned)p->signals, (const __nv_bfloat16*)p->rs, p->post, p->comb, p->lag,
+          const_cast<float*>(p->normw), (int)p->R, p->norm_eps, (__nv_bfloat16*)p->xn, (__nv_bfloat16*)p->out, (int*)p->ptok_o);
+    } else {
+      if (!smem_attr_c(k_frow_rs<false>, FR_SMEM, 8)) return FPR_E_CUDA;
+      pdl2::launch(k_frow_rs<false>, dim3(p->R), dim3(256), FR_SMEM, p->c.stream, p->slots, se, (const unsigned*)p->flag,
+          (const unsigned*)p->epoch, (unsigned)p->signals, (const __nv_bfloat16*)p->rs, p->post, p->comb, p->lag,
+          const_cast<float*>(p->normw), (int)p->R, p->norm_eps, (__nv_bfloat16*)p->xn, (__nv_bfloat16*)p->out, (int*)p->ptok_o);
+    }
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
+void frow_rs(torch::Tensor slots, torch::Tensor flag, torch::Tensor epoch, int64_t signals, torch::Tensor rs, torch::Tensor post,
+             torch::Tensor comb, torch::Tensor lag, torch::Tensor normw, double norm_eps, torch::Tensor xn, torch::Tensor out,
+             torch::Tensor ptok_o) {
+  using namespace mhcf;
+  const c10::cuda::CUDAGuard dg(rs.device());
+  const int R = (int)rs.size(0);
+  const bool f32 = slots.scalar_type() == torch::kFloat32;
+  TORCH_CHECK(slots.dim() == 3 && slots.size(0) == 4 && slots.size(1) == R && slots.size(2) == D && slots.is_contiguous() &&
+                  (f32 || slots.scalar_type() == torch::kBFloat16), "mhcf frow_rs: slots [4, R, D]");
+  check_rows(rs, R, HC * D, "rs");
+  check_rows(xn, R, HC * D, "xn");
+  check_rows(out, R, D, "out");
+  check_rows(post, R, HC, "post");
+  check_rows(comb, R, 16, "comb");
+  check_rows(lag, R, HC, "lag");
+  FprMhcfFrowRsArgs ca{{at::cuda::getCurrentCUDAStream(), (int)rs.get_device(), 0}, slots.data_ptr(), f32 ? 1 : 0, R,
+                       (const uint32_t*)flag.data_ptr(), (const uint32_t*)epoch.data_ptr(), (uint32_t)signals, rs.data_ptr(),
+                       post.data_ptr<float>(), comb.data_ptr<float>(), lag.data_ptr<float>(), normw.data_ptr<float>(),
+                       (float)norm_eps, xn.data_ptr(), out.data_ptr(), ptok_o.numel() ? ptok_o.data_ptr<int>() : nullptr};
+  FPR_CABI_RECORD("mhcf.frow_rs", ca);   // rule 9 (fpr_cabi_rec.h)
+  TORCH_CHECK(frow_rs_core(&ca) == FPR_OK, "mhcf frow_rs: CUDA launch error");
+}
 
 static const __nv_bfloat16* in_of(torch::Tensor scratch, int R) {
   return (const __nv_bfloat16*)(scratch.data_ptr<float>() + mhcf::in_off(R));
@@ -1581,6 +1810,26 @@ static int g_fbo = 1;  // fb_out kernel: 1 = k_fb<1> (default: 32.0 us at 4,288 
 static int g_fbm = 8;  // fb_mix kernel: 8 = k_fbm8 (one warp per row, default), 1 = k_fb<2> (one 256-thread CTA per row)
 void set_fbm(int64_t k) { g_fbm = (int)k; }
 void set_fbo(int64_t k) { g_fbo = (int)k; }
+static int fb_out_core(const FprMhcfFbOutArgs* p) {   // C ABI "mhcf.fb_out" (g_fbo: an init-time setting)
+  try {
+    const int R = p->R;
+    const __nv_bfloat16* in = (const __nv_bfloat16*)(p->scratch + mhcf::in_off(R));
+    float* nw = const_cast<float*>(p->normw);
+    if (g_fbo == 2) {
+      if (!smem_attr_c(mhcf::k_fbo_row, mhcf::FBO_SMEM, 4)) return FPR_E_CUDA;
+      if (((uintptr_t)in % 16) || ((uintptr_t)p->out % 16)) return FPR_E_ARG;
+      mhcf::k_fbo_row<<<R, 256, mhcf::FBO_SMEM, p->c.stream>>>(in, nw, R, p->norm_eps, (__nv_bfloat16*)p->out, (int*)p->ptok_o);
+    } else if (g_fbo == 4) {
+      mhcf::k_fbo4<<<R, 64, 0, p->c.stream>>>(in, nw, R, p->norm_eps, (__nv_bfloat16*)p->out, (int*)p->ptok_o);
+    } else {
+      mhcf::k_fb<1><<<R, 256, 0, p->c.stream>>>(nullptr, in, nullptr, nullptr, nw, R, p->norm_eps, 0.f, 0, nullptr, nullptr,
+                                                 nullptr, (__nv_bfloat16*)p->out, (int*)p->ptok_o);
+    }
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void fb_out(torch::Tensor scratch, int64_t R, torch::Tensor normw, double norm_eps, torch::Tensor out, torch::Tensor ptok_o) {
   const c10::cuda::CUDAGuard dg(scratch.device());
   same_dev(scratch, {normw, out});
@@ -1591,24 +1840,30 @@ void fb_out(torch::Tensor scratch, int64_t R, torch::Tensor normw, double norm_e
   TORCH_CHECK(normw.scalar_type() == torch::kFloat32 && normw.is_contiguous() && ((uintptr_t)normw.data_ptr() % 16) == 0 &&
                   ((uintptr_t)out.data_ptr() % 8) == 0 && out.stride(0) == mhcf::D,
               "mhcf fb_out: normw fp32 contiguous, out rows contiguous");
-  if (g_fbo == 2) {
-    smem_attr(mhcf::k_fbo_row, mhcf::FBO_SMEM, 4);
+  if (g_fbo == 2)
     TORCH_CHECK(((uintptr_t)in_of(scratch, (int)R) % 16) == 0 && ((uintptr_t)out.data_ptr() % 16) == 0, "mhcf fb_out: alignment");
-    mhcf::k_fbo_row<<<(int)R, 256, mhcf::FBO_SMEM, at::cuda::getCurrentCUDAStream()>>>(
-        in_of(scratch, (int)R), normw.data_ptr<float>(), (int)R, (float)norm_eps, (__nv_bfloat16*)out.data_ptr(),
-        ptok_o.numel() ? ptok_o.data_ptr<int>() : nullptr);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return;
+  FprMhcfFbOutArgs ca{{at::cuda::getCurrentCUDAStream(), (int)scratch.get_device(), 0}, scratch.data_ptr<float>(),
+                      normw.data_ptr<float>(), (float)norm_eps, out.data_ptr(), ptok_o.numel() ? ptok_o.data_ptr<int>() : nullptr,
+                      (int32_t)R};
+  FPR_CABI_RECORD("mhcf.fb_out", ca);   // rule 9 (fpr_cabi_rec.h)
+  TORCH_CHECK(fb_out_core(&ca) == FPR_OK, "mhcf fb_out: CUDA launch error");
+}
+static int fb_mix_core(const FprMhcfFbMixArgs* p) {   // C ABI "mhcf.fb_mix" (g_fbm: an init-time setting)
+  try {
+    const int R = p->R;
+    float* sc = const_cast<float*>(p->scale);
+    float* ba = const_cast<float*>(p->base);
+    if (g_fbm == 8) {
+      pdl2::launch(mhcf::k_fbm8, dim3((R + 7) / 8), dim3(256), 0, p->c.stream, p->scratch, sc, ba, R, p->norm_eps, p->hc_eps,
+                   (int)p->iters, p->pre_o, p->post_o, p->comb_o);
+    } else {
+      mhcf::k_fb<2><<<R, 256, 0, p->c.stream>>>(p->scratch, nullptr, sc, ba, nullptr, R, p->norm_eps, p->hc_eps, (int)p->iters,
+                                                 p->pre_o, p->post_o, p->comb_o, nullptr, nullptr);
+    }
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
   }
-  if (g_fbo == 4) {
-    mhcf::k_fbo4<<<(int)R, 64, 0, at::cuda::getCurrentCUDAStream()>>>(
-        in_of(scratch, (int)R), normw.data_ptr<float>(), (int)R, (float)norm_eps, (__nv_bfloat16*)out.data_ptr(),
-        ptok_o.numel() ? ptok_o.data_ptr<int>() : nullptr);
-    return;
-  }
-  mhcf::k_fb<1><<<(int)R, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-      nullptr, in_of(scratch, (int)R), nullptr, nullptr, normw.data_ptr<float>(), (int)R, (float)norm_eps, 0.f, 0, nullptr,
-      nullptr, nullptr, (__nv_bfloat16*)out.data_ptr(), ptok_o.numel() ? ptok_o.data_ptr<int>() : nullptr);
 }
 void fb_mix(torch::Tensor scratch, int64_t R, torch::Tensor scale, torch::Tensor base, double norm_eps, double hc_eps,
             int64_t iters, torch::Tensor pre_o, torch::Tensor post_o, torch::Tensor comb_o) {
@@ -1617,16 +1872,11 @@ void fb_mix(torch::Tensor scratch, int64_t R, torch::Tensor scale, torch::Tensor
   TORCH_CHECK(R >= 1 && scratch.numel() >= (int64_t)R * mhcf::GP && pre_o.size(0) >= R && post_o.size(0) >= R &&
                   comb_o.size(0) >= R && pre_o.is_contiguous() && post_o.is_contiguous() && comb_o.is_contiguous(),
               "mhcf fb_mix: shapes");
-  if (g_fbm == 8) {
-    mhcf::k_fbm8<<<((int)R + 7) / 8, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-        scratch.data_ptr<float>(), scale.data_ptr<float>(), base.data_ptr<float>(), (int)R, (float)norm_eps, (float)hc_eps,
-        (int)iters, pre_o.data_ptr<float>(), post_o.data_ptr<float>(), comb_o.data_ptr<float>());
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return;
-  }
-  mhcf::k_fb<2><<<(int)R, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-      scratch.data_ptr<float>(), nullptr, scale.data_ptr<float>(), base.data_ptr<float>(), nullptr, (int)R, (float)norm_eps,
-      (float)hc_eps, (int)iters, pre_o.data_ptr<float>(), post_o.data_ptr<float>(), comb_o.data_ptr<float>(), nullptr, nullptr);
+  FprMhcfFbMixArgs ca{{at::cuda::getCurrentCUDAStream(), (int)scratch.get_device(), 0}, scratch.data_ptr<float>(),
+                      scale.data_ptr<float>(), base.data_ptr<float>(), (float)norm_eps, (float)hc_eps, (int32_t)iters,
+                      pre_o.data_ptr<float>(), post_o.data_ptr<float>(), comb_o.data_ptr<float>(), (int32_t)R};
+  FPR_CABI_RECORD("mhcf.fb_mix", ca);   // rule 9 (fpr_cabi_rec.h)
+  TORCH_CHECK(fb_mix_core(&ca) == FPR_OK, "mhcf fb_mix: CUDA launch error");
 }
 void fb_all(torch::Tensor scratch, int64_t R, torch::Tensor scale, torch::Tensor base, torch::Tensor normw, double norm_eps,
             double hc_eps, int64_t iters, torch::Tensor pre_o, torch::Tensor post_o, torch::Tensor comb_o, torch::Tensor out,
@@ -1664,12 +1914,42 @@ torch::Tensor prof_take() {  // [2048, 8] int64 cycle sums (MHCF_PROF builds), t
 }
 int64_t smem_bytes() { return mhcf::SM_TOTAL; }
 
+// ---- C ABI (fpr_cabi.h): init + table
+static int init_core(const FprMhcfInitArgs* p) {   // every dynamic-smem opt-in on the caller's current device
+  (void)p;
+  using namespace mhcf;
+  return (smem_attr_c(k_fa2, S2_TOTAL, 2) && smem_attr_c(k_frow, FR_SMEM, 3) && smem_attr_c(k_fmix, FX_TOTAL, 5) &&
+          smem_attr_c(k_fbo_row, FBO_SMEM, 4) && smem_attr_c(k_frow_rs<true>, FR_SMEM, 7) &&
+          smem_attr_c(k_frow_rs<false>, FR_SMEM, 8)) ? FPR_OK : FPR_E_CUDA;
+}
+extern "C" {
+static int c_init(const void* a) { return init_core((const FprMhcfInitArgs*)a); }
+static int c_fa(const void* a) { return fa2_core((const FprMhcfFaArgs*)a); }
+static int c_frow(const void* a) { return frow_core((const FprMhcfFrowArgs*)a); }
+static int c_fmix(const void* a) { return fmix_core((const FprMhcfFmixArgs*)a); }
+static int c_fb_out(const void* a) { return fb_out_core((const FprMhcfFbOutArgs*)a); }
+static int c_frow_rs(const void* a) { return frow_rs_core((const FprMhcfFrowRsArgs*)a); }
+static int c_fb_mix(const void* a) { return fb_mix_core((const FprMhcfFbMixArgs*)a); }
+static const FprFnEntry k_mhcf_fns[] = {
+    {"mhcf.init", c_init, nullptr, (int64_t)sizeof(FprMhcfInitArgs)},
+    {"mhcf.fa", c_fa, nullptr, (int64_t)sizeof(FprMhcfFaArgs)},
+    {"mhcf.frow", c_frow, nullptr, (int64_t)sizeof(FprMhcfFrowArgs)},
+    {"mhcf.fmix", c_fmix, nullptr, (int64_t)sizeof(FprMhcfFmixArgs)},
+    {"mhcf.fb_out", c_fb_out, nullptr, (int64_t)sizeof(FprMhcfFbOutArgs)},
+    {"mhcf.fb_mix", c_fb_mix, nullptr, (int64_t)sizeof(FprMhcfFbMixArgs)},
+    {"mhcf.frow_rs", c_frow_rs, nullptr, (int64_t)sizeof(FprMhcfFrowRsArgs)},
+};
+static const FprExtTable k_mhcf_table = {FPR_CABI_VERSION, "mhcf", "", 7, k_mhcf_fns};
+__attribute__((visibility("default"))) const FprExtTable* fpr_mhcf_table(void) { return &k_mhcf_table; }
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fa", &fa2);   // the boundary's streaming kernel (warp-specialized fa2)
   m.def("fa1", &fa);   // the first version (one role per phase; 2x slower), kept for A/B
   m.def("fa_x", &fa_x);
   m.def("fa2", &fa2);
   m.def("frow", &frow);
+  m.def("frow_rs", &frow_rs);
   m.def("fmix", &fmix);
   m.def("fmix2", &fmix2);
   m.def("smem2_bytes", &smem2_bytes);

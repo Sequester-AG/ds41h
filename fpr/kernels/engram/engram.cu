@@ -526,7 +526,38 @@ __global__ void __launch_bounds__(512) k_probe(const uint8_t* __restrict__ tab, 
   if (x == 0x9e3779b9u) sink[0] = x;
 }
 
+// engram.ring_copy: pair k's 128-B ring slot as 8 int4 words, one thread per word
+#define FPR_ENGRAM_RING_COPY_MAX_K 64   // = engram_cabi.h's FPR_ENGRAM_RING_COPY_MAX (static_assert below)
+struct RingPairs {
+  int s[FPR_ENGRAM_RING_COPY_MAX_K];
+  int d[FPR_ENGRAM_RING_COPY_MAX_K];
+};
+__global__ void k_ring_copy(const int4* __restrict__ src, int4* __restrict__ dst, const __grid_constant__ RingPairs p,
+                            int n) {
+  const int t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= 8 * n) return;
+  const int k = t >> 3, w = t & 7;
+  dst[(size_t)p.d[k] * 8 + w] = src[(size_t)p.s[k] * 8 + w];
+}
+
 }  // namespace eg
+
+#include "engram_cabi.h"
+
+#include <cstddef>
+#include <cstring>
+#include <mutex>
+
+static_assert(sizeof(FprEngramHashParams) == sizeof(eg::HashParams) &&
+                  offsetof(FprEngramHashParams, mult) == offsetof(eg::HashParams, mult) &&
+                  offsetof(FprEngramHashParams, prime) == offsetof(eg::HashParams, prime) &&
+                  offsetof(FprEngramHashParams, off) == offsetof(eg::HashParams, off) &&
+                  offsetof(FprEngramHashParams, pad_id) == offsetof(eg::HashParams, pad_id) &&
+                  offsetof(FprEngramHashParams, vocab) == offsetof(eg::HashParams, vocab),
+              "FprEngramHashParams (engram_cabi.h) != eg::HashParams");
+static_assert(FPR_ENGRAM_NL == eg::NL && FPR_ENGRAM_NG == eg::NG && FPR_ENGRAM_NC == eg::NC && FPR_ENGRAM_DIM == eg::DIM &&
+                  FPR_ENGRAM_D == eg::D && FPR_ENGRAM_KVW == eg::KVW,
+              "engram_cabi.h constants != engram.cu");
 
 // ================================================================================================== bindings
 namespace {
@@ -553,14 +584,55 @@ struct HashCtx {  // host-side constant parameters (built once)
   eg::HashParams hp;
 };
 std::vector<HashCtx> g_hash;
+// hash_setup appends (Python, init), hash_params_core reads (pybind hash under the GIL, or a C++ driver thread without it):
+// the mutex keeps a C-path read off a reallocating push_back. Launch cores never touch g_hash (their Args carry the params).
+std::mutex g_hash_mu;
 
 int64_t hash_setup(torch::Tensor mult, torch::Tensor prime, torch::Tensor off, int64_t pad_id, int64_t vocab) {
-  g_hash.push_back({make_hash_params(mult, prime, off, pad_id, vocab)});
+  const eg::HashParams hp = make_hash_params(mult, prime, off, pad_id, vocab);
+  std::lock_guard<std::mutex> lk(g_hash_mu);
+  g_hash.push_back({hp});
   return static_cast<int64_t>(g_hash.size() - 1);
 }
 
 void chk_i32(const torch::Tensor& t, const char* n) {
   TORCH_CHECK(t.is_cuda() && t.dtype() == torch::kInt32 && t.is_contiguous(), n, ": contiguous int32 CUDA");
+}
+
+// a core's return code in the pybind path (the launches' cudaGetLastError replaces C10_CUDA_KERNEL_LAUNCH_CHECK)
+void check_rc(int rc, const char* fn) {
+  TORCH_CHECK(rc == FPR_OK, "engram ", fn, ": ", rc == FPR_E_ARG ? "invalid arguments" : "CUDA launch error", " (", rc, ")");
+}
+
+bool unroll_ok(int64_t u) { return u == 1 || u == 2 || u == 4 || u == 8; }
+
+int hash_params_core(const FprEngramHashParamsArgs* p) {   // C ABI "engram.hash_params": host copy of registry entry ctx
+  try {
+    if (p->out == nullptr) return FPR_E_ARG;
+    std::lock_guard<std::mutex> lk(g_hash_mu);
+    if (p->ctx < 0 || p->ctx >= (int64_t)g_hash.size()) return FPR_E_ARG;
+    std::memcpy(p->out, &g_hash[(size_t)p->ctx].hp, sizeof(eg::HashParams));
+    return FPR_OK;
+  } catch (...) {
+    return FPR_E_ARG;
+  }
+}
+
+int hash_core(const FprEngramHashArgs* p) {   // C ABI "engram.hash": the launch of pybind hash
+  try {
+    if (p->hp == nullptr || p->T < 0) return FPR_E_ARG;
+    if (p->T == 0) return FPR_OK;
+    eg::HashParams hp;
+    std::memcpy(&hp, p->hp, sizeof hp);
+    const int T = static_cast<int>(p->T);
+    eg::k_hash<<<(T * eg::NHD + 255) / 256, 256, 0, p->c.stream>>>(p->ids, p->counts, p->s_row0, p->s_nrows, p->s_start,
+                                                                   p->s_slot, p->s_look, p->tmap,
+                                                                   reinterpret_cast<int2*>(p->ring), T, hp, p->out, p->keep,
+                                                                   p->err);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
 }
 
 // all inputs int32 CUDA: ids [>= T]; counts [>= 2] = (sequences, real rows) in device memory; s_row0/s_nrows/s_start/
@@ -571,19 +643,59 @@ void hash(int64_t ctx, torch::Tensor ids, torch::Tensor counts, torch::Tensor s_
           torch::Tensor s_start, torch::Tensor s_slot, torch::Tensor s_look, torch::Tensor tmap, torch::Tensor ring, int64_t T,
           torch::Tensor out, torch::Tensor keep, torch::Tensor err) {
   const c10::cuda::CUDAGuard guard_(ids.device());
-  TORCH_CHECK(ctx >= 0 && ctx < (int64_t)g_hash.size(), "hash ctx");
+  FprEngramHashParams hp;
+  const FprEngramHashParamsArgs pa{{nullptr, 0, 0}, ctx, &hp};
+  TORCH_CHECK(hash_params_core(&pa) == FPR_OK, "hash ctx");
   for (auto* p : {&ids, &counts, &s_row0, &s_nrows, &s_start, &s_slot, &s_look, &tmap, &ring, &out, &err}) chk_i32(*p, "hash arg");
   TORCH_CHECK(keep.is_cuda() && keep.dtype() == torch::kUInt8, "keep uint8");
   TORCH_CHECK(ring.dim() == 3 && ring.size(1) == eg::RING && ring.size(2) == 2, "ring [slots, 16, 2]");
   TORCH_CHECK(out.numel() >= T * eg::NL * eg::NC && ids.numel() >= T && keep.numel() >= T, "sizes");
   if (T == 0) return;
-  auto st = c10::cuda::getCurrentCUDAStream(ids.device().index()).stream();
-  eg::k_hash<<<(T * eg::NHD + 255) / 256, 256, 0, st>>>(ids.data_ptr<int>(), counts.data_ptr<int>(),
-                                              s_row0.data_ptr<int>(), s_nrows.data_ptr<int>(), s_start.data_ptr<int>(),
-                                              s_slot.data_ptr<int>(), s_look.data_ptr<int>(), tmap.data_ptr<int>(),
-                                              reinterpret_cast<int2*>(ring.data_ptr<int>()), (int)T, g_hash[ctx].hp,
-                                              out.data_ptr<int>(), keep.data_ptr<uint8_t>(), err.data_ptr<int>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const auto dev = ids.device().index();
+  const FprEngramHashArgs ca{{c10::cuda::getCurrentCUDAStream(dev).stream(), dev, 0}, &hp, ids.data_ptr<int>(),
+                             counts.data_ptr<int>(), s_row0.data_ptr<int>(), s_nrows.data_ptr<int>(), s_start.data_ptr<int>(),
+                             s_slot.data_ptr<int>(), s_look.data_ptr<int>(), tmap.data_ptr<int>(), ring.data_ptr<int>(),
+                             (int32_t)T, out.data_ptr<int>(), keep.data_ptr<uint8_t>(), err.data_ptr<int>()};
+  check_rc(hash_core(&ca), "hash");
+}
+
+int gather_core(const FprEngramGatherArgs* p) {   // C ABI "engram.gather": the launch of pybind gather
+  try {
+    const int nl = static_cast<int>(p->nl);
+    if (nl < 1 || nl > eg::NL || p->threads < 32 || p->threads > 512 || p->threads % 32 != 0 || p->T < 0) return FPR_E_ARG;
+    if (p->T == 0) return FPR_OK;
+    if (!unroll_ok(p->unroll)) return FPR_E_ARG;
+    eg::GatherParams g{};
+    for (int l = 0; l < nl; ++l) {
+      if (reinterpret_cast<uintptr_t>(p->tabs[l]) % 16 != 0) return FPR_E_ARG;
+      g.tab[l] = reinterpret_cast<const uint8_t*>(p->tabs[l]);
+      g.out[l] = reinterpret_cast<__nv_bfloat16*>(p->outs[l]);
+      g.lidx[l] = static_cast<int>(p->lidx[l]);
+      for (int c = 0; c < eg::NC; ++c) {
+        g.lo[l][c] = p->lo[l][c];
+        g.hi[l][c] = p->hi[l][c];
+      }
+    }
+    g.nl = nl;
+    g.hash = p->hash;
+    g.T = static_cast<int>(p->T);
+    g.rows = static_cast<int>((int64_t)p->T * nl * eg::NC);
+    const int threads = static_cast<int>(p->threads), unroll = static_cast<int>(p->unroll);
+    const int gpc = threads / 16;
+    const int need = (g.rows + gpc * unroll - 1) / (gpc * unroll);
+    const int grid = p->ctas > 0 ? std::max(1, std::min<int>((int)p->ctas, need)) : std::max(1, need);
+    auto st = p->c.stream;
+    switch (unroll) {
+      case 1: eg::k_gather<1><<<grid, threads, 0, st>>>(g); break;
+      case 2: eg::k_gather<2><<<grid, threads, 0, st>>>(g); break;
+      case 4: eg::k_gather<4><<<grid, threads, 0, st>>>(g); break;
+      case 8: eg::k_gather<8><<<grid, threads, 0, st>>>(g); break;
+      default: return FPR_E_ARG;
+    }
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
 }
 
 // tabs: device addresses of record 0 per selected layer; lidx: hash-layer index per selected layer; outs: bf16 [T, 24, 256];
@@ -597,35 +709,55 @@ void gather(torch::Tensor hash_ids, int64_t T, std::vector<int64_t> tabs, std::v
   TORCH_CHECK((int)lo.size() == nl * eg::NC && (int)hi.size() == nl * eg::NC, "lo/hi");
   TORCH_CHECK(threads >= 32 && threads <= 512 && threads % 32 == 0, "threads");
   if (T == 0) return;
-  eg::GatherParams p{};
+  const auto dev = hash_ids.device().index();
+  FprEngramGatherArgs ca{};
+  ca.c = FprCall{c10::cuda::getCurrentCUDAStream(dev).stream(), dev, 0};
   for (int l = 0; l < nl; ++l) {
     TORCH_CHECK(outs[l].is_cuda() && outs[l].dtype() == torch::kBFloat16 && outs[l].is_contiguous() &&
                     outs[l].numel() >= T * eg::NC * eg::DIM, "out bf16 [T, 24, 256]");
     TORCH_CHECK(tabs[l] % 16 == 0, "table base 16-B aligned");
-    p.tab[l] = reinterpret_cast<const uint8_t*>(tabs[l]);
-    p.out[l] = reinterpret_cast<__nv_bfloat16*>(outs[l].data_ptr());
-    p.lidx[l] = static_cast<int>(lidx[l]);
+    ca.tabs[l] = reinterpret_cast<const void*>(tabs[l]);
+    ca.outs[l] = outs[l].data_ptr();
+    ca.lidx[l] = static_cast<int32_t>(lidx[l]);
     for (int c = 0; c < eg::NC; ++c) {
-      p.lo[l][c] = lo[l * eg::NC + c];
-      p.hi[l][c] = hi[l * eg::NC + c];
+      ca.lo[l][c] = lo[l * eg::NC + c];
+      ca.hi[l][c] = hi[l * eg::NC + c];
     }
   }
-  p.nl = nl;
-  p.hash = hash_ids.data_ptr<int>();
-  p.T = static_cast<int>(T);
-  p.rows = static_cast<int>(T * nl * eg::NC);
-  const int gpc = static_cast<int>(threads) / 16;
-  const int need = (p.rows + gpc * (int)unroll - 1) / (gpc * (int)unroll);
-  const int grid = ctas > 0 ? std::max(1, std::min<int>((int)ctas, need)) : std::max(1, need);
-  auto st = c10::cuda::getCurrentCUDAStream(hash_ids.device().index()).stream();
-  switch (unroll) {
-    case 1: eg::k_gather<1><<<grid, threads, 0, st>>>(p); break;
-    case 2: eg::k_gather<2><<<grid, threads, 0, st>>>(p); break;
-    case 4: eg::k_gather<4><<<grid, threads, 0, st>>>(p); break;
-    case 8: eg::k_gather<8><<<grid, threads, 0, st>>>(p); break;
-    default: TORCH_CHECK(false, "unroll 1/2/4/8");
+  TORCH_CHECK(unroll_ok(unroll), "unroll 1/2/4/8");
+  ca.hash = hash_ids.data_ptr<int>();
+  ca.T = static_cast<int32_t>(T);
+  ca.nl = nl;
+  ca.ctas = static_cast<int32_t>(ctas);
+  ca.threads = static_cast<int32_t>(threads);
+  ca.unroll = static_cast<int32_t>(unroll);
+  check_rc(gather_core(&ca), "gather");
+}
+
+int gather_ids_core(const FprEngramGatherIdsArgs* p) {   // C ABI "engram.gather_ids": the launch of pybind gather_ids
+  try {
+    if (p->n < 0) return FPR_E_ARG;
+    if (p->n == 0) return FPR_OK;
+    if (p->threads < 16 || !unroll_ok(p->unroll)) return FPR_E_ARG;
+    const int n = static_cast<int>(p->n), threads = static_cast<int>(p->threads), unroll = static_cast<int>(p->unroll);
+    const int gpc = threads / 16;
+    const int need = (n + gpc * unroll - 1) / (gpc * unroll);
+    const int grid = p->ctas > 0 ? std::max(1, std::min<int>((int)p->ctas, need)) : std::max(1, need);
+    auto st = p->c.stream;
+    auto tp = reinterpret_cast<const uint8_t*>(p->tab);
+    auto ids = reinterpret_cast<const long long*>(p->ids);
+    auto o = reinterpret_cast<__nv_bfloat16*>(p->out);
+    switch (unroll) {
+      case 1: eg::k_gather_ids<1><<<grid, threads, 0, st>>>(tp, ids, n, o); break;
+      case 2: eg::k_gather_ids<2><<<grid, threads, 0, st>>>(tp, ids, n, o); break;
+      case 4: eg::k_gather_ids<4><<<grid, threads, 0, st>>>(tp, ids, n, o); break;
+      case 8: eg::k_gather_ids<8><<<grid, threads, 0, st>>>(tp, ids, n, o); break;
+      default: return FPR_E_ARG;
+    }
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void gather_ids(int64_t tab, torch::Tensor ids, torch::Tensor out, int64_t ctas, int64_t threads, int64_t unroll) {
@@ -634,32 +766,35 @@ void gather_ids(int64_t tab, torch::Tensor ids, torch::Tensor out, int64_t ctas,
   TORCH_CHECK(out.is_cuda() && out.dtype() == torch::kBFloat16 && out.is_contiguous() && out.numel() >= ids.numel() * eg::DIM, "out");
   const int n = static_cast<int>(ids.numel());
   if (n == 0) return;
-  const int gpc = static_cast<int>(threads) / 16;
-  const int need = (n + gpc * (int)unroll - 1) / (gpc * (int)unroll);
-  const int grid = ctas > 0 ? std::max(1, std::min<int>((int)ctas, need)) : std::max(1, need);
-  auto st = c10::cuda::getCurrentCUDAStream(ids.device().index()).stream();
-  auto tp = reinterpret_cast<const uint8_t*>(tab);
-  auto o = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
-  switch (unroll) {
-    case 1: eg::k_gather_ids<1><<<grid, threads, 0, st>>>(tp, reinterpret_cast<const long long*>(ids.data_ptr<int64_t>()), n, o); break;
-    case 2: eg::k_gather_ids<2><<<grid, threads, 0, st>>>(tp, reinterpret_cast<const long long*>(ids.data_ptr<int64_t>()), n, o); break;
-    case 4: eg::k_gather_ids<4><<<grid, threads, 0, st>>>(tp, reinterpret_cast<const long long*>(ids.data_ptr<int64_t>()), n, o); break;
-    case 8: eg::k_gather_ids<8><<<grid, threads, 0, st>>>(tp, reinterpret_cast<const long long*>(ids.data_ptr<int64_t>()), n, o); break;
-    default: TORCH_CHECK(false, "unroll 1/2/4/8");
+  TORCH_CHECK(unroll_ok(unroll), "unroll 1/2/4/8");
+  const auto dev = ids.device().index();
+  const FprEngramGatherIdsArgs ca{{c10::cuda::getCurrentCUDAStream(dev).stream(), dev, 0}, reinterpret_cast<const void*>(tab),
+                                  ids.data_ptr<int64_t>(), n, out.data_ptr(), (int32_t)ctas, (int32_t)threads, (int32_t)unroll};
+  check_rc(gather_ids_core(&ca), "gather_ids");
+}
+
+int expand_core(const FprEngramExpandArgs* p) {   // C ABI "engram.expand": the launch of pybind expand
+  try {
+    if (p->T < 0) return FPR_E_ARG;
+    if (p->T == 0) return FPR_OK;
+    const long long total = (long long)p->T * eg::NC * (eg::DIM / 8);
+    eg::k_expand<<<(unsigned)((total + 255) / 256), 256, 0, p->c.stream>>>(reinterpret_cast<const __nv_bfloat16*>(p->urows),
+                                                                            p->inv, (int)p->T, (int)p->nl, (int)p->l,
+                                                                            reinterpret_cast<__nv_bfloat16*>(p->out));
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void expand(torch::Tensor urows, torch::Tensor inv, int64_t T, int64_t nl, int64_t l, torch::Tensor out) {
   const c10::cuda::CUDAGuard guard_(inv.device());
   chk_i32(inv, "inv");
   if (T == 0) return;
-  const long long total = T * eg::NC * (eg::DIM / 8);
-  auto st = c10::cuda::getCurrentCUDAStream(inv.device().index()).stream();
-  eg::k_expand<<<(unsigned)((total + 255) / 256), 256, 0, st>>>(reinterpret_cast<const __nv_bfloat16*>(urows.data_ptr()),
-                                                                  inv.data_ptr<int>(), (int)T, (int)nl, (int)l,
-                                                                  reinterpret_cast<__nv_bfloat16*>(out.data_ptr()));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const auto dev = inv.device().index();
+  const FprEngramExpandArgs ca{{c10::cuda::getCurrentCUDAStream(dev).stream(), dev, 0}, urows.data_ptr(), inv.data_ptr<int>(),
+                               (int32_t)T, (int32_t)nl, (int32_t)l, out.data_ptr()};
+  check_rc(expand_core(&ca), "expand");
 }
 
 void probe(int64_t tab, torch::Tensor ids, torch::Tensor sink, int64_t ctas, int64_t threads) {
@@ -669,6 +804,28 @@ void probe(int64_t tab, torch::Tensor ids, torch::Tensor sink, int64_t ctas, int
   eg::k_probe<<<(int)ctas, (int)threads, 0, st>>>(reinterpret_cast<const uint8_t*>(tab), reinterpret_cast<const long long*>(ids.data_ptr<int64_t>()), n,
                                                   reinterpret_cast<unsigned*>(sink.data_ptr<int>()));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+int inject_core(const FprEngramInjectArgs* p) {   // C ABI "engram.inject": the launch of pybind inject (MODE 0 / MODE 1)
+  try {
+    if (p->T < 0) return FPR_E_ARG;
+    if (p->T == 0) return FPR_OK;
+    auto bf = [](const void* q) { return reinterpret_cast<const __nv_bfloat16*>(q); };
+    auto ob = reinterpret_cast<__nv_bfloat16*>(p->out);
+    if (p->x_in != nullptr) {
+      eg::k_inject<0><<<(int)p->T, eg::IT, 0, p->c.stream>>>(bf(p->x_in), nullptr, nullptr, nullptr, nullptr, bf(p->kv),
+                                                             (long long)p->kv_stride, bf(p->qw), bf(p->kw), p->keep, p->eps,
+                                                             p->clampv, ob, p->gate_out, p->kv_idx, eg::Fold{});
+    } else {
+      if (p->y == nullptr || p->rs == nullptr || p->post == nullptr || p->comb == nullptr) return FPR_E_ARG;
+      eg::k_inject<1><<<(int)p->T, eg::IT, 0, p->c.stream>>>(nullptr, bf(p->y), bf(p->rs), p->post, p->comb, bf(p->kv),
+                                                             (long long)p->kv_stride, bf(p->qw), bf(p->kw), p->keep, p->eps,
+                                                             p->clampv, ob, p->gate_out, p->kv_idx, eg::Fold{});
+    }
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
 }
 
 // x_in: bf16 [T, 4, 5120] (mode 0) or y [T, 5120] + rs [T, 4, 5120] + post [T, 4] + comb [T, 4, 4] fp32 (mode 1);
@@ -684,29 +841,54 @@ void inject(int64_t T, c10::optional<torch::Tensor> x_in, c10::optional<torch::T
   TORCH_CHECK(kw.dtype() == torch::kBFloat16 && kw.is_contiguous() && kw.numel() == eg::HC * eg::D, "kw");
   TORCH_CHECK(out.dtype() == torch::kBFloat16 && out.is_contiguous(), "out");
   if (T == 0) return;
-  auto st = c10::cuda::getCurrentCUDAStream(kv.device().index()).stream();
-  const unsigned char* kp = keep.has_value() && keep->numel() ? keep->data_ptr<uint8_t>() : nullptr;
-  float* gp = gate_out.has_value() && gate_out->numel() ? gate_out->data_ptr<float>() : nullptr;
-  const int* ki = nullptr;
+  const auto dev = kv.device().index();
+  FprEngramInjectArgs ca{};
+  ca.c = FprCall{c10::cuda::getCurrentCUDAStream(dev).stream(), dev, 0};
+  ca.T = static_cast<int32_t>(T);
+  ca.keep = keep.has_value() && keep->numel() ? keep->data_ptr<uint8_t>() : nullptr;
+  ca.gate_out = gate_out.has_value() && gate_out->numel() ? gate_out->data_ptr<float>() : nullptr;
   if (kv_idx.has_value() && kv_idx->numel()) {
     chk_i32(*kv_idx, "kv_idx");
-    ki = kv_idx->data_ptr<int>();
+    ca.kv_idx = kv_idx->data_ptr<int>();
   }
-  auto bf = [](const torch::Tensor& t) { return reinterpret_cast<const __nv_bfloat16*>(t.data_ptr()); };
-  auto ob = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+  ca.kv = kv.data_ptr();
+  ca.kv_stride = kv.stride(0);
+  ca.qw = qw.data_ptr();
+  ca.kw = kw.data_ptr();
+  ca.eps = eps;
+  ca.clampv = clampv;
+  ca.out = out.data_ptr();
   if (x_in.has_value() && x_in->numel()) {
     TORCH_CHECK(x_in->dtype() == torch::kBFloat16 && x_in->is_contiguous(), "x_in");
-    eg::k_inject<0><<<(int)T, eg::IT, 0, st>>>(bf(*x_in), nullptr, nullptr, nullptr, nullptr, bf(kv), kv.stride(0), bf(qw), bf(kw),
-                                              kp, eps, clampv, ob, gp, ki, eg::Fold{});
+    ca.x_in = x_in->data_ptr();
   } else {
     TORCH_CHECK(y.has_value() && rs.has_value() && post.has_value() && comb.has_value(), "mode 1 needs y, rs, post, comb");
     TORCH_CHECK(y->dtype() == torch::kBFloat16 && y->is_contiguous() && rs->dtype() == torch::kBFloat16 && rs->is_contiguous(), "y/rs");
     TORCH_CHECK(post->dtype() == torch::kFloat32 && post->is_contiguous() && comb->dtype() == torch::kFloat32 && comb->is_contiguous(),
                 "post/comb fp32");
-    eg::k_inject<1><<<(int)T, eg::IT, 0, st>>>(nullptr, bf(*y), bf(*rs), post->data_ptr<float>(), comb->data_ptr<float>(), bf(kv),
-                                              kv.stride(0), bf(qw), bf(kw), kp, eps, clampv, ob, gp, ki, eg::Fold{});
+    ca.y = y->data_ptr();
+    ca.rs = rs->data_ptr();
+    ca.post = post->data_ptr<float>();
+    ca.comb = comb->data_ptr<float>();
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  check_rc(inject_core(&ca), "inject");
+}
+
+int inject_rs_core(const FprEngramInjectRsArgs* p) {   // C ABI "engram.inject_rs": the launch of pybind inject_rs (MODE 2)
+  try {
+    if (p->T < 0) return FPR_E_ARG;
+    if (p->T == 0) return FPR_OK;
+    auto bf = [](const void* q) { return reinterpret_cast<const __nv_bfloat16*>(q); };
+    eg::Fold fo{bf(p->recv), reinterpret_cast<const unsigned*>(p->flag), reinterpret_cast<const unsigned*>(p->epoch),
+                static_cast<unsigned>(p->signals), static_cast<int>(p->R)};
+    eg::k_inject<2><<<(int)p->T, eg::IT, 0, p->c.stream>>>(nullptr, nullptr, bf(p->rs), p->post, p->comb, bf(p->kv),
+                                                           (long long)p->kv_stride, bf(p->qw), bf(p->kw), p->keep, p->eps,
+                                                           p->clampv, reinterpret_cast<__nv_bfloat16*>(p->out), p->gate_out,
+                                                           p->kv_idx, fo);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
 }
 
 // MODE 2: y from the RS receive slots (recv bf16 [4, R, D], flag / epoch uint32 device words, as kernels/sp_layer/mhc.cu
@@ -720,27 +902,51 @@ void inject_rs(int64_t T, torch::Tensor recv, torch::Tensor flag, torch::Tensor 
                   recv.size(2) == eg::D && recv.size(1) >= T, "recv bf16 [4, R, 5120]");
   TORCH_CHECK(kv.dtype() == torch::kBFloat16 && kv.stride(1) == 1 && kv.size(1) >= eg::KVW, "kv");
   if (T == 0) return;
-  auto st = c10::cuda::getCurrentCUDAStream(kv.device().index()).stream();
-  const unsigned char* kp = keep.has_value() && keep->numel() ? keep->data_ptr<uint8_t>() : nullptr;
-  float* gp = gate_out.has_value() && gate_out->numel() ? gate_out->data_ptr<float>() : nullptr;
-  const int* ki = kv_idx.has_value() && kv_idx->numel() ? kv_idx->data_ptr<int>() : nullptr;
-  auto bf = [](const torch::Tensor& t) { return reinterpret_cast<const __nv_bfloat16*>(t.data_ptr()); };
-  eg::Fold fo{bf(recv), reinterpret_cast<const unsigned*>(flag.data_ptr()), reinterpret_cast<const unsigned*>(epoch.data_ptr()),
-              static_cast<unsigned>(signals), static_cast<int>(recv.size(1))};
-  eg::k_inject<2><<<(int)T, eg::IT, 0, st>>>(nullptr, nullptr, bf(rs), post.data_ptr<float>(), comb.data_ptr<float>(), bf(kv),
-                                            kv.stride(0), bf(qw), bf(kw), kp, eps, clampv,
-                                            reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), gp, ki, fo);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const auto dev = kv.device().index();
+  FprEngramInjectRsArgs ca{};
+  ca.c = FprCall{c10::cuda::getCurrentCUDAStream(dev).stream(), dev, 0};
+  ca.T = static_cast<int32_t>(T);
+  ca.keep = keep.has_value() && keep->numel() ? keep->data_ptr<uint8_t>() : nullptr;
+  ca.gate_out = gate_out.has_value() && gate_out->numel() ? gate_out->data_ptr<float>() : nullptr;
+  ca.kv_idx = kv_idx.has_value() && kv_idx->numel() ? kv_idx->data_ptr<int>() : nullptr;
+  ca.recv = recv.data_ptr();
+  ca.R = static_cast<int32_t>(recv.size(1));
+  ca.flag = reinterpret_cast<const uint32_t*>(flag.data_ptr());
+  ca.epoch = reinterpret_cast<const uint32_t*>(epoch.data_ptr());
+  ca.signals = static_cast<uint32_t>(signals);
+  ca.rs = rs.data_ptr();
+  ca.post = post.data_ptr<float>();
+  ca.comb = comb.data_ptr<float>();
+  ca.kv = kv.data_ptr();
+  ca.kv_stride = kv.stride(0);
+  ca.qw = qw.data_ptr();
+  ca.kw = kw.data_ptr();
+  ca.eps = eps;
+  ca.clampv = clampv;
+  ca.out = out.data_ptr();
+  check_rc(inject_rs_core(&ca), "inject_rs");
+}
+
+int hc_post_core(const FprEngramHcPostArgs* p) {   // C ABI "engram.hc_post": the launch of pybind hc_post
+  try {
+    if (p->T < 0) return FPR_E_ARG;
+    if (p->T == 0) return FPR_OK;
+    eg::k_hc_post<<<(int)p->T, eg::IT, 0, p->c.stream>>>(reinterpret_cast<const __nv_bfloat16*>(p->y),
+                                                         reinterpret_cast<const __nv_bfloat16*>(p->rs), p->post, p->comb,
+                                                         reinterpret_cast<__nv_bfloat16*>(p->out));
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
 }
 
 void hc_post(int64_t T, torch::Tensor y, torch::Tensor rs, torch::Tensor post, torch::Tensor comb, torch::Tensor out) {
   const c10::cuda::CUDAGuard guard_(y.device());
   if (T == 0) return;
-  auto st = c10::cuda::getCurrentCUDAStream(y.device().index()).stream();
-  eg::k_hc_post<<<(int)T, eg::IT, 0, st>>>(reinterpret_cast<const __nv_bfloat16*>(y.data_ptr()),
-                                           reinterpret_cast<const __nv_bfloat16*>(rs.data_ptr()), post.data_ptr<float>(),
-                                           comb.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const auto dev = y.device().index();
+  const FprEngramHcPostArgs ca{{c10::cuda::getCurrentCUDAStream(dev).stream(), dev, 0}, (int32_t)T, y.data_ptr(), rs.data_ptr(),
+                               post.data_ptr<float>(), comb.data_ptr<float>(), out.data_ptr()};
+  check_rc(hc_post_core(&ca), "hc_post");
 }
 
 std::tuple<int64_t, std::string, int64_t> host_register(int64_t ptr, int64_t bytes, bool read_only) {
@@ -771,6 +977,105 @@ int64_t host_unregister(int64_t ptr) { return static_cast<int64_t>(cudaHostUnreg
 
 }  // namespace
 
+// ---- C ABI (fpr_cabi.h): table. No init entry: no per-device state (no dynamic SMEM, no attributes, no device buffers).
+// hash_setup / probe / host_register / host_unregister stay pybind only; "engram.hash_params" is a host-only copy.
+extern "C" {
+static_assert(FPR_ENGRAM_RING_COPY_MAX == FPR_ENGRAM_RING_COPY_MAX_K, "ring_copy pair capacity");
+static_assert(sizeof(int32_t) * 16 * 2 == 128, "ring slot = 16 (position, token) int32 pairs");
+
+int ring_copy_core(const FprEngramRingCopyArgs* p) {   // C ABI "engram.ring_copy": EngramPhys.ring_copy x n
+  try {
+    if (p->n < 0 || p->n > FPR_ENGRAM_RING_COPY_MAX) return FPR_E_ARG;
+    if (p->n == 0) return FPR_OK;
+    if (p->src_ring == nullptr || p->dst_ring == nullptr || p->src_nring <= 0 || p->dst_nring <= 0 ||
+        reinterpret_cast<uintptr_t>(p->src_ring) % 16 != 0 || reinterpret_cast<uintptr_t>(p->dst_ring) % 16 != 0)
+      return FPR_E_ARG;
+    const int n = p->n;
+    const bool same = static_cast<const void*>(p->dst_ring) == static_cast<const void*>(p->src_ring);
+    bool chained = false;
+    for (int k = 0; k < n; ++k) {
+      if (p->src_slot[k] < 0 || p->src_slot[k] >= p->src_nring || p->dst_slot[k] < 0 || p->dst_slot[k] >= p->dst_nring)
+        return FPR_E_ARG;
+      for (int j = 0; j < k && !chained; ++j)   // Python's sequential order matters: a repeated write, or (one ring) a
+        chained = p->dst_slot[j] == p->dst_slot[k] ||   // read after an earlier write / a write after an earlier read
+                  (same && (p->dst_slot[j] == p->src_slot[k] || p->src_slot[j] == p->dst_slot[k]));
+    }
+    const cudaStream_t st = p->c.stream;
+    if (p->src_ready != nullptr &&
+        cudaStreamWaitEvent(st, reinterpret_cast<cudaEvent_t>(p->src_ready), 0) != cudaSuccess)
+      return FPR_E_CUDA;
+    auto src = reinterpret_cast<const int4*>(p->src_ring);
+    auto dst = reinterpret_cast<int4*>(p->dst_ring);
+    eg::RingPairs rp{};
+    if (!chained) {
+      for (int k = 0; k < n; ++k) {
+        rp.s[k] = p->src_slot[k];
+        rp.d[k] = p->dst_slot[k];
+      }
+      eg::k_ring_copy<<<(8 * n + 255) / 256, 256, 0, st>>>(src, dst, rp, n);
+    } else {
+      for (int k = 0; k < n; ++k) {
+        rp.s[0] = p->src_slot[k];
+        rp.d[0] = p->dst_slot[k];
+        eg::k_ring_copy<<<1, 32, 0, st>>>(src, dst, rp, 1);
+      }
+    }
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
+
+// pybind twin (tests: the entry vs EngramPhys.ring_copy): dst_ring's device + current stream
+void ring_copy(torch::Tensor src_ring, torch::Tensor dst_ring, std::vector<int64_t> src_slots, std::vector<int64_t> dst_slots) {
+  const c10::cuda::CUDAGuard guard_(dst_ring.device());
+  TORCH_CHECK(src_ring.is_cuda() && src_ring.dtype() == torch::kInt32 && src_ring.is_contiguous() && src_ring.dim() == 3 &&
+              src_ring.size(1) == 16 && src_ring.size(2) == 2, "src_ring int32 [n, 16, 2]");
+  TORCH_CHECK(dst_ring.is_cuda() && dst_ring.dtype() == torch::kInt32 && dst_ring.is_contiguous() && dst_ring.dim() == 3 &&
+              dst_ring.size(1) == 16 && dst_ring.size(2) == 2, "dst_ring int32 [n, 16, 2]");
+  TORCH_CHECK(src_slots.size() == dst_slots.size(), "slot lists differ in length");
+  FprEngramRingCopyArgs a{};
+  a.c.stream = c10::cuda::getCurrentCUDAStream(dst_ring.device().index()).stream();
+  a.c.device = dst_ring.device().index();
+  a.src_ring = src_ring.data_ptr<int32_t>();
+  a.dst_ring = dst_ring.data_ptr<int32_t>();
+  a.src_nring = static_cast<int32_t>(src_ring.size(0));
+  a.dst_nring = static_cast<int32_t>(dst_ring.size(0));
+  for (size_t i0 = 0; i0 < src_slots.size(); i0 += FPR_ENGRAM_RING_COPY_MAX) {
+    const size_t m = std::min<size_t>(FPR_ENGRAM_RING_COPY_MAX, src_slots.size() - i0);
+    a.n = static_cast<int32_t>(m);
+    for (size_t k = 0; k < m; ++k) {
+      a.src_slot[k] = static_cast<int32_t>(src_slots[i0 + k]);
+      a.dst_slot[k] = static_cast<int32_t>(dst_slots[i0 + k]);
+    }
+    check_rc(ring_copy_core(&a), "ring_copy");
+  }
+}
+
+static int c_hash_params(const void* a) { return hash_params_core((const FprEngramHashParamsArgs*)a); }
+static int c_hash(const void* a) { return hash_core((const FprEngramHashArgs*)a); }
+static int c_gather(const void* a) { return gather_core((const FprEngramGatherArgs*)a); }
+static int c_gather_ids(const void* a) { return gather_ids_core((const FprEngramGatherIdsArgs*)a); }
+static int c_expand(const void* a) { return expand_core((const FprEngramExpandArgs*)a); }
+static int c_inject(const void* a) { return inject_core((const FprEngramInjectArgs*)a); }
+static int c_inject_rs(const void* a) { return inject_rs_core((const FprEngramInjectRsArgs*)a); }
+static int c_hc_post(const void* a) { return hc_post_core((const FprEngramHcPostArgs*)a); }
+static int c_ring_copy(const void* a) { return ring_copy_core((const FprEngramRingCopyArgs*)a); }
+static const FprFnEntry k_engram_fns[] = {
+    {"engram.hash_params", c_hash_params, nullptr, (int64_t)sizeof(FprEngramHashParamsArgs)},
+    {"engram.hash", c_hash, nullptr, (int64_t)sizeof(FprEngramHashArgs)},
+    {"engram.gather", c_gather, nullptr, (int64_t)sizeof(FprEngramGatherArgs)},
+    {"engram.gather_ids", c_gather_ids, nullptr, (int64_t)sizeof(FprEngramGatherIdsArgs)},
+    {"engram.expand", c_expand, nullptr, (int64_t)sizeof(FprEngramExpandArgs)},
+    {"engram.inject", c_inject, nullptr, (int64_t)sizeof(FprEngramInjectArgs)},
+    {"engram.inject_rs", c_inject_rs, nullptr, (int64_t)sizeof(FprEngramInjectRsArgs)},
+    {"engram.hc_post", c_hc_post, nullptr, (int64_t)sizeof(FprEngramHcPostArgs)},
+    {"engram.ring_copy", c_ring_copy, nullptr, (int64_t)sizeof(FprEngramRingCopyArgs)},
+};
+static const FprExtTable k_engram_table = {FPR_CABI_VERSION, "engram", "", 9, k_engram_fns};
+__attribute__((visibility("default"))) const FprExtTable* fpr_engram_table(void) { return &k_engram_table; }
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("hash_setup", &hash_setup);
   m.def("hash", &hash);
@@ -781,6 +1086,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("inject", &inject);
   m.def("inject_rs", &inject_rs);
   m.def("hc_post", &hc_post);
+  m.def("ring_copy", &ring_copy);
   m.def("host_register", &host_register);
   m.def("host_unregister", &host_unregister);
 }

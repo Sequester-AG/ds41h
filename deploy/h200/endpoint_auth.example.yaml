@@ -1,0 +1,5 @@
+# vLLM --config file with the endpoint's API keys. Copy it outside the repository (AUTH_CONFIG in site.env), replace
+# the placeholders with long random keys, chmod 600. Never commit the real file.
+api-key:
+  - "REPLACE_WITH_A_RANDOM_KEY_1"
+  - "REPLACE_WITH_A_RANDOM_KEY_2"

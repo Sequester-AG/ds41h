@@ -49,6 +49,48 @@ WOA8 = os.environ.get("ENG_PF_ACT8_WOA", "0") == "1"   # wo_a in FP8 too (ropeq6
 _EXT = {}
 
 
+# CUDA_ERROR_INVALID_HANDLE in fp8_einsum): its JIT runtime
+# loads each kernel with cuLibraryLoadFromFile but caches the CUfunction cuKernelGetFunction returns for the context of the
+# kernel's FIRST use, so the same kernel launched on another GPU of this process gets a foreign handle. The SM count is part
+# of the kernel signature: around each call, GPU d runs with base - 2 d SMs, so every GPU JIT-loads its own kernels in its own context; results are bitwise the same on every count
+# Costs only calls with more output tiles than SMs (prefill sizes) on GPUs 1..3.
+# (vLLM never meets
+# the bug: one process per GPU.)
+DG_PERDEV = os.environ.get("ATTN_ACT8_DG_PERDEV", "1") == "1"
+_DG = {}
+
+
+def _dg():
+    if "m" not in _DG:
+        from vllm.utils import deep_gemm as m
+
+        _DG["m"], _DG["base"] = m, int(m.get_num_sms())
+    return _DG["m"]
+
+
+def dg_num_sms() -> int:
+    return int(_dg().get_num_sms())
+
+
+class _dg_device:
+    """with _dg_device(t): DeepGEMM calls for t's GPU (see DG_PERDEV); restores the previous SM count."""
+
+    def __init__(self, t: torch.Tensor):
+        self.d = t.device.index if DG_PERDEV else None
+
+    def __enter__(self):
+        if self.d is not None:
+            m = _dg()
+            self.old = int(m.get_num_sms())
+            m.set_num_sms(_DG["base"] - 2 * self.d)
+        return self
+
+    def __exit__(self, *exc):
+        if self.d is not None:
+            _dg().set_num_sms(self.old)
+        return False
+
+
 def set_enabled(on: bool) -> None:
     global ENABLED
     ENABLED = bool(on)
@@ -115,7 +157,7 @@ def ropeq():
         from torch.utils.cpp_extension import load
 
         here = os.path.dirname(os.path.abspath(__file__))
-        bdir = os.path.join(here, "build_rq")
+        bdir = os.environ.get("ATTN_ACT8_RQ_BUILD") or os.path.join(here, "build_rq")
         os.makedirs(bdir, exist_ok=True)
         _EXT["rq"] = load(name="ropeq64_ext", sources=[os.path.join(here, "ropeq64.cu")],
                           extra_cuda_cflags=["-O3", "-std=c++20", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a",
@@ -130,7 +172,8 @@ def wo_a(P: dict, o: torch.Tensor, pos: torch.Tensor, cos_sin: torch.Tensor, z: 
     from vllm.utils.deep_gemm import fp8_einsum
 
     oq, osc = ropeq().inv_rope_fp8_quant(o, pos, cos_sin, 8)
-    fp8_einsum("bhr,hdr->bhd", (oq, osc), P["wo_a"], z, recipe=(1, 128, 128))
+    with _dg_device(o):
+        fp8_einsum("bhr,hdr->bhd", (oq, osc), P["wo_a"], z, recipe=(1, 128, 128))
     return z
 
 
@@ -141,7 +184,8 @@ def applies(layer: int, which: str, n_rows: int) -> bool:
 
 
 def _gemm(x: torch.Tensor, fw, out: torch.Tensor) -> torch.Tensor:
-    return deploy_linear().gemm_w8a8(x, fw, out=out)
+    with _dg_device(x):
+        return deploy_linear().gemm_w8a8(x, fw, out=out)
 
 
 def qkv(P: dict, a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:

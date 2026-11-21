@@ -1,0 +1,11 @@
+# fe_parser: reasoning + DSML tool-call parser, structural tags. See parser.h.
+set(FE_PARSER_SOURCES parser.cpp dsml_engine.cpp pyjson.cpp structural_tag.cpp)
+if(TARGET fe_common)
+  list(APPEND FE_PARSER_SOURCES parser_json.cpp)
+endif()
+add_library(fe_parser STATIC ${FE_PARSER_SOURCES})
+target_include_directories(fe_parser PUBLIC ${CMAKE_SOURCE_DIR}/src)
+target_compile_options(fe_parser PRIVATE -Wall -Wextra)
+if(TARGET fe_common)
+  target_link_libraries(fe_parser PUBLIC fe_common)
+endif()

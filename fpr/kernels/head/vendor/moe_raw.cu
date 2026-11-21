@@ -455,16 +455,24 @@ __global__ void __launch_bounds__(640) k_gather2(const __nv_bfloat16* __restrict
 #define MSR_G5BS 0  // > 0: dynamic batches of MSR_G5BS contiguous slots (atomic counter): blocks that start late (SMs held by
                     // the concurrent shared-expert GEMM) take less; 0: static round-robin slots
 #endif
+// the EC slot-base table holds route2's
+// max_ec(MAXT x 6) = 1152 ECs (was 512); more (impossible for T <= 8192) -> nothing written, g_gather5_err set.
+constexpr int G5_MAXE = 384 + 8192 * 6 / 64;
+__device__ unsigned g_gather5_err = 0u;
 __global__ void __launch_bounds__(640, MSR_G5B) k_gather5(const __nv_bfloat16* __restrict__ x, EC* __restrict__ ecs,
                                                           const int* __restrict__ ptok, char* __restrict__ img,
                                                           const int* __restrict__ counts, int pstride,
                                                           int* __restrict__ ctr = nullptr) {
-  constexpr int U = MSR_G5U, MAXE = 512, MAXJ = 64;
+  constexpr int U = MSR_G5U, MAXE = G5_MAXE, MAXJ = 64;
   __shared__ int sbase[MAXE + 1];
   __shared__ long long soff[MAXJ];  // per slot of this batch: image byte offset of slab 0, n_pad * 128 (slab stride)
   __shared__ int sstr[MAXJ], stok[MAXJ], snn[MAXJ];
   __shared__ float ssc[MAXJ];
   const int nec = counts[0], S = counts[3] / (80 * 128), G = gridDim.x;
+  if (nec < 0 || nec > MAXE) {  // never past sbase: skip, flag (uniform per launch: every block returns)
+    if (blockIdx.x == 0 && threadIdx.x == 0) atomicOr(&g_gather5_err, 1u);
+    return;
+  }
   for (int i = threadIdx.x; i < nec; i += blockDim.x) sbase[i] = (int)(ecs[i].img_off / (80 * 128));
   if (threadIdx.x == 0) sbase[nec] = S;
   __syncthreads();
@@ -1666,34 +1674,79 @@ __global__ void k_combine(const __nv_bfloat16* __restrict__ Y, const int* __rest
 }  // namespace msr
 
 // ------------------------------------------------------------------------------------------------ bindings
+#include "head_moe_raw_cabi.h"
 using namespace msr;
 static int g_sms = 0;
+// C ABI: g_sms without a data race (4 driver threads; every GPU of the node has the same SM count), 0 on error
+static int sms_c(int dev) {
+  int v = __atomic_load_n(&g_sms, __ATOMIC_ACQUIRE);
+  if (!v) {
+    if (cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) return 0;
+    __atomic_store_n(&g_sms, v, __ATOMIC_RELEASE);
+  }
+  return v;
+}
+// C ABI: a dynamic-SMEM opt-in once per (kernel, device), no exceptions, the device bit set atomically
+template <typename K>
+static bool smem_attr_c(K kern, int bytes, unsigned long long* done) {
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return false;
+  if (!(__atomic_load_n(done, __ATOMIC_ACQUIRE) >> dev & 1ull)) {
+    if (cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) != cudaSuccess) return false;
+    __atomic_fetch_or(done, 1ull << dev, __ATOMIC_RELEASE);
+  }
+  return true;
+}
+// per-device opt-in masks (C path and the converted pybind functions; were static bool attr_dev[64] per function)
+static unsigned long long g_gemm_attr[3] = {0, 0, 0};   // [MODE]: k_gemm<MODE> (gemm1r / gemm2r)
+static unsigned long long g_route_attr = 0;             // k_route (route)
+static unsigned long long g_r8_attr = 0;                // k_gemm1r8<MSR_R8NW, MSR_R8S> (gemm1r8)
+static unsigned long long g_q8_attr = 0;                // k_gemm2r8 (gemm2r8)
 
+static int route_core(const FprHeadMoeRawRouteArgs* p) {   // C ABI "head_moe_raw.route": the launches of pybind route
+  try {
+    const int64_t T = p->T;
+    if (T < 0 || T * 6 > RT_MAXP) return FPR_E_ARG;
+    if (p->rts_bytes < (int64_t)RS_INTS * (int64_t)sizeof(int)) return FPR_E_WS;
+    const int sms = sms_c(p->c.device);
+    if (!sms) return FPR_E_CUDA;
+    if (!smem_attr_c(k_route, (int)sizeof(RtSmem), &g_route_attr)) return FPR_E_CUDA;
+    k_route<<<1, RT_THREADS, sizeof(RtSmem), p->c.stream>>>((const int*)p->ids, (int)T, (int*)p->rts, (int*)p->counts,
+                                                            (int*)p->slotmap);
+    if (cudaGetLastError() != cudaSuccess) return FPR_E_CUDA;
+    k_route_fill<<<2 * sms, 256, 0, p->c.stream>>>((const int*)p->rts, p->w, (EC*)p->ecs, (Tile*)p->t1, (Tile*)p->t2,
+                                                   p->grid > 0 ? (int)p->grid : sms, p->inv);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void route(torch::Tensor ids, torch::Tensor w, int64_t T, torch::Tensor ecs, torch::Tensor t1, torch::Tensor t2,
            torch::Tensor counts, torch::Tensor slotmap, torch::Tensor rts, int64_t grid, torch::Tensor inv) {
   TORCH_CHECK(T * 6 <= RT_MAXP, "route: T too large");
   TORCH_CHECK(rts.numel() >= RS_INTS, "route: scratch too small");
-  auto stream = at::cuda::getCurrentCUDAStream();
-  static bool attr_dev[64] = {};  // per device: a one-process multi-GPU harness calls this on several devices
-  int cur_dev = 0;
-  cudaGetDevice(&cur_dev);
-  bool& attr = attr_dev[cur_dev & 63];
-  if (!attr) {
-    cudaFuncSetAttribute(k_route, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(RtSmem));
-    attr = true;
+  FprHeadMoeRawRouteArgs ca{{at::cuda::getCurrentCUDAStream(), (int)ids.get_device(), 0}, ids.data_ptr<int>(),
+                            w.data_ptr<float>(), T, ecs.data_ptr(), t1.data_ptr(), t2.data_ptr(), counts.data_ptr<int>(),
+                            slotmap.data_ptr<int>(), rts.data_ptr<int>(), (int64_t)rts.numel() * (int64_t)sizeof(int),
+                            (int32_t)grid, inv.numel() ? inv.data_ptr<float>() : nullptr};
+  TORCH_CHECK(route_core(&ca) == FPR_OK, "head_moe_raw route: CUDA launch error");
+}
+static int swiglu_core(const FprMoeRawSwigluArgs* p) {   // C ABI "head_moe_raw.swiglu" (plain launch: this fork has no pdl2)
+  try {
+    const int I = (int)p->I;
+    if (I % 8 != 0) return FPR_E_ARG;
+    k_swiglu<<<(unsigned)p->T, I / 8, 0, p->c.stream>>>((const __nv_bfloat16*)p->gu, (__nv_bfloat16*)p->h, I);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
   }
-  if (!g_sms) cudaDeviceGetAttribute(&g_sms, cudaDevAttrMultiProcessorCount, ids.get_device());
-  k_route<<<1, RT_THREADS, sizeof(RtSmem), stream>>>(ids.data_ptr<int>(), (int)T, rts.data_ptr<int>(), counts.data_ptr<int>(),
-                                                     slotmap.data_ptr<int>());
-  k_route_fill<<<2 * g_sms, 256, 0, stream>>>(rts.data_ptr<int>(), w.data_ptr<float>(), (EC*)ecs.data_ptr(), (Tile*)t1.data_ptr(),
-                                              (Tile*)t2.data_ptr(), grid > 0 ? (int)grid : g_sms,
-                                              inv.numel() ? inv.data_ptr<float>() : nullptr);
 }
 void swiglu(torch::Tensor gu, torch::Tensor h) {
-  auto stream = at::cuda::getCurrentCUDAStream();
   const int I = (int)h.size(1);
   TORCH_CHECK(I % 8 == 0 && gu.size(1) == 2 * I, "swiglu shapes");
-  k_swiglu<<<(unsigned)h.size(0), I / 8, 0, stream>>>((const __nv_bfloat16*)gu.data_ptr(), (__nv_bfloat16*)h.data_ptr(), I);
+  FprMoeRawSwigluArgs ca{{at::cuda::getCurrentCUDAStream(), (int)h.get_device(), 0}, gu.data_ptr(), h.data_ptr(),
+                         (int32_t)h.size(0), I};
+  TORCH_CHECK(swiglu_core(&ca) == FPR_OK, "head_moe_raw swiglu: CUDA launch error");
 }
 int64_t route_scratch_ints() { return RS_INTS; }
 void router_top(torch::Tensor logits, torch::Tensor bias, torch::Tensor ids, torch::Tensor wts, double route_scale) {
@@ -1745,29 +1798,39 @@ void prepr5(torch::Tensor x, torch::Tensor ecs, torch::Tensor counts, torch::Ten
                                                            counts.data_ptr<int>(), 16,
                                                            ctr.numel() ? ctr.data_ptr<int>() : nullptr);
 }
+static int prepr_core(const FprHeadMoeRawPreprArgs* p) {   // C ABI "head_moe_raw.prepr": the launches of pybind prepr
+  try {
+    const cudaStream_t stream = p->c.stream;
+    const int T = (int)p->T;
+    const unsigned mec = (unsigned)p->max_ec;
+    const __nv_bfloat16* x = (const __nv_bfloat16*)p->x;
+    int* const counts = (int*)p->counts;
+    if (MSR_GATHER3 == 2) {
+      k_gather4<<<dim3(mec, 8), 640, 0, stream>>>(x, (EC*)p->ecs, (int*)p->ptok, p->inv, (char*)p->img, counts);
+      return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+    }
+    if (MSR_GATHER3) {
+      k_gather3<<<dim3(mec, MSR_G3Y), 160 * G3G, 0, stream>>>(x, (EC*)p->ecs, (int*)p->ptok, p->inv, (char*)p->img, counts);
+      return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+    }
+    k_prescale<<<T, 256, 0, stream>>>(x, (int*)p->ptok, p->inv);
+    if (cudaGetLastError() != cudaSuccess) return FPR_E_CUDA;
+    if (MSR_GATHER2)
+      k_gather2<<<dim3(mec, 8), 640, 0, stream>>>(x, (EC*)p->ecs, (int*)p->ptok, (char*)p->img, counts);
+    else
+      k_gather<<<dim3(mec, 8), 640, 0, stream>>>(x, (EC*)p->ecs, (int*)p->ptok, (char*)p->img, counts);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void prepr(torch::Tensor x, torch::Tensor ecs, torch::Tensor counts, int64_t max_ec, torch::Tensor img, torch::Tensor ptok,
            torch::Tensor inv) {
-  auto stream = at::cuda::getCurrentCUDAStream();
   int T = x.size(0);
-  if (MSR_GATHER3 == 2) {
-    k_gather4<<<dim3((unsigned)max_ec, 8), 640, 0, stream>>>((const __nv_bfloat16*)x.data_ptr(), (EC*)ecs.data_ptr(),
-                                                             ptok.data_ptr<int>(), inv.data_ptr<float>(),
-                                                             (char*)img.data_ptr(), counts.data_ptr<int>());
-    return;
-  }
-  if (MSR_GATHER3) {
-    k_gather3<<<dim3((unsigned)max_ec, MSR_G3Y), 160 * G3G, 0, stream>>>((const __nv_bfloat16*)x.data_ptr(), (EC*)ecs.data_ptr(),
-                                                             ptok.data_ptr<int>(), inv.data_ptr<float>(),
-                                                             (char*)img.data_ptr(), counts.data_ptr<int>());
-    return;
-  }
-  k_prescale<<<T, 256, 0, stream>>>((const __nv_bfloat16*)x.data_ptr(), ptok.data_ptr<int>(), inv.data_ptr<float>());
-  if (MSR_GATHER2)
-    k_gather2<<<dim3((unsigned)max_ec, 8), 640, 0, stream>>>((const __nv_bfloat16*)x.data_ptr(), (EC*)ecs.data_ptr(),
-                                                             ptok.data_ptr<int>(), (char*)img.data_ptr(), counts.data_ptr<int>());
-  else
-    k_gather<<<dim3((unsigned)max_ec, 8), 640, 0, stream>>>((const __nv_bfloat16*)x.data_ptr(), (EC*)ecs.data_ptr(),
-                                                            ptok.data_ptr<int>(), (char*)img.data_ptr(), counts.data_ptr<int>());
+  FprHeadMoeRawPreprArgs ca{{at::cuda::getCurrentCUDAStream(), (int)x.get_device(), 0}, x.data_ptr(), ecs.data_ptr(),
+                            counts.data_ptr<int>(), (int32_t)max_ec, img.data_ptr(), ptok.data_ptr<int>(), inv.data_ptr<float>(),
+                            T};
+  TORCH_CHECK(prepr_core(&ca) == FPR_OK, "head_moe_raw prepr: CUDA launch error");
 }
 static PFN_cuTensorMapEncodeTiled_v12000 tmap_encode() {
   static PFN_cuTensorMapEncodeTiled_v12000 fn = nullptr;
@@ -1815,21 +1878,41 @@ static void launch(Args<MODE>& a, int64_t grid) {
   }
   k_gemm<MODE><<<grid > 0 ? (int)grid : g_sms, 32 + 32 * NCW, Lay<MODE>::SMEM, stream>>>(a);
 }
+// C-ABI variant of launch: the caller's stream, the per-device opt-in set atomically, no exceptions
+template <int MODE>
+static int launch_c(const Args<MODE>& a, int grid, int sms, cudaStream_t stream) {
+  if (!smem_attr_c(k_gemm<MODE>, Lay<MODE>::SMEM, &g_gemm_attr[MODE])) return FPR_E_CUDA;
+  k_gemm<MODE><<<grid > 0 ? grid : sms, 32 + 32 * NCW, Lay<MODE>::SMEM, stream>>>(a);
+  return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+}
 // raw w13 [E, 2I, H/2], s13 [E, 2I, H/32] (uint8), counts[1] = GEMM1 tiles
+static int gemm1r_core(const FprMoeRawGemm1rArgs* p) {   // C ABI "head_moe_raw.gemm1r" (tensor maps encoded on the host per call)
+  try {
+    const int sms = sms_c(p->c.device);
+    if (!sms) return FPR_E_CUDA;
+    void* w13 = const_cast<void*>(p->w13);
+    void* s13 = const_cast<void*>(p->s13);
+    Args<1> a{};
+    a.ecs = (const EC*)p->ecs, a.tiles = (const Tile*)p->tiles, a.bimg = (const char*)p->img;
+    a.himg = (char*)p->himg, a.nt_dev = const_cast<int*>(p->counts) + 1;
+    a.w2 = (const unsigned char*)w13;  // GEMM1: raw w13 (only the MS3_ABL 9 timing ablation reads it directly)
+    const uint64_t rows = (uint64_t)p->E * 1152;
+    a.tmw = tmap2d(w13, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 2, rows, 128, 64, CU_TENSOR_MAP_SWIZZLE_128B);
+    a.tms = tmap2d(s13, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 32, rows, 16, 64, CU_TENSOR_MAP_SWIZZLE_NONE);
+    a.tmw2 = tmap2d(w13, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 2, rows, 128, 128, CU_TENSOR_MAP_SWIZZLE_128B);
+    a.tms2 = tmap2d(s13, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 32, rows, 16, 128, CU_TENSOR_MAP_SWIZZLE_NONE);
+    return launch_c<1>(a, (int)p->grid, sms, p->c.stream);
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void gemm1r(torch::Tensor w13, torch::Tensor s13, torch::Tensor ecs, torch::Tensor tiles, torch::Tensor counts,
             torch::Tensor img, torch::Tensor himg, int64_t grid) {
   TORCH_CHECK(w13.size(1) == 1152 && w13.size(2) == D / 2 && s13.size(2) == D / 32, "gemm1r: raw w13 / s13 shapes");
-  if (!g_sms) cudaDeviceGetAttribute(&g_sms, cudaDevAttrMultiProcessorCount, w13.get_device());
-  Args<1> a{};
-  a.ecs = (const EC*)ecs.data_ptr(), a.tiles = (const Tile*)tiles.data_ptr(), a.bimg = (const char*)img.data_ptr();
-  a.himg = (char*)himg.data_ptr(), a.nt_dev = counts.data_ptr<int>() + 1;
-  a.w2 = (const unsigned char*)w13.data_ptr();  // GEMM1: raw w13 (only the MS3_ABL 9 timing ablation reads it directly)
-  const uint64_t rows = (uint64_t)w13.size(0) * 1152;
-  a.tmw = tmap2d(w13.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 2, rows, 128, 64, CU_TENSOR_MAP_SWIZZLE_128B);
-  a.tms = tmap2d(s13.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 32, rows, 16, 64, CU_TENSOR_MAP_SWIZZLE_NONE);
-  a.tmw2 = tmap2d(w13.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 2, rows, 128, 128, CU_TENSOR_MAP_SWIZZLE_128B);
-  a.tms2 = tmap2d(s13.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 32, rows, 16, 128, CU_TENSOR_MAP_SWIZZLE_NONE);
-  launch<1>(a, grid);
+  FprMoeRawGemm1rArgs ca{{at::cuda::getCurrentCUDAStream(), (int)w13.get_device(), 0}, w13.data_ptr(), s13.data_ptr(),
+                         (int64_t)w13.size(0), ecs.data_ptr(), tiles.data_ptr(), counts.data_ptr<int>(), img.data_ptr(),
+                         himg.data_ptr(), (int32_t)grid};
+  TORCH_CHECK(gemm1r_core(&ca) == FPR_OK, "head_moe_raw gemm1r: CUDA launch error");
 }
 // gemm1r with skip8 = 1: the tile stream leaves the n_pad-8 tiles to gemm1r8
 void gemm1rs(torch::Tensor w13, torch::Tensor s13, torch::Tensor ecs, torch::Tensor tiles, torch::Tensor counts,
@@ -1849,42 +1932,58 @@ void gemm1rs(torch::Tensor w13, torch::Tensor s13, torch::Tensor ecs, torch::Ten
   launch<1>(a, grid);
 }
 // row-stream GEMM1 of the n_pad-8 ECs: ec8 / counts[6] from route2x; same H image as gemm1r
+static int gemm1r8_core(const FprHeadMoeRawGemm1r8Args* p) {   // C ABI "head_moe_raw.gemm1r8" (tensor map encoded per call)
+  try {
+    const int sms = sms_c(p->c.device);
+    if (!sms) return FPR_E_CUDA;
+    void* w13 = const_cast<void*>(p->w13);
+    Args<1> a{};
+    a.ecs = (const EC*)p->ecs, a.bimg = (const char*)p->img, a.himg = (char*)p->himg;
+    a.nt_dev = const_cast<int*>(p->counts) + 6, a.ec8 = (const int*)p->ec8;
+    a.w2 = (const unsigned char*)w13, a.s2 = (const unsigned char*)p->s13;
+    a.tmw = tmap_rows3d(w13, (uint64_t)p->E * 1152);
+    constexpr int SM8 = r8::L<MSR_R8NW, MSR_R8S>::SMEM;
+    if (!smem_attr_c(k_gemm1r8<MSR_R8NW, MSR_R8S>, SM8, &g_r8_attr)) return FPR_E_CUDA;
+    k_gemm1r8<MSR_R8NW, MSR_R8S><<<p->grid > 0 ? (int)p->grid : sms, 32 + 32 * MSR_R8NW, SM8, p->c.stream>>>(a);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void gemm1r8(torch::Tensor w13, torch::Tensor s13, torch::Tensor ecs, torch::Tensor ec8, torch::Tensor counts,
              torch::Tensor img, torch::Tensor himg, int64_t grid) {
   TORCH_CHECK(w13.size(1) == 1152 && w13.size(2) == D / 2 && s13.size(2) == D / 32, "gemm1r8: raw w13 / s13 shapes");
   TORCH_CHECK(counts.numel() >= 7 && ec8.scalar_type() == torch::kInt32, "gemm1r8: counts >= 7, ec8 int32");
-  if (!g_sms) cudaDeviceGetAttribute(&g_sms, cudaDevAttrMultiProcessorCount, w13.get_device());
-  Args<1> a{};
-  a.ecs = (const EC*)ecs.data_ptr(), a.bimg = (const char*)img.data_ptr(), a.himg = (char*)himg.data_ptr();
-  a.nt_dev = counts.data_ptr<int>() + 6, a.ec8 = ec8.data_ptr<int>();
-  a.w2 = (const unsigned char*)w13.data_ptr(), a.s2 = (const unsigned char*)s13.data_ptr();
-  a.tmw = tmap_rows3d(w13.data_ptr(), (uint64_t)w13.size(0) * 1152);
-  auto stream = at::cuda::getCurrentCUDAStream();
-  constexpr int SM8 = r8::L<MSR_R8NW, MSR_R8S>::SMEM;
-  static bool attr_dev[64] = {};
-  int cur_dev = 0;
-  cudaGetDevice(&cur_dev);
-  if (!attr_dev[cur_dev & 63]) {
-    cudaFuncSetAttribute(k_gemm1r8<MSR_R8NW, MSR_R8S>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM8);
-    attr_dev[cur_dev & 63] = true;
-  }
-  k_gemm1r8<MSR_R8NW, MSR_R8S><<<grid > 0 ? (int)grid : g_sms, 32 + 32 * MSR_R8NW, SM8, stream>>>(a);
+  FprHeadMoeRawGemm1r8Args ca{{at::cuda::getCurrentCUDAStream(), (int)w13.get_device(), 0}, w13.data_ptr(), s13.data_ptr(),
+                              (int64_t)w13.size(0), ecs.data_ptr(), ec8.data_ptr<int>(), counts.data_ptr<int>(), img.data_ptr(),
+                              himg.data_ptr(), (int32_t)grid};
+  TORCH_CHECK(gemm1r8_core(&ca) == FPR_OK, "head_moe_raw gemm1r8: CUDA launch error");
 }
 // raw w2 [E, H, I/2], s2 [E, H, I/32] (uint8), counts[2] = GEMM2 tiles; yout bf16 [slots][H]
+static int gemm2r_core(const FprMoeRawGemm2rArgs* p) {   // C ABI "head_moe_raw.gemm2r" (tensor maps encoded on the host per call)
+  try {
+    const int sms = sms_c(p->c.device);
+    if (!sms) return FPR_E_CUDA;
+    void* w2 = const_cast<void*>(p->w2);
+    Args<2> a{};
+    a.s2 = (const unsigned char*)p->s2, a.ecs = (const EC*)p->ecs, a.tiles = (const Tile*)p->tiles;
+    a.w2 = (const unsigned char*)w2;
+    a.bimg = (const char*)p->himg, a.nt_dev = const_cast<int*>(p->counts) + 2;
+    a.yout = (__nv_bfloat16*)p->yout;
+    a.tmw = tmap2d(w2, CU_TENSOR_MAP_DATA_TYPE_UINT16, 2, IR / 4, (uint64_t)p->E * D, 48, 128, CU_TENSOR_MAP_SWIZZLE_NONE);
+    a.tmw2 = tmap2d(w2, CU_TENSOR_MAP_DATA_TYPE_UINT16, 2, IR / 4, (uint64_t)p->E * D, 48, 256, CU_TENSOR_MAP_SWIZZLE_NONE);
+    return launch_c<2>(a, (int)p->grid, sms, p->c.stream);
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void gemm2r(torch::Tensor w2, torch::Tensor s2, torch::Tensor ecs, torch::Tensor tiles, torch::Tensor counts,
             torch::Tensor himg, torch::Tensor yout, int64_t grid) {
   TORCH_CHECK(w2.size(1) == D && w2.size(2) == IR / 2 && s2.size(2) == IR / 32, "gemm2r: raw w2 / s2 shapes");
-  if (!g_sms) cudaDeviceGetAttribute(&g_sms, cudaDevAttrMultiProcessorCount, w2.get_device());
-  Args<2> a{};
-  a.s2 = (const unsigned char*)s2.data_ptr(), a.ecs = (const EC*)ecs.data_ptr(), a.tiles = (const Tile*)tiles.data_ptr();
-  a.w2 = (const unsigned char*)w2.data_ptr();
-  a.bimg = (const char*)himg.data_ptr(), a.nt_dev = counts.data_ptr<int>() + 2;
-  a.yout = (__nv_bfloat16*)yout.data_ptr();
-  a.tmw = tmap2d(w2.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT16, 2, IR / 4, (uint64_t)w2.size(0) * D, 48, 128,
-                 CU_TENSOR_MAP_SWIZZLE_NONE);
-  a.tmw2 = tmap2d(w2.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT16, 2, IR / 4, (uint64_t)w2.size(0) * D, 48, 256,
-                  CU_TENSOR_MAP_SWIZZLE_NONE);
-  launch<2>(a, grid);
+  FprMoeRawGemm2rArgs ca{{at::cuda::getCurrentCUDAStream(), (int)w2.get_device(), 0}, w2.data_ptr(), s2.data_ptr(),
+                         (int64_t)w2.size(0), ecs.data_ptr(), tiles.data_ptr(), counts.data_ptr<int>(), himg.data_ptr(),
+                         yout.data_ptr(), (int32_t)grid};
+  TORCH_CHECK(gemm2r_core(&ca) == FPR_OK, "head_moe_raw gemm2r: CUDA launch error");
 }
 void gemm2rs(torch::Tensor w2, torch::Tensor s2, torch::Tensor ecs, torch::Tensor tiles, torch::Tensor counts,
              torch::Tensor himg, torch::Tensor yout, int64_t grid, int64_t skip8) {
@@ -1903,30 +2002,43 @@ void gemm2rs(torch::Tensor w2, torch::Tensor s2, torch::Tensor ecs, torch::Tenso
   launch<2>(a, grid);
 }
 // row-stream GEMM2 of the n_pad-8 ECs (ec8 / counts[6] from route2x); same Y as gemm2r
+static int gemm2r8_core(const FprHeadMoeRawGemm2r8Args* p) {   // C ABI "head_moe_raw.gemm2r8"
+  try {
+    const int sms = sms_c(p->c.device);
+    if (!sms) return FPR_E_CUDA;
+    Args<2> a{};
+    a.s2 = (const unsigned char*)p->s2, a.w2 = (const unsigned char*)p->w2, a.ecs = (const EC*)p->ecs;
+    a.bimg = (const char*)p->himg, a.nt_dev = const_cast<int*>(p->counts) + 6, a.ec8 = (const int*)p->ec8;
+    a.yout = (__nv_bfloat16*)p->yout;
+    if (!smem_attr_c(k_gemm2r8, q8::SMEM, &g_q8_attr)) return FPR_E_CUDA;
+    k_gemm2r8<<<p->grid > 0 ? (int)p->grid : sms, 32 + 32 * NCW, q8::SMEM, p->c.stream>>>(a);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void gemm2r8(torch::Tensor w2, torch::Tensor s2, torch::Tensor ecs, torch::Tensor ec8, torch::Tensor counts,
              torch::Tensor himg, torch::Tensor yout, int64_t grid) {
   TORCH_CHECK(w2.size(1) == D && w2.size(2) == IR / 2 && s2.size(2) == IR / 32, "gemm2r8: raw w2 / s2 shapes");
   TORCH_CHECK(counts.numel() >= 7 && ec8.scalar_type() == torch::kInt32, "gemm2r8: counts >= 7, ec8 int32");
-  if (!g_sms) cudaDeviceGetAttribute(&g_sms, cudaDevAttrMultiProcessorCount, w2.get_device());
-  Args<2> a{};
-  a.s2 = (const unsigned char*)s2.data_ptr(), a.w2 = (const unsigned char*)w2.data_ptr(), a.ecs = (const EC*)ecs.data_ptr();
-  a.bimg = (const char*)himg.data_ptr(), a.nt_dev = counts.data_ptr<int>() + 6, a.ec8 = ec8.data_ptr<int>();
-  a.yout = (__nv_bfloat16*)yout.data_ptr();
-  auto stream = at::cuda::getCurrentCUDAStream();
-  static bool attr_dev[64] = {};
-  int cur_dev = 0;
-  cudaGetDevice(&cur_dev);
-  if (!attr_dev[cur_dev & 63]) {
-    cudaFuncSetAttribute(k_gemm2r8, cudaFuncAttributeMaxDynamicSharedMemorySize, q8::SMEM);
-    attr_dev[cur_dev & 63] = true;
+  FprHeadMoeRawGemm2r8Args ca{{at::cuda::getCurrentCUDAStream(), (int)w2.get_device(), 0}, w2.data_ptr(), s2.data_ptr(),
+                              ecs.data_ptr(), ec8.data_ptr<int>(), counts.data_ptr<int>(), himg.data_ptr(), yout.data_ptr(),
+                              (int32_t)grid};
+  TORCH_CHECK(gemm2r8_core(&ca) == FPR_OK, "head_moe_raw gemm2r8: CUDA launch error");
+}
+static int combine_core(const FprMoeRawCombineArgs* p) {   // C ABI "head_moe_raw.combine" (plain launch: this fork has no pdl2)
+  try {
+    k_combine<<<(unsigned)p->T, D / 8, 0, p->c.stream>>>((const __nv_bfloat16*)p->Y, (const int*)p->slotmap,
+                                                         (const __nv_bfloat16*)p->sh, (__nv_bfloat16*)p->out);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
   }
-  k_gemm2r8<<<grid > 0 ? (int)grid : g_sms, 32 + 32 * NCW, q8::SMEM, stream>>>(a);
 }
 void combine(torch::Tensor Y, torch::Tensor slotmap, torch::Tensor sh, torch::Tensor out) {
-  auto stream = at::cuda::getCurrentCUDAStream();
-  k_combine<<<(unsigned)out.size(0), D / 8, 0, stream>>>((const __nv_bfloat16*)Y.data_ptr(), slotmap.data_ptr<int>(),
-                                                          sh.numel() ? (const __nv_bfloat16*)sh.data_ptr() : nullptr,
-                                                          (__nv_bfloat16*)out.data_ptr());
+  FprMoeRawCombineArgs ca{{at::cuda::getCurrentCUDAStream(), (int)out.get_device(), 0}, Y.data_ptr(), slotmap.data_ptr<int>(),
+                          sh.numel() ? sh.data_ptr() : nullptr, out.data_ptr(), (int32_t)out.size(0)};
+  TORCH_CHECK(combine_core(&ca) == FPR_OK, "head_moe_raw combine: CUDA launch error");
 }
 int64_t route_max_ec() { return RT_MAXEC; }
 int64_t gemm_ctas() { return MS3_CTAS; }
@@ -1952,4 +2064,47 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gemm2r8", &gemm2r8);
   m.def("combine", &combine);
   m.def("smem_bytes", &smem_bytes);
+}
+
+// ---- C ABI (fpr_cabi.h): init + table
+// per device: the k_route / k_gemm<1> / k_gemm<2> / k_gemm1r8 / k_gemm2r8 dynamic-SMEM opt-ins; once per process: the SM
+// count and the cuTensorMapEncodeTiled entry point (tmap_encode's static: call before the driver threads launch)
+static int init_core(const FprMoeRawInitArgs* p) {
+  try {
+    if (!sms_c(p->c.device)) return FPR_E_CUDA;
+    (void)tmap_encode();   // the static entry point, resolved here once (throws if unavailable)
+    return (smem_attr_c(k_route, (int)sizeof(RtSmem), &g_route_attr) &&
+            smem_attr_c(k_gemm<1>, Lay<1>::SMEM, &g_gemm_attr[1]) && smem_attr_c(k_gemm<2>, Lay<2>::SMEM, &g_gemm_attr[2]) &&
+            smem_attr_c(k_gemm1r8<MSR_R8NW, MSR_R8S>, r8::L<MSR_R8NW, MSR_R8S>::SMEM, &g_r8_attr) &&
+            smem_attr_c(k_gemm2r8, q8::SMEM, &g_q8_attr))
+               ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
+extern "C" {
+static int c_init(const void* a) { return init_core((const FprMoeRawInitArgs*)a); }
+static int c_route(const void* a) { return route_core((const FprHeadMoeRawRouteArgs*)a); }
+static int64_t c_route_ws(const void* a) { (void)a; return (int64_t)RS_INTS * (int64_t)sizeof(int); }
+static int c_swiglu(const void* a) { return swiglu_core((const FprMoeRawSwigluArgs*)a); }
+static int c_prepr(const void* a) { return prepr_core((const FprHeadMoeRawPreprArgs*)a); }
+static int c_gemm1r(const void* a) { return gemm1r_core((const FprMoeRawGemm1rArgs*)a); }
+static int c_gemm1r8(const void* a) { return gemm1r8_core((const FprHeadMoeRawGemm1r8Args*)a); }
+static int c_gemm2r(const void* a) { return gemm2r_core((const FprMoeRawGemm2rArgs*)a); }
+static int c_gemm2r8(const void* a) { return gemm2r8_core((const FprHeadMoeRawGemm2r8Args*)a); }
+static int c_combine(const void* a) { return combine_core((const FprMoeRawCombineArgs*)a); }
+static const FprFnEntry k_head_moe_raw_fns[] = {
+    {"head_moe_raw.init", c_init, nullptr, (int64_t)sizeof(FprMoeRawInitArgs)},
+    {"head_moe_raw.route", c_route, c_route_ws, (int64_t)sizeof(FprHeadMoeRawRouteArgs)},
+    {"head_moe_raw.swiglu", c_swiglu, nullptr, (int64_t)sizeof(FprMoeRawSwigluArgs)},
+    {"head_moe_raw.prepr", c_prepr, nullptr, (int64_t)sizeof(FprHeadMoeRawPreprArgs)},
+    {"head_moe_raw.gemm1r", c_gemm1r, nullptr, (int64_t)sizeof(FprMoeRawGemm1rArgs)},
+    {"head_moe_raw.gemm1r8", c_gemm1r8, nullptr, (int64_t)sizeof(FprHeadMoeRawGemm1r8Args)},
+    {"head_moe_raw.gemm2r", c_gemm2r, nullptr, (int64_t)sizeof(FprMoeRawGemm2rArgs)},
+    {"head_moe_raw.gemm2r8", c_gemm2r8, nullptr, (int64_t)sizeof(FprHeadMoeRawGemm2r8Args)},
+    {"head_moe_raw.combine", c_combine, nullptr, (int64_t)sizeof(FprMoeRawCombineArgs)},
+};
+static const FprExtTable k_head_moe_raw_table = {FPR_CABI_VERSION, "head_moe_raw", "6b4b603372d05196ca31d9e02327d2d3", 9,
+                                                 k_head_moe_raw_fns};
+__attribute__((visibility("default"))) const FprExtTable* fpr_head_moe_raw_table(void) { return &k_head_moe_raw_table; }
 }

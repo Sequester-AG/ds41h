@@ -60,10 +60,10 @@ def deep_gemm_include() -> Path:
     return inc
 
 
-def _load(name: str, src: str, flags: list[str], inc: list[str]):
+def _load(name: str, src: str, flags: list[str], inc: list[str], root: Path | None = None):
     from torch.utils.cpp_extension import load
 
-    d = BUILD / name
+    d = (root or BUILD) / name
     d.mkdir(parents=True, exist_ok=True)
     return load(name=name, sources=[str(HERE / src)], extra_cflags=["-O3", "-std=c++20"], extra_cuda_cflags=flags,
                 extra_include_paths=inc, build_directory=str(d), verbose=bool(os.environ.get("IDX2F_VERBOSE")))
@@ -82,6 +82,23 @@ def ext_sel():
 @functools.cache
 def ext_topk():
     return _load("idx2f_topk", "idx2f_topk.cu", DS_FLAGS, [str(HERE)])
+
+
+# IDX2F_TOPK4=<tpb>: exact_topk's non-fused path on idx2f_topk4.cu = the same exact
+# top-K as idx2f_topk.cu in tpb-thread CTAs with dynamic shared memory (several rows per SM).
+# 2,048 prefill rows: 107 vs
+# 206 us at 8K, 176 vs 262 at 48K, ~equal at 64K (tpb 256). Calls of >= IDX2F_TOPK4_MINR rows only (default 384: above the
+# served decode buckets 4 .. 320 rows per rank, so the captured decode graphs keep the 1,024-thread kernel); rows too wide
+# for its shared memory fall back to idx2f_topk. Prebuild: ext_topk4().
+TOPK4 = int(os.environ.get("IDX2F_TOPK4", "0") or 0)
+assert TOPK4 in (0, 256, 512, 1024), f"IDX2F_TOPK4 must be 0 (off), 256, 512 or 1024 (CTA threads), got {TOPK4}"
+TOPK4_MINR = int(os.environ.get("IDX2F_TOPK4_MINR", "384"))   # > the largest decode bucket (320 rows per rank): decode
+                                                              # (captured T graphs) stays on idx2f_topk
+
+
+@functools.cache
+def ext_topk4():
+    return _load("idx2f_topk4", "idx2f_topk4.cu", DS_FLAGS, [str(HERE)])
 
 
 @functools.cache
@@ -138,6 +155,35 @@ def pf_groups(seq_pr: list[tuple[int, int]]) -> list[int]:
     if seq_pr:
         gs.append(seq_pr[-1][1])
     return gs
+
+
+@functools.cache
+def ext_fcand8m():
+    """Lever (a), the HBM index-key mirror: idx2f_fcand8 + a mirror view kvm; block-table entries with
+    bit 27 (MIRROR_BIT) read mirror slot (entry & ~MIRROR_BIT). Generated from the frozen idx2f_fcand8.cu (gen_mirror.py)."""
+    return _load("idx2f_fcand8m", "idx2f_fcand8m.cu", DG_FLAGS, [str(deep_gemm_include())], MIRROR_BUILD)
+
+
+@functools.cache
+def ext_fcandm():
+    """Lever (a): idx2f_fcand (fused block maxima) + the mirror view, as ext_fcand8m."""
+    return _load("idx2f_fcandm", "idx2f_fcandm.cu", DG_FLAGS, [str(deep_gemm_include())], MIRROR_BUILD)
+
+
+@functools.cache
+def ext_mirror():
+    """Lever (a): the mirror's per-step refresh in the decode graph (idx2f_mirror.cu)."""
+    return _load("idx2f_mirror", "idx2f_mirror.cu", DS_FLAGS, [], MIRROR_BUILD)
+
+
+# (lever (a)) the mirror extensions' build root (tests: a private one; default: idx2f's)
+MIRROR_BUILD = Path(os.environ.get("IDX2F_MIRROR_BUILD", str(BUILD)))
+MIRROR_BIT = 1 << 27   # (lever (a)) block-table entries of CompactK.kvm users: slot | MIRROR_BIT = mirror slot, else pool page
+
+
+def _ext_logits_m():
+    assert LOGITS == "f8", f"lever (a) mirror: IDX2F_LOGITS=f8 only (fcand8m), not {LOGITS}"
+    return ext_fcand8m()
 
 
 @functools.cache
@@ -218,6 +264,7 @@ class CompactK:
     kv: torch.Tensor
     block_table: torch.Tensor  # [B_r, P] int32
     block_size: int
+    kvm: torch.Tensor | None = None   # lever (a): the HBM index-key mirror view (block-table entries | MIRROR_BIT read it)
 
 
 def compact_pages(pages: torch.Tensor, ids: torch.Tensor, block_table: torch.Tensor, reqs: list[int], bs: int,
@@ -241,6 +288,7 @@ def dg_logits(q: torch.Tensor, ck: CompactK, weights: torch.Tensor, seq_lens: to
     """DeepGEMM paged MQA logits on owned rows: q [B, 4, 32, 128] fp8, weights [B*4, 32] fp32, seq_lens [B, 4] int32."""
     from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits, get_paged_mqa_logits_metadata
 
+    assert ck.kvm is None, "lever (a) mirror: DeepGEMM logits have no mirror variant (use logits_impl idx2f)"
     if sched is None:
         sms = torch.cuda.get_device_properties(q.device).multi_processor_count
         sched = get_paged_mqa_logits_metadata(seq_lens, ck.block_size, sms)
@@ -256,6 +304,12 @@ def dense_logits(q: torch.Tensor, ck: CompactK, weights: torch.Tensor, seq_lens:
     rows = q.shape[0] * q.shape[1]
     if out is None:                                    # out: [rows, >= width] fp32, rows 16-B aligned (a workspace view)
         out = torch.empty((rows, max(int(width), 256)), dtype=torch.float32, device=q.device)
+    if ck.kvm is not None:   # lever (a): the mirror variants (same arithmetic; mirrored pages from HBM)
+        if bm is not None:
+            ext_fcandm().logits_dense(q, ck.kv, ck.kvm, weights, seq_lens.reshape(-1), ck.block_table, out, bm)
+        else:
+            _ext_logits_m().logits_dense(q, ck.kv, ck.kvm, weights, seq_lens.reshape(-1), ck.block_table, out)
+        return out
     if bm is not None:   # fused block maxima (= block_max(out, lens, bm, max_len), bit for bit)
         ext_fcand().logits_dense(q, ck.kv, weights, seq_lens.reshape(-1), ck.block_table, out, bm)
     else:
@@ -350,6 +404,9 @@ def exact_topk(logits: torch.Tensor, lens: torch.Tensor, bmax: torch.Tensor, out
         ext_ftopk().topk(logits, lens, bmax, TOPK, out, cblk, slow, stop, glob.gout, glob.glen, glob.t2r, glob.bt,
                          int(glob.bs), glob.valid)
         return
+    if TOPK4 and not stop and logits.shape[0] >= TOPK4_MINR and ext_topk4().smem_bytes(TOPK4, bmax.shape[1]) <= 232448:
+        ext_topk4().topk4(logits, lens, bmax, TOPK, out, cblk, slow, TOPK4, 0)   # IDX2F_TOPK4 (bitwise, smaller CTAs)
+        return
     ext_topk().topk(logits, lens, bmax, TOPK, out, cblk, slow, stop)
 
 
@@ -426,6 +483,15 @@ def cand_logits(q: torch.Tensor, ck: CompactK, weights: torch.Tensor, seq_lens: 
                 out: torch.Tensor, bm: torch.Tensor | None = None) -> None:
     """bm: fused block maxima of the compact rows (= block_max(out, p.clen, bm, 16384), bit for bit)."""
     B = q.shape[0]
+    if ck.kvm is not None:   # lever (a): the mirror variants
+        assert B <= MAX_CALL_B, "lever (a) mirror: one call (<= 1,024 pseudo-requests; decode buckets)"
+        if bm is not None:
+            ext_fcandm().logits(q, ck.kv, ck.kvm, weights, seq_lens.reshape(-1), ck.block_table, p.ublk, p.uslot, p.nunion,
+                                out, p.upk, bm)
+        else:
+            _ext_logits_m().logits(q, ck.kv, ck.kvm, weights, seq_lens.reshape(-1), ck.block_table, p.ublk, p.uslot,
+                                   p.nunion, out, p.upk)
+        return
     if B <= MAX_CALL_B:
         if bm is not None:
             ext_fcand().logits(q, ck.kv, weights, seq_lens.reshape(-1), ck.block_table, p.ublk, p.uslot, p.nunion, out,
@@ -839,7 +905,7 @@ class OwnedIndexer:
                 if single:
                     self.prep = p
             comp = ws.logits(r1 - r0, CAND_K * CAND_BLOCK)
-            cand_logits(x.q[b0:b1], CompactK(k20.kv, bt, k20.block_size), x.weights[r0:r1], sl, p, comp)
+            cand_logits(x.q[b0:b1], CompactK(k20.kv, bt, k20.block_size, k20.kvm), x.weights[r0:r1], sl, p, comp)
             if self.mode == "fast":
                 bm = ws.bm(r1 - r0, CAND_K)
                 block_max(comp, p.clen, bm, CAND_K * CAND_BLOCK)
@@ -859,6 +925,7 @@ class OwnedIndexer:
             self.cand_ascending = not long_rows
         if (self.dl and fast and self.ws is not None and self.bmax is None and self.dense_impl == "idx2f"
                 and self.nb_lens is not None):
+            assert ck.kvm is None, "lever (a) mirror: no dense_layer (IDX2F_DL) variant"
             ext_dl().dense_layer(x.q, ck.kv, x.weights, x.seq_lens.reshape(-1), ck.block_table, self.ws.f32,
                                  self.ws.bmax, bstep, self.width[L], self.max_len[L], TOPK, out, self.slow,
                                  self.nb_lens if L == 20 else None, self.cand if L == 20 else None, CAND_K)
@@ -867,10 +934,11 @@ class OwnedIndexer:
             b1 = min(self.B, b0 + bstep)
             r0, r1 = NEXT_N * b0, NEXT_N * b1
             sl = x.seq_lens[b0:b1]
-            sub = CompactK(ck.kv, ck.block_table[b0:b1], ck.block_size)
+            sub = CompactK(ck.kv, ck.block_table[b0:b1], ck.block_size, ck.kvm)
             gst = (self._pf_gstart(b0, b1) if self.dense_impl == "idx2f" and self.pf and self.pf_groups is not None
                    and self.ws is not None else None)
             if gst is not None:   # (slices whose groups average < 2 pseudo-requests keep the default kernel: _pf_gstart None)
+                assert ck.kvm is None, "lever (a) mirror: no prefill-logits variant"
                 lg = self.ws.logits(r1 - r0, self.width[L])
                 ext_pf().logits_prefill(x.q[b0:b1], ck.kv, x.weights[r0:r1], sl.reshape(-1), ck.block_table[b0:b1],
                                         gst, lg, 0)

@@ -248,10 +248,9 @@ SMALL_T = int(os.environ.get("DS41H_MOE_SMALL_T", "512"))  # default since the p
 # small16k (moe_prefill.cu moe_small16k_kernel): the same per-element math as 0x500 (bit-identical:
 # tests/test_moe.py test_small16k_bit_identical_to_0x500 + side-stream stress; in situ deterministic-prefill rows identical, k64)
 # with 4 K blocks per pipeline stage (0x2500: 128-byte swizzled weight boxes) or 32-token units (0x3500: hot experts expand their
-# weights once per 32 routed rows). In situ (k64, 350 W, k=7, NVMe deployment line): c16 decode 2,585 -> 2,799 tok/s with 0x2500
-# (0x3500 2,707), c64 5,019 -> 5,779 with 0x3500 (0x2500 5,372). "auto" = 0x2500 up to SMALL_AUTO_T tokens per call, 0x3500
-# above: DEFAULT (k64b, same line: c16 2,650 -> 2,840, c32 3,881 -> 4,208 (0x3500 at c32: 4,199),
-# c64 5,087 -> 5,640; PP c16 +0.5 %). DS41H_MOE_SMALL_VARIANT=<int> / ctl moe_small_v pins one variant ("0x500" = the old default).
+# weights once per 32 routed rows).
+# "auto" = 0x2500 up to SMALL_AUTO_T tokens per call, 0x3500
+# above: DEFAULT. DS41H_MOE_SMALL_VARIANT=<int> / ctl moe_small_v pins one variant ("0x500" = the old default).
 _SV = os.environ.get("DS41H_MOE_SMALL_VARIANT", "auto").strip().lower()
 SMALL_AUTO = _SV == "auto"
 SMALL_VARIANT = 0x2500 if SMALL_AUTO else int(_SV, 0)
@@ -486,6 +485,12 @@ def _method_cls():
             layer.num_experts = num_experts
             weight_loader = extra_weight_attrs.pop("weight_loader")
             scale_loader = Mxfp4MoEMethod.get_scale_weight_loader(weight_loader)  # e8m0fnu -> uint8 view
+            from ds41h import bulk_experts
+
+            if bulk_experts.enabled():  # filled in bulk from the checkpoint in process_weights_after_loading
+                weight_loader, scale_loader = bulk_experts.noop_loader(weight_loader), bulk_experts.noop_loader(scale_loader)
+                bulk_experts.install_iterator_filter()
+                self.ds41h_bulk = True
             i2 = 2 * intermediate_size_per_partition
 
             def param(name, shape, loader, block_scale=False):
@@ -511,6 +516,12 @@ def _method_cls():
                 raise NotImplementedError(f"ds41h raw MXFP4 MoE: activation {act} (expected silu)")
             if getattr(layer, "apply_router_weight_on_input", False):
                 raise NotImplementedError("ds41h raw MXFP4 MoE: apply_router_weight_on_input")
+            from ds41h import bulk_experts
+
+            if getattr(self, "ds41h_bulk", False):
+                bulk_experts.fill(layer)
+            if bulk_experts.checksum_dir():
+                bulk_experts.checksum(layer)
             for name in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale"):
                 p = getattr(layer, name)
                 if not p.data.is_contiguous():

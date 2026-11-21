@@ -19,13 +19,7 @@
 //     page-segregated data | scales; models/deepseek_v41/common/ops/cache_utils.py:37-48, :83-180);
 //   * q is produced as contiguous [M, 16, 512] bf16 with RoPE (no 16 -> 64 head padding).
 //
-// Phase graph (counters in scratch; every CTA is resident, so spin-waits cannot deadlock):
-//   P1  (G2 warps, before G2 loads wq_b; fn lines L2-prefetched before the PDL wait): per (32-column slice,
-//       token) P1a: residual_out = post*x + comb^T residual (bf16), collapse with the INCOMING pre_mix (bf16)
-//       and its square sum -> xcb / xsq                                          -> C_P1A (per G2 CTA)
-//       then (the CTA's wq_b slice is L2-prefetched) P1b: partial 24 mixes + sum(new_r^2) over the fp32
-//       stream -> mixp                                                            -> C_P1B (per G2 CTA)
-//   G1  (112 CTAs = 14 groups of 8 tiles x 8 k-parts of 640): wq_a|wkv weights prefetched at launch; after
+// after
 //       C_P1A (early mode) or C_P1B each CTA builds its 640-column slice of a = RMSNorm(collapse) (attn_norm)
 //       itself, runs its k-part, the last of the 8 k-part warps of a tile reduces (fixed order), rounds to
 //       bf16 (stock GEMM output) and publishes qkv + per-tile square sums.            -> C_P3Q / C_P3K
@@ -33,11 +27,6 @@
 //       itself, runs the 8192 x 1280 GEMM slice, reduces the halves in smem, applies q RoPE.
 //   H   (2 CTAs): Sinkhorn of the attention mHC mixes (after C_P1B) and kv_norm + RoPE + FP8 V4-record
 //       insert (after C_P3K).
-// Stock mhc_shifted_post_pre (models/deepseek_v41/nvidia/ops/mhc.py:191, model.py:565-599) collapses this
-// attention input with the PREVIOUS sublayer's pre (pre_mix argument) and only hands this sublayer's
-// Sinkhorn outputs (post, comb, attn_pre) to the FFN boundary, so nothing in G1/G2 depends on P1b or the
-// Sinkhorn: with `early` G1 starts as soon as the collapse is published and the Sinkhorn chain (fn GEMV ->
-// mix reduction -> 20 iterations) runs concurrently with both GEMMs.
 //
 // Switches (Params, from ds41h/prologue.py; defaults keep the Phase-1 behaviour):
 //   MMA template (DS41H_PROLOGUE_MMA=hmma|wgmma): G1/G2 MMA flavour, see skinny.cu.
@@ -129,8 +118,6 @@ constexpr long OFF_QKV = OFF_QKP + long(QKV_TILES) * KSPLIT1 * 16 * MAXM * 4;  /
 constexpr long OFF_QSQ = OFF_QKV + long(MAXM) * QKV * 2;                 // [QKV_TILES][MAXM] f32
 constexpr long OFF_QRB = (OFF_QSQ + long(QKV_TILES) * MAXM * 4 + 255) / 256 * 256;  // [KB2][WG_KB_PITCH] e4m3 qr B tile
 constexpr long OFF_QRS = (OFF_QRB + long(KB2) * WG_KB_PITCH + 255) / 256 * 256;     // [KB2][MAXM] f32 qr block scales
-// FAST_V3_ADEFER (wgmma): the P1a jobs quantize u = bf16(collapse * attn_norm_w) per (token, k32 block) straight into an
-// e4m3 B tile of the whole 5120-wide activation (attn_norm's rsqrt deferred to the wq_a|wkv finisher).
 constexpr long OFF_QAB = (OFF_QRS + long(KB2) * MAXM * 4 + 255) / 256 * 256;   // [KB1][WG_KB_PITCH] e4m3
 constexpr long OFF_QAS = (OFF_QAB + long(KB1) * WG_KB_PITCH + 255) / 256 * 256;  // [KB1][MAXM] f32 block scales
 // Params::idx (indexer projections, see v3_idx_w): weights_proj partial sums [k-part][32 rows][MAXM] f32
@@ -239,14 +226,11 @@ struct Params {
   unsigned long long* qsqll; // scratch OFF_QSQLL
   unsigned long long* xll;   // scratch OFF_XLL
   unsigned long long* xsqll; // scratch OFF_XSQLL
-  int ll;                    // DS41H_PROLOGUE_LL (opt-in bits): 1 = the G1 -> G2 q hop as LL words + relaxed hint (see v3_g2),
-                             // 2 = the P1a -> G1 hop (xcb / xsq) likewise (see p1_collapse / v3_g1)
+  int ll;
   int cvt;                  // DS41H_PROLOGUE_CVT=1 (opt-in): v3 G1 / G2 activation staging with convert_act_batched
   int mma2;                 // DS41H_PROLOGUE_MMA2=1 (opt-in): v3 HMMA MMA phases with 2 tiles per warp sharing one activation
                             // fragment (warps 0-3 compute, 4-7 idle): half the activation LDS, same per-tile FMA order
-  int probe;                // DS41H_PROLOGUE_PROBE (bench-only timing probes, NOT synchronization-correct; default 0):
-                            // 1: G1 finisher q/kv tile signals relaxed (no release), 2: P1a signals relaxed;
-                            // 4 (correctness-safe test probe): DS41H_PROLOGUE_LL hint issued before the LL words;
+  int probe;                // 4 (correctness-safe test probe): DS41H_PROLOGUE_LL hint issued before the LL words;
                             // 8: no end-of-kernel C_FIN arrival / counter reset (bench zeroes the counters between launches)
   int aflag;                // 1: signal C_AQ for the flag-mode attention (q rows of each G2 CTA, each token's KV insert)
   float rms_eps, hc_eps, norm_eps, qkv_eps, post_mult;
@@ -492,8 +476,8 @@ __device__ __forceinline__ float mix_reduce(const float* mixp, int tok, int lane
   return part == 0 ? a0 : part == 1 ? a1 : part == 2 ? a2 : a3;
 }
 
-// ---------------------------------------------------------------- P1a: mHC post + collapse, one (slice, token)
-// Returns the fp32 post-mapped stream values of this column (the mixes of P1b read them).
+// mHC post + collapse, one (slice, token)
+// Returns the fp32 post-mapped stream values of this column.
 // MODE 0: residual output + xcb / xsq scratch; MODE 2 (v3: the G1 CTAs compute the collapse and the residual
 // output themselves): only nr (the fp32 stream values the mixes need).
 template <int MODE = 0>
@@ -562,7 +546,7 @@ __device__ __forceinline__ void p1_collapse(const Params& p, int s, int tok, int
   if (lane == 0) __stcg(p.xsq + tok * SLICES + s, xs);
 }
 
-// ---------------------------------------------------------------- P1b: partial mixes, one (slice, token)
+// partial mixes, one (slice, token)
 // FS == false: hc_attn_fn straight from global memory (96 LDG.32 per lane). FS == true: from the CTA's shared copy
 // fs = f32 [MIX][HC][32] of this slice (p1_stage_fn, cp.async), 96 LDS.32 per lane: the jobs of the m tokens of a
 // slice share one 12 KB copy instead of each pulling it from L2. Same values, same FMA order: bit-identical.
@@ -644,7 +628,6 @@ __device__ __forceinline__ P1Job p1_job(const Params& p, int wid) {
   }
   return j;
 }
-// Before the PDL wait (weights only): pull the hc_attn_fn lines the CTA's P1b jobs will read into L2.
 __device__ __forceinline__ void p1_prefetch_fn(const Params& p, int c, int tid) {
   const int ntg = (p.m + p.tpj - 1) / p.tpj, w0 = c * WARPS;
   if (w0 >= SLICES * ntg) return;
@@ -673,7 +656,7 @@ constexpr int fn_stage_max() {  // slices whose fn fits the CTA's shared memory 
   return (MMA == MMA_WGMMA ? SMEM_BYTES_WG : SMEM_BYTES) / FN_SLICE_BYTES;
 }
 // Before the PDL wait (weights only): cp.async the CTA's fn slices into shared memory as f32 [ns][MIX][HC][32] (the
-// 128-byte rows of hc_attn_fn); asynchronous, waited for (cp_async_wait_all + barrier) before P1b reads it.
+// 128-byte rows of hc_attn_fn)
 __device__ __forceinline__ void p1_stage_fn(const Params& p, float* fs, const P1Range& r, int tid) {
   for (int i = tid; i < r.ns * MIX * HC * 8; i += THREADS) {  // 16-byte chunk i = ((si * MIX + q) * HC + j) * 8 + c8
     const int c8 = i & 7, j = (i >> 3) & 3, qs = i >> 5, q = qs % MIX, si = qs / MIX;
@@ -681,27 +664,23 @@ __device__ __forceinline__ void p1_stage_fn(const Params& p, float* fs, const P1
   }
   cp_async_commit();
 }
-// All warps of G2 CTA c: P1a for the CTA's jobs -> C_P1A, then P1b -> C_P1B (one release per CTA).
-// fs: the staged fn slices (p1_stage_fn) or nullptr (P1b reads global memory).
+// fs: the staged fn slices (p1_stage_fn) or nullptr.
 __device__ __forceinline__ void p1_cta(const Params& p, const float* fs, int c, int tid, int warp, int lane) {
   const P1Job j = p1_job(p, c * WARPS + warp);
   float nr[2][HC];
 #pragma unroll
   for (int t = 0; t < 2; ++t)
     if (j.tok0 + t < j.tok1) p1_collapse(p, j.s, j.tok0 + t, lane, nr[t]);
-  PROF_T0(9);  // G2: thread 0's P1a job issued
+  PROF_T0(9);
   if (fs != nullptr) cp_async_wait_all();  // the staged fn slices (p1_stage_fn) are complete after the barrier
   __syncthreads();
-  PROF_T0(10);  // G2: all P1a jobs of the CTA issued
+  PROF_T0(10);
   if (tid == 0) {
     if (!(p.fast & FAST_LIGHT_SYNC)) __threadfence();
-    PROF_AT(11);  // G2: P1a fence done
+    PROF_AT(11);
     red_release(p.pc + C_P1A, 1u);
   }
-  PROF_T0(2);  // G2: P1a published
-  // The CTA's 80 KB wq_b slice (4 consecutive tiles, contiguous) + scales start streaming into L2 now, so
-  // the register loads after P1b hit L2 instead of starting the HBM stream late (FAST_PREFETCH: already
-  // requested at kernel entry).
+  PROF_T0(2);
   if (!(p.fast & FAST_PREFETCH)) prefetch_wqb(p, c, tid);
   if (fs != nullptr) {  // CTA-uniform
     const float* f = fs + (j.s - p1_range(p, c).s0) * (FN_SLICE_BYTES / 4);
@@ -714,7 +693,7 @@ __device__ __forceinline__ void p1_cta(const Params& p, const float* fs, int c, 
       if (j.tok0 + t < j.tok1) p1_mixes<false>(p, nullptr, j.s, j.tok0 + t, lane, nr[t]);
   }
   cta_signal(p.pc + C_P1B, p.fast & FAST_LIGHT_SYNC);
-  PROF_T0(3);  // G2: P1b published
+  PROF_T0(3);
 }
 
 // ---------------------------------------------------------------- H: Sinkhorn of the attention mixes (one warp per token)
@@ -1283,8 +1262,7 @@ __device__ __forceinline__ void qr_local(const Params& p, uint8_t* sm, uint8_t* 
 // The grid runs in clusters of 8 (the 8 k-part CTAs of a G1 tile group are one cluster). After the MMA the tile
 // partials are reduced through DSMEM (CTA r finishes tile grp*8 + r, k-parts summed 0..7 like g1_finish_tile): the
 // tile counter atomic + partial reload round trips become a cluster barrier.
-// FAST_OWN_COLLAPSE (with FAST_CLUSTER): each G1 CTA also computes the collapse of its own 640 columns (same arithmetic
-// as p1_collapse, no wait for P1a) and gets the attn_norm sum of squares from its 7 peers through DSMEM in the order
+// FAST_OWN_COLLAPSE (with FAST_CLUSTER): each G1 CTA also computes the collapse of its own 640 columns and gets the attn_norm sum of squares from its 7 peers through DSMEM in the order
 // of the global path (bit-identical rs). Measured slower (the 14 groups redo the collapse: ~6 us at m = 6).
 __device__ __forceinline__ unsigned cl_rank() {
   unsigned r;
@@ -1535,7 +1513,7 @@ __device__ __forceinline__ void role_g1(const Params& p, uint8_t* sm, int b, int
   for (int i = tid; i < V8; i += THREADS) cp_async16(w + i * 8, p.attn_norm + col0 + i * 8);
   cp_async_commit();
   if (own) {
-    g1_collapse(p, sm, col0, tid, warp, lane);  // own slice: no wait for P1a
+    g1_collapse(p, sm, col0, tid, warp, lane);
     {
       constexpr int H1 = KW_MAX / 2;
       const uint8_t* base = p.wqa + ((long(tile) * KB1 + kp * KW_MAX) * 32 + lane) * 16;
@@ -1549,7 +1527,6 @@ __device__ __forceinline__ void role_g1(const Params& p, uint8_t* sm, int b, int
     g1_cluster_rs(p, sm, warp, lane);
     PROF_T0(3);  // G1: rs known
   } else {
-    // The collapse uses the incoming pre_mix, so (early mode) only P1a has to be complete.
     cta_wait(p.pc + ((p.fast & FAST_EARLY) ? C_P1A : C_P1B), unsigned(G2_CTAS), p.fast & FAST_LIGHT_SYNC);
     PROF_T0(2);  // G1: collapse published
     for (int v = tid; v < m * V8; v += THREADS) {
@@ -1675,7 +1652,7 @@ __device__ __forceinline__ void role_g2(const Params& p, uint8_t* sm, int c, int
   const int half = MMA == MMA_WGMMA ? __shfl_sync(FULL, warp >> 2, 0) : (warp & 1);  // (uniform: see skinny.cu)
   const int tile = c * G2_TILES + tl, m = p.m;
   Frag f;
-  load_frag(f, p.wqb, p.wqb_s, tile, KB2, KB2, half * KW_MAX, KW_MAX, lane);  // after P1 (L2-prefetched during P1b)
+  load_frag(f, p.wqb, p.wqb_s, tile, KB2, KB2, half * KW_MAX, KW_MAX, lane);  // after P1
   float* red = reinterpret_cast<float*>(sm + SM_RED);
   float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   if constexpr (MMA == MMA_HMMA) {
@@ -1832,13 +1809,9 @@ __device__ __forceinline__ void role_h(const Params& p, uint8_t* sm, int h, int 
 //   * weights go to shared memory by one bulk copy per tile (cp.async.bulk + mbarrier, L2::evict_first) issued at
 //     entry, so no thread holds weight registers and the latency-critical activation loads are not queued behind
 //     the per-SM weight stream (LSU loads vs. the copy engine);
-//   * G1 computes the collapse of its own 640 columns (x / residual are L2-hot in decode) instead of waiting for the
-//     P1a hop, gets the exact attn_norm statistics from its 7 cluster peers through DSMEM, and reduces its k-parts
-//     through DSMEM (no tile counter / partial reload hop);
 //   * wgmma: q_norm deferred to the wq_b epilogue (FAST_QR_DEFER semantics, the G1 pair finishers write the e4m3 qr
 //     B tile), so the qr_build hop is gone too. HMMA keeps stock rounding (bit-identical to fast=0).
-//   * G1 never waits on G2 (G2 waits for the q tiles; the H jobs wait for P1b / kv tiles only after their own tile
-//     work), so the grid cannot deadlock even when not every cluster is co-resident.
+//   * G1 never waits on G2, so the grid cannot deadlock even when not every cluster is co-resident.
 // MMA loops read the A fragments from shared memory (HMMA: rolled by 4, wgmma: one LDS.128 per block just before its
 // wgmma), which keeps the hot code small (cold instruction fetch after the decoder layer kernel flushed the L2).
 constexpr int V3_WBYTES = KW_MAX * CHUNK * WARPS;  // 81920: G1 = 8 tiles x 20 blocks, G2 = 4 tiles x 40 blocks
@@ -1919,7 +1892,7 @@ struct WStream {
   unsigned long long* bars;
   unsigned long long pol;
   int issued, done;
-  const unsigned* gate;  // optional: once *gate >= G2_CTAS (the P1a hop is complete everywhere) the window opens fully
+  const unsigned* gate;  // optional: once *gate >= G2_CTAS the window opens fully
   int window;            // chunks in flight (FAST_V3_PACE: V3_PACE_WINDOW, FAST_V3_PACE1: 1)
   __device__ __forceinline__ void init() {
     for (int c = 0; c < V3_NCH; ++c) mbar_init(bars + c, 1);
@@ -2366,9 +2339,8 @@ __device__ __forceinline__ void v3_g1(Params& p, uint8_t* sm, int b, int tid, in
   const int kp = b % KSPLIT1, grp = b / KSPLIT1, tile = grp * WARPS + warp, m = p.m, col0 = kp * KPART1;
   uint8_t* ra = sm + V3_A;
   unsigned long long* wbar = reinterpret_cast<unsigned long long*>(sm + V3_BAR);
-  // Weight stream (chunk t = tile grp*8 + t, k-part kp). FAST_V3_W1_LATE (with FAST_V3_HOP): it starts only once the
-  // P1a hop is seen and this CTA's critical copies are queued, so the latency-critical loads of the CTAs sharing this
-  // SM are not queued behind it; else at entry (immutable: before the PDL wait), all at once or paced (FAST_V3_PACE).
+  // Weight stream (chunk t = tile grp*8 + t, k-part kp).
+  // else at entry (immutable: before the PDL wait), all at once or paced (FAST_V3_PACE).
   const bool pace = p.fast & FAST_V3_PACE;
   WStream ws{sm, p.wqa + (long(grp * WARPS) * KB1 + kp * KW_MAX) * CHUNK, long(KB1) * CHUNK, wbar, 0ull, 0, 0, nullptr,
              (p.fast & FAST_V3_PACE1) ? 1 : V3_PACE_WINDOW};
@@ -2422,7 +2394,7 @@ __device__ __forceinline__ void v3_g1(Params& p, uint8_t* sm, int b, int tid, in
   cp_async_commit();
   const bool adefer = MMA == MMA_WGMMA && (p.fast & FAST_V3_ADEFER);
   if (adefer) {
-    // the P1a jobs published the e4m3 B tile of u = bf16(collapse * attn_norm_w) + the collapse slice sums: copy this
+    // copy this
     // k-part's 20 blocks (5.4 KB) and all sums; attn_norm's rsqrt is applied by the finisher (no staging at all)
     uint8_t* bt = ra + V1_BT;
     float* sx = reinterpret_cast<float*>(ra + V1_SX);
@@ -2452,7 +2424,7 @@ __device__ __forceinline__ void v3_g1(Params& p, uint8_t* sm, int b, int tid, in
       if (lane == 0) rs[warp] = rsqrtf(__fdiv_rn(s, float(HID)) + p.norm_eps);
     }
   } else if (p.fast & FAST_V3_HOP) {
-    // collapse published by the G2 P1a jobs (no redundant collapse math): its 640-column slice + all slice sums
+    // its 640-column slice + all slice sums
     float* xsq = reinterpret_cast<float*>(ra + V1_BT);  // [MAXM][SLICES] f32; the B tile is written after rs
     const unsigned llx = (MMA == MMA_HMMA && (p.ll & 2) && !(p.fast & FAST_V3_EXT_P1A)) ? epoch1 : 0u;
     if (llx != 0u) {  // DS41H_PROLOGUE_LL & 2: relaxed hint, then the LL words (flags validated)
@@ -2617,9 +2589,7 @@ __device__ __forceinline__ void v3_g1(Params& p, uint8_t* sm, int b, int tid, in
   cl_wait_acquire();
 }
 
-// v3 P1 on G2 CTA c (right after the PDL wait; nothing in G1 depends on it unless FAST_V3_HOP): its (slice, token)
-// jobs: FAST_V3_HOP: the full P1a (residual output + collapse -> xcb / xsq, C_P1A), else only the fp32 stream values
-// (the G1 CTAs compute the collapse and group 0 writes the residual output); then the partial mixes -> C_P1B.
+// then the partial mixes -> C_P1B.
 // FAST_V3_EXT_P1A (with HOP, experimental): the residual output and xcb / xsq were produced by the PREVIOUS grid (target:
 // the decoder layer kernel's AR #2 epilogue, see notes "PROPOSAL"; bench: an earlier launch on the same inputs), so the G2
 // jobs only recompute the fp32 stream for the mixes and G1 reads xcb / xsq right after its PDL wait (no C_P1A hop).
@@ -2651,12 +2621,12 @@ __device__ __forceinline__ void p1_v3_g2(const Params& p, int c, int warp, int l
     }
   }
   after_p1a();
-  PROF_T0(9);  // G2: P1a done
+  PROF_T0(9);
 #pragma unroll
   for (int t = 0; t < 2; ++t)
     if (j.tok0 + t < j.tok1) p1_mixes<false>(p, nullptr, j.s, j.tok0 + t, lane, nr[t]);
   cta_signal(p.pc + C_P1B, true);
-  PROF_T0(2);  // G2: P1b published
+  PROF_T0(2);
 }
 
 // DS41H_PROLOGUE_LL consumer (G2, HMMA): the m qkv q rows as LL words (g1_push_finish) -> act rows (bf16, the layout the
@@ -2744,10 +2714,7 @@ __device__ __forceinline__ void v3_g2(Params& p, uint8_t* sm, int c, int tid, in
   const bool late_w = p.fast & FAST_V3_LATE_W2;
   // weight stream: chunk ch = tile-half (tl, half) at (tl * 2 + half) * 10 KB (the CTA's 80 KB are contiguous)
   const bool pace = p.fast & FAST_V3_PACE;
-  // (no gate: opening the G2 window when the P1a hop completes floods the SMs while the G1 CTAs are on their critical
-  // copies / MMA -- measured 1-2 us slower)
-  // FAST_V3_W2_WIN4 (experimental): window 4 instead of 2; FAST_V3_W2_OPEN (experimental): the whole rest of the stream is
-  // issued once this CTA's P1b is published (G1's weights have landed by then: G1 W ready ~6.9 us vs P1b ~5.4-6.7 us)
+  // FAST_V3_W2_WIN4 (experimental): window 4 instead of 2
   WStream ws{sm, p.wqb + long(c) * G2_TILES * KB2 * CHUNK, long(V3_CH), wbar, 0ull, 0, 0, nullptr,
              (p.fast & FAST_V3_PACE1) ? 1 : ((p.fast & FAST_V3_W2_WIN4) ? 4 : V3_PACE_WINDOW)};
   const int wchunk = tl * 2 + half;
@@ -2760,8 +2727,6 @@ __device__ __forceinline__ void v3_g2(Params& p, uint8_t* sm, int c, int tid, in
         ws.all();
     }
   };
-  // FAST_V3_L2PF: the wq_b slice goes HBM -> L2 after this CTA's P1a (G1's wq_a|wkv stream has the HBM to itself until
-  // then) and L2 -> smem after its P1b, long before the q tiles arrive
   const bool l2pf = p.fast & FAST_V3_L2PF;
   if (!late_w && !l2pf) issue_weights();  // weights are immutable: before the PDL wait
   const unsigned sword = lane * 4 < KW_MAX ? ld_stream4(p.wqb_s + long(tile) * KB2 + half * KW_MAX + lane * 4) : 0u;
@@ -2781,7 +2746,7 @@ __device__ __forceinline__ void v3_g2(Params& p, uint8_t* sm, int c, int tid, in
         ws.prefetch_all();
       }
     } else if (late_w) {
-      issue_weights();  // FAST_V3_LATE_W2: after this CTA's P1a jobs, before the mixes
+      issue_weights();
     } else if (pace && tid == 0) {
       ws.step();
     }
@@ -2796,7 +2761,7 @@ __device__ __forceinline__ void v3_g2(Params& p, uint8_t* sm, int c, int tid, in
   }
   // FAST_V3_SK_G2: the Sinkhorn of token t runs on the last warp of G2 CTA G2_CTAS - 1 - t, a CTA without P1 jobs for every
   // m <= 8 (P1 jobs fill CTAs 0 .. 160 m / 8 - 1 for m <= 6, 0 .. 79 for m = 7, 8). It starts as soon as all mixes are
-  // published (~P1b) instead of after a G1 CTA's tile work and normally ends before the q tiles arrive; meanwhile warp 0
+  // published instead of after a G1 CTA's tile work and normally ends before the q tiles arrive; meanwhile warp 0
   // (thread 0 drives the paced weight stream) waits for the q tiles. Without the bit G1 CTA V3_H0_G1 hosts it.
   if ((p.fast & FAST_V3_SK_G2) && !(p.fast & FAST_V3_SK_G1) && warp == WARPS - 1 && G2_CTAS - 1 - c < m) {
     warp_wait(p.pc + C_P1B, unsigned(G2_CTAS), lane, true, p.fast & FAST_V3_FENCE);
@@ -3514,7 +3479,7 @@ void launch_v3(const Params& p) {
       err = cudaLaunchKernelEx(&cfg, prologue_kernel_v3<MMA, FAST_V3_FIXED>, p);
     else if (p.fast == (FAST_V3_FIXED | FAST_V3_ACQPOLL) && !no_fixed_v3())
       err = cudaLaunchKernelEx(&cfg, prologue_kernel_v3<MMA, FAST_V3_FIXED | FAST_V3_ACQPOLL>, p);
-    else if (p.fast == (FAST_V3_FIXED | FAST_V3_EXT_P1A) && !no_fixed_v3())  // P1a done by the decoder (run_prologue p1a_done)
+    else if (p.fast == (FAST_V3_FIXED | FAST_V3_EXT_P1A) && !no_fixed_v3())
       err = cudaLaunchKernelEx(&cfg, prologue_kernel_v3<MMA, FAST_V3_FIXED | FAST_V3_EXT_P1A>, p);
     else
       err = cudaLaunchKernelEx(&cfg, prologue_kernel_v3<MMA>, p);
@@ -3732,7 +3697,7 @@ void prologue(torch::Tensor x, torch::Tensor resid, torch::Tensor post, torch::T
   }
   if (p.fast & FAST_V3) {
     p.fast |= FAST_LIGHT_SYNC;
-    if (mma != MMA_WGMMA) p.fast &= ~FAST_V3_ADEFER;  // A_DEFER: wgmma only, implies the P1a hop
+    if (mma != MMA_WGMMA) p.fast &= ~FAST_V3_ADEFER;
     if (p.fast & FAST_V3_ADEFER) p.fast |= FAST_V3_HOP;
     if (p.fast & FAST_V3_PACE1) p.fast |= FAST_V3_PACE;
     if (mma == MMA_WGMMA) p.fast |= FAST_QR_DEFER | FAST_CLUSTER;

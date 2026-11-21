@@ -1,177 +1,103 @@
-# ds41h
+# ds41h native (4x H200)
 
-High-throughput serving of [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
-on four NVIDIA H200 NVL GPUs, on top of the vLLM 0.32.0 wheel.
+Native C/C++ serving of [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) on one
+node with **4x H200** (141 GB each, x86_64, `sm_90a`). The vLLM-based ds41h stack it replaces is at tag `FPRv1`.
 
-ds41h is not a fork of vLLM. It patches vLLM's modules at import time and replaces the hot paths with custom CUDA
-kernels: decoder layers, sparse attention, routed MoE, DSpark drafting and sampling, Engram lookups and the NVLink
-all-reduce. Each component has its own flag and falls back to the stock path when it is off or a request does not
-qualify. Two small source patches to the installed wheel live in `patches/`, and the setup script applies them.
+- **Engine.** Each sequence lives on one GPU. The experts are split across the four GPUs, and long prompts are
+  prefilled across all four. The Engram n-gram tables (~190 GiB) live in host RAM, not in GPU memory.
+- **Native loop.** The scheduler, KV manager, block tables, step builders and engine loop are C++. Decode runs on CUDA
+  graphs launched by a C++ driver. A C++ frontend replaces vLLM's Python API server, including HTTP/TLS, API keys,
+  chat templates and the tool-call parsers. Its deliberate differences are listed in
+  [frontend_cxx/DEVIATIONS.md](frontend_cxx/DEVIATIONS.md).
+- **Kernels.** Custom sm_90a kernels: a persistent decoder kernel, the sparse-attention indexer, routed-expert GEMMs
+  and NVLink all-gather / reduce-scatter.
+- **Precision.** No quantization beyond the checkpoint's own formats (MXFP4 experts, FP8 dense weights).
 
-The default configuration keeps stock vLLM's precision: the checkpoint as shipped (MXFP4 experts, FP8 dense weights)
-with 16-bit activations. [docs/EXACTNESS.md](docs/EXACTNESS.md) describes how this is checked against stock vLLM.
+vLLM 0.32.0 still launches the engine process. Python remains for start-up, weight loading, and steps the native loop
+does not take, such as image steps.
 
 ## Performance
 
-Measured on 2026-11-01 at a 600 W GPU power limit, with TP4 and a 262,144-token maximum context. Thinking was off and
-every request ran to its full length. Details and caveats are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+8K prompts, 2,048 output tokens, thinking off, aggregate decode tok/s at *n* concurrent streams (Cn).
 
-| Decode, 8K-token prompt | DSpark k=3 | DSpark k=5 |
-|---|---|---|
-| 1 user | 521 tok/s | 653 tok/s |
-| 64 users, total | 6,711 tok/s | 7,490 tok/s |
-| 256 users, total over the whole run | 9,900 tok/s | 10,128 tok/s |
+### Against stock vLLM at 600 W (estimate)
 
-Prefill with k=5 reaches 42.4K tok/s at 8K tokens and 61.8K tok/s at 16K tokens.
+Stock vLLM 0.32.0 with the DSpark drafter (k=5) was measured on the same host with the GPUs power-capped at ~200 W.
+A hardware check in the same session ran GEMMs at ~1/4 and HBM reads at ~1/2 of their 600 W throughput. The 600 W
+column scales the stock run by those factors: x1.5-2 for decode (bandwidth- and latency-bound) and x2.5-3.5 for
+prefill (mostly GEMMs). ds41h native was measured at 600 W, with DSpark k=3.
 
-## FPRv1
+| | Stock, measured at ~200 W | Stock, estimated at 600 W | ds41h native, 600 W | Gain at 600 W |
+|---|---|---|---|---|
+| Decode, 1 stream | 300 tok/s | 450-600 tok/s | 622 tok/s | ~x1.0-1.4 |
+| Prefill | 11.2K tok/s | 27-38K tok/s | 52-65K tok/s | ~x1.5-2.4 |
+| KV cache | 613K tokens (vLLM's count, 36,864 max context) | same | 67.8M tokens | x35+ |
 
-FPRv1 (First Principles Rewrite v1, in [`fpr/`](fpr)) is a second engine for the same model and machine, behind the same
-vLLM API layer. Each sequence lives on one GPU, the experts are split exactly like ds41h's TP4 slices, long prompts
-are prefilled across all four GPUs, and decode can be pipelined. It serves images and the Responses API with stored
-responses.
+- **KV cache.** Stock keeps the Engram tables in GPU memory, so its KV cache is small. vLLM's start-up count
+  understates tokens held at once by up to ~3x, so x35 is the floor and x110 the raw ratio.
+- **Concurrency.** At 64 or more streams stock was not measured. Its KV cache holds roughly 60-180 streams of 10K
+  tokens, so 256 streams do not fit.
 
-**FPRv1 against ds41h production**, both measured on 2026-11-08 on the same machine (4× H200 NVL, 600 W), ds41h in its THROUGHPUT
-configuration. Decode: 8K-token prompts, thinking off, DSpark k=3, 2,048 output tokens per stream, tok/s while all
-streams run / over the whole run; FPRv1 with pipelined dispatch. Prefill: one prompt on a warm server, prompt tokens /
-time to first token. KV: tokens held at once, measured.
+### Against ds41h-on-vLLM (tag `FPRv1`, measured)
 
-| | ds41h, production of 2026-11-08 | FPRv1 | FPRv1 vs production |
+| | ds41h-on-vLLM | ds41h native | Gain |
 |---|---|---|---|
-| Decode, 1 user, tok/s | 530 / 503 | 321 / 295 | 0.61× / 0.59× |
-| Decode, 64 users, tok/s | 6,759 / 5,626 | 8,895 / 6,857 | **1.32× / 1.22×** |
-| Decode, 256 users, tok/s | 12,203 / 10,513 | 20,791 / 15,736 | **1.70× / 1.50×** |
-| Prefill 8K, K tok/s | 53.1 | 54.4 | 1.02× |
-| Prefill 16K | 62.6 | 54.4 | 0.87× |
-| Prefill 32K | 60.5 | 60.2 | 1.00× |
-| Prefill 64K | 57.3 | 63.4 | **1.11×** |
-| Prefill 128K | 56.6 | 64.3 | **1.14×** |
-| Prefill 250K | 52.3 (4.78 s) | 61.7 (4.05 s) | **1.18×** |
-| KV cache, M tokens | ~21 | 64.4 (58.8 with images on) | **~3.0×** (2.8×) |
-
-ds41h production of 2026-11-08 = the 2026-11-01 release with `DS41H_MOE_SMALL_T=1024` and a grammar-masking change that is not published yet; these benchmarks use no structured output.
-
-Design, the synchronous-mode numbers, the exactness results and the known limits are in [docs/FPR.md](docs/FPR.md).
-`scripts/serve_fpr.sh` starts it.
+| C1 | 530 | 622 | x1.17 |
+| C64 | 6,759 | 9,000-9,115 | x1.33-1.35 |
+| C128 | - | 14,325 | - |
+| C256 | 12,203 | 19,462-19,499 | x1.60 |
+| Prefill, 8K-128K prompts | 53-61K tok/s | 52-65K tok/s | x1.0-1.13 |
+| First token at 250-290K | 4.78 s (250K) | 4.71 s (290K) | - |
+| KV cache, tokens held at once | ~21M | 67.8M | x3.2 |
 
 ## Requirements
 
-- 4× H200 NVL (`sm_90a`) in one host. The kernels are compiled for this architecture and for exactly four
-  tensor-parallel ranks.
-- Linux x86-64 and an NVIDIA driver that supports CUDA 13.
-- About 480 GB of fast disk for the checkpoint, and about 25 GB for the environment.
-- Room for the Engram tables, by mode: about 210 GB on NVMe or about 195 GiB of RAM in `/dev/shm`.
-  See [docs/ENGRAM.md](docs/ENGRAM.md).
-- [uv](https://docs.astral.sh/uv/), git, patch and a C++ toolchain.
+- 4x H200 NVL or SXM in one x86_64 node, NVLink between all four. The kernels are built for exactly four GPUs.
+- CUDA 13 driver, g++ >= 13, CMake >= 3.20, [uv](https://docs.astral.sh/uv/), OpenSSL and zlib headers.
+- The checkpoint (~480 GB), plus ~195 GiB of host RAM for the Engram tables in `/dev/shm`.
 
-Tested only on one machine: 4× H200 NVL, 1 TB of RAM, driver 595.91.07, Linux 7.0 and glibc 2.43.
+## Build and run
 
-## Quick start
-
-Build the environment. This takes no GPU time and installs into `~/.ds41h` (set `DS41H_HOME` to change that):
+Building runs on the CPU only.
 
 ```bash
-bash setup/build-venv.sh
+cp deploy/h200/site.env.example deploy/h200/site.env    # edit the paths, model, TLS and key locations
+source deploy/h200/site.env
+bash setup/build-venv.sh                                # vLLM 0.32.0 + patches/
+bash deploy/h200/build_native.sh                        # frontend, xgrammar, C++ core, native decode, CUDA extensions, weight cache
+cp deploy/h200/endpoint_auth.example.yaml $DS41H_HOME/keys/endpoint_auth.yaml   # put real keys in, chmod 600
+bash deploy/h200/switch_native.sh                       # start, warm up, health check, watchdog
 ```
 
-Download the checkpoint:
-
-```bash
-~/.ds41h/venv/bin/hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --local-dir ~/.ds41h/model
-```
-
-Start the server on `127.0.0.1:8100`. The first start compiles the kernels, which takes about 10 minutes:
-
-```bash
-THROUGHPUT=1 ENGRAM=host MAXLEN=262144 MAX_SEQS=256 CAPTURE=1024 GPU_UTIL=0.91 scripts/serve_ds41h.sh
-```
-
-`CAPTURE` should be `MAX_SEQS` × (k + 1), here 256 × 4.
-
-Send a request:
-
-```bash
-curl -s http://127.0.0.1:8100/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"deepseek-v41-flash-h200","messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
-```
-
-## Configurations
-
-[scripts/serve_ds41h.sh](scripts/serve_ds41h.sh) documents every option in its header. The main ones are:
-
-| Setting | Effect |
-|---|---|
-| Default | Latency line: DSpark k=7, for few concurrent streams |
-| `THROUGHPUT=1` | Throughput line: k=3 and grouped sparse decode, for many concurrent long-context streams |
-| `SPEC_K=<n>` | Another draft length |
-| `ENGRAM=nvme`, `host` or `hbm` | Where the Engram n-gram tables live |
-| `KVRAM=auto` | Host-RAM KV cache tier, one copy shared by the four ranks |
-| `DSML_RT=1` (default) | DeepSeek API parity for tool calls, reasoning round trips and request options |
-| `EXTRA="..."` | Further `vllm serve` arguments. `--no-language-model-only` enables images |
-
-[scripts/run_endpoint.example.sh](scripts/run_endpoint.example.sh) is a template for an HTTPS endpoint with API keys.
-
-## Security
-
-Stock vLLM 0.32.0 checks the API key only on paths under `/v1`, `/v2`, `/inference` and `/cohere`. Other routes stay open
-even with keys configured, including `/invocations`, which runs the model, and `/scale_elastic_ep`.
-`patches/vllm-0.32.0-auth-all-paths.patch` requires the key on every path except `/health`. `setup/build-venv.sh` applies
-it, so check that it is in place before you expose a server. With no keys configured, every route is open.
-
-With images on, stock vLLM 0.32.0 also lets a client name an image with its own `uuid` and then uses that `uuid` as
-the image's identity in the processor cache, the encoder cache and the prefix-cache keys, which all clients share. A
-reused `uuid` therefore hands one client another client's image: a later request with a different image is answered
-about the first one, even when the two requests use different `cache_salt` values (measured on this stack).
-`patches/vllm-0.32.0-mm-content-identity.patch` makes the identity the hash of the image content, ignores client
-`uuid`s, and refuses image parts that carry a `uuid` but no data. Apply it before serving images to more than one client.
-
-## Tests
-
-The CPU tests need the checkpoint on disk:
-
-```bash
-source scripts/env.sh
-export PYTHONPATH=$PWD:$PYTHONPATH DS41H_MODEL_DIR=~/.ds41h/model
-python tests/test_ref_cpu.py
-python tests/test_fast_tokenize.py
-python tests/test_reason_count.py /tmp/reason_count.json
-```
-
-The other files in `tests/` compare each kernel with `ds41h/ref/`, a pure-torch reference built from DeepSeek's official
-inference code, or with stock vLLM. They need GPUs and the real weights, and their docstrings give the commands.
+- **Before building.** Put the frontend's third-party sources in `frontend_cxx/third_party/dl/` first: zeromq 4.3.5,
+  oniguruma 6.9.10, libjpeg-turbo 3.2.0 and simdjson 3.12.3.
+- **`run_native.sh`** starts the server over TLS with API keys. `NATIVE_PRIVATE=1` runs it on 127.0.0.1:8100 without
+  TLS for benchmarks. Wait for "warm-up done" before sending load.
+- **Rollback.** `rollback_native.sh` restarts the previous configuration. `watchdog.sh` and `mem_guard.sh` call it on
+  a fault, and `touch $DS41H_RUN/NO_FALLBACK` pauses them.
+- **Required settings.** The served configuration is `fpr/config/h200_native.env` plus `deploy/h200/native.env` (256
+  seats). It needs head-graph preload off (`ENG_*_HEAD_PRECAPTURE_PRELOAD=0`) and `PHYS_KEEP_GRAPHS=1`.
 
 ## Layout
 
 | Path | Contents |
 |---|---|
-| `ds41h/` | Import hooks (`hook.py`, `patch_*.py`), flags (`flags.py`), kernel wrappers, pure-torch reference (`ref/`) |
-| `ds41h/kernels/` | CUDA kernels, compiled on first use |
-| `plugins/` | vLLM plugins: DeepSeek API parity, host-RAM KV tier |
-| `runtime/` | `sitecustomize.py`: installs the hooks when `DS41H=1`, maps large checkpoints with `MAP_NORESERVE` |
-| `patches/` | Fixes to the installed vLLM wheel, applied by `setup/` |
-| `scripts/` | Launchers, kernel prebuild, benchmarks and profilers, exactness tools |
-| `setup/` | Pinned package versions and the environment build |
-| `docs/` | Design, exactness method, benchmarks, Engram modes, FPRv1 |
-| `fpr/` | FPRv1: engine, scheduler and KV manager, vLLM plugins, kernels, configuration ([docs/FPR.md](docs/FPR.md)) |
+| `fpr/engine/`, `fpr/kernels/` | Model step, attention, indexer; CUDA kernels and loaders |
+| `fpr/core/`, `packages/nd/` | C++ scheduler, KV manager, block tables, engine process, native decode |
+| `frontend_cxx/` | C++ API frontend |
+| `ds41h/`, `plugins/`, `patches/` | Kernels and hooks shared with ds41h-on-vLLM; vLLM plugins and patches |
+| `fpr/config/`, `scripts/`, `deploy/h200/` | Serving configuration, launchers, build, switch / rollback and guards |
+| `docs/` | Design, exactness, Engram and FPRv1 notes (from `FPRv1`) |
 
 ## Known limits
 
-- It depends on vLLM 0.32.0. Several hooks compare a hash of the stock source and need review on any other version.
-- `patches/vllm-0.32.0-reasoning-count.patch` fixes a vLLM streaming cost that grew with output length when
-  `continuous_usage_stats` is on. Neither patch has been submitted upstream yet.
-- At 256 streams the aggregate decode rate falls during a run (about 12.1K, 10.7K and 9.1K tok/s across the early,
-  middle and late thirds at k=5, 8K). This is not fully explained.
-- On very short prompts with thinking on and no system prompt, the model can emit garbage tokens when it skips its
-  reasoning. DeepSeek's own API does the same. A system prompt or turning thinking off avoids it.
-- Comments in the code can cite labels of internal benchmark runs. These runs are not published.
-
-## Acknowledgements
-
-ds41h builds on [BRRR](https://github.com/fraserprice/DeepSeek-4.1-Flash-1017-BRRR) by Fraser Price, whose approach to
-persistent decoder kernels, DSpark sampling and NVLink all-reduce it adapts for `sm_90a` and stock vLLM. It also uses
-[vLLM](https://github.com/vllm-project/vllm), [FlashMLA](https://github.com/vllm-project/FlashMLA) and DeepSeek's
-reference inference code. See [NOTICE](NOTICE).
+- Tied to vLLM 0.32.0, CUDA 13 and `sm_90a`, with exactly four GPUs per node. Tested on one 4x H200 NVL node.
+- Image steps run on the Python path.
+- Flags that are off in the served configuration may refer to kernels that are not included here.
+- Some modules with test-like names (`bench2b.py`, `test_comm.py`, `test_mhc.py`, `moe_stream/bench.py`,
+  `commbench.py`, `cap_check.py`) are runtime libraries the engine imports.
 
 ## License
 
-Apache License 2.0, see [LICENSE](LICENSE). Third-party notices are in [NOTICE](NOTICE) and [LICENSES/](LICENSES).
-The model weights are not part of this repository and have their own license.
+Apache 2.0, see [LICENSE](LICENSE). Third-party notices are in [NOTICE](NOTICE) and [LICENSES/](LICENSES). The model
+weights have their own license.

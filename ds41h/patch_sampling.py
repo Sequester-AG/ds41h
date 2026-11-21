@@ -40,7 +40,7 @@ EARLY_MAIN = flags._flag("DS41H_DRAFTER_EARLY_MAIN", "1")
 EARLY_GLUE = flags._flag("DS41H_SAMPLING_EARLY_GLUE", "0")
 # DS41H_DRAFTER_PRECAT=1: the early main_proj's torch.cat(aux hidden states) is issued on the side stream BEFORE the verification
 # head GEMV (it only depends on the target forward), so the side stream starts main_proj right at the head's end event
-# (stock order: cat after the head event, ~4 us on the side chain that gates propose). Same values; drafter schedule only.
+# Same values; drafter schedule only.
 PRECAT = EARLY_MAIN and flags._flag("DS41H_DRAFTER_PRECAT", "0")
 # DS41H_GRAPH_OUT_BATCH=1 (opt-in; target decode-graph tail -> correctness gate): vLLM's FULL decode graph ends with
 # store_capture_output's copies of the model outputs into the graph manager's persistent buffers (hidden + 3 aux hidden
@@ -239,8 +239,6 @@ def patch_model_runner(module) -> None:
             precat = patch_drafter.early_cat(self.speculator, aux0)  # side stream, overlaps the head GEMV
         logits = vp_sampling.verify_logits(self.model, hidden_states, input_batch.logits_indices)
         if vp_sampling.VERIFY_HEAD and getattr(self, "_ds41h_force_installed", False):
-            # exactness gate (ds41h/patch_force.py wraps model.compute_logits_local, which the ds41h verify head bypasses):
-            # the same capture of the forced requests' rows of this rank's logits shard
             cap = getattr(self, "_ds41h_force_cap", None)
             if cap is not None and "rows" not in cap:
                 cap["kind"] = "local"
@@ -472,11 +470,7 @@ def vp_post_fuse() -> bool:
 
 
 def _post_state(runner, input_batch) -> dict | None:
-    """The stock post_update state tensors for this step if the fused update is allowed, else None. Not in a step that
-    carries a request of the exactness force hook (it rewrites that request's sampled tokens / counts after sample(); the
-    hook sets runner._ds41h_force_cap for exactly those steps, so the other requests of an EXACT=1 server -- the bench,
-    GSM8K -- run the fused update and are covered by the gate), prompt logprobs (read num_computed_tokens between sample()
-    and postprocess_sampled), PP, or an aux-output connector."""
+    """The stock post_update state tensors for this step if the fused update is allowed, else None."""
     if not vp_post_fuse() or getattr(runner, "_ds41h_force_cap", None) is not None:
         return None
     if getattr(runner, "pp_handler", None) is not None or getattr(runner, "aux_output_connector", None) is not None:

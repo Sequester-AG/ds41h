@@ -20,8 +20,8 @@ With the flag
     allocated as stock and returned, and the stock kernel is launched with the same arguments after the main stream
     waits for the tail event, at the start of model_state.prepare_inputs (after the attention metadata build, before
     the target forward). Between the stock call site and that point nothing writes the kernel's inputs or reads its
-    outputs (input_ids, logits_indices). Steps with new / finished / preempted / resumed requests, encoder inputs or
-    dummy runs wait for the tail event before any work instead.
+    outputs (input_ids, logits_indices).
+
 Target numerics: unchanged (same kernels, same arguments, same values; only the stream schedule changes).
 Drafter numerics: unchanged (graph A + graph B = the stock graph's kernels).
 Guards: source hashes of the stock functions whose structure this relies on; any mismatch leaves everything stock.
@@ -85,7 +85,7 @@ _SHA = {
 # process state (one TP rank / device per worker process)
 _ST: dict = {
     "active": False,  # inside GPUModelRunner.sample_tokens
-    "switched": None,  # (main, tail) streams while the tail stream is current
+    "switched": None,  # streams while the tail stream is current
     "event": None,  # tail event not yet waited on by the main stream
     "deferred": None,  # deferred combine_sampled_and_draft_tokens launch
     "defer_ok": False,  # set by the execute_model wrapper for steps whose combine may be deferred
@@ -150,7 +150,7 @@ def tail_stream(dev):
 
 
 def wait_tail() -> None:
-    """Make the current (main) stream wait for the last draft tail (no-op if none is pending)."""
+    """Make the current stream wait for the last draft tail (no-op if none is pending)."""
     ev = _ST["event"]
     if ev is not None:
         import torch
@@ -280,12 +280,11 @@ def patch_dspark(module) -> None:
             if entry is None:
                 raise RuntimeError(f"ds41h tail: no draft-tail graph for {desc}")
             if _EAGER_EMB[0] is not None:
-                # DS41H_DRAFTER_EMBED_EAGER: the drafter input embedding on a side stream (forked from main, before the
-                # switch to the tail stream); graph A waits for it through its external event-wait node
+                # DS41H_DRAFTER_EMBED_EAGER: the drafter input embedding on a side stream; graph A waits for it through its external event-wait node
                 _EAGER_EMB[0](self, key_reqs)
             if full:
                 bt = _SYNC["bt"]
-                if bt is not None:  # no batched prepare consumed the private-table sync: plain copies (main, before the fork)
+                if bt is not None:  # no batched prepare consumed the private-table sync: plain copies
                     bt.sync(_SYNC["n"])
                     _SYNC["bt"] = None
                     _ST["stats"]["plain_sync"] = _ST["stats"].get("plain_sync", 0) + 1

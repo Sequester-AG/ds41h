@@ -38,7 +38,7 @@ def fp8_dequant_bf16(w, s):
 def load_dense(ck, L, rank, dev):
     p = f"layers.{L}.ffn."
     g = lambda n: ck.get(p + n)  # noqa: E731
-    g("gate.bias")  # opens the shard holding the router gate (Ckpt caches the handle)
+    g("gate.bias")
     w1 = fp8_dequant_bf16(g("shared_experts.w1.weight"), g("shared_experts.w1.scale"))
     w3 = fp8_dequant_bf16(g("shared_experts.w3.weight"), g("shared_experts.w3.scale"))
     w2 = fp8_dequant_bf16(g("shared_experts.w2.weight"), g("shared_experts.w2.scale"))

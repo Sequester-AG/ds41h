@@ -3,7 +3,7 @@
 Stock vLLM 0.32.0 pads the 16 local query heads (TP4) to ``padded_heads = 64``
 (models/deepseek_v41/nvidia/flashmla.py ``get_padded_num_q_heads``) for both FlashMLA decode and
 prefill, so ``flash_mla_sparse_fwd`` computes 4x the useful QK/PV work in prefill (and the q / output
-buffers are 4x larger than needed). vLLM PR #61615 (merged 2026-10-22, after 0.32.0) passes the real
+buffers are 4x larger than needed). vLLM PR #61615 passes the real
 head count to FlashMLA's SM90 small-head (8/16/32) sparse prefill kernel added by
 vllm-project/FlashMLA PR #26 (e2afa5f; 1.8-2.25x vs padding at 8/16 heads on H20) -- a 3-line change
 on the vLLM side: ``q[..., :H]``, ``attn_sink[:H]``, ``out[..., :H]``.

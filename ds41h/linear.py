@@ -139,9 +139,7 @@ WOA16_GEMM = os.environ.get("DS41H_PREFILL_WOA16_GEMM", "cublas").strip().lower(
 # same [M, 1792] GEMM); with WQA_SHARD each rank runs the stock kernel on ceil(M / tp) of the rows and the outputs are
 # all-gathered along the token dim (concat = the [M, 1792] layout, no permute copy). Same per-row math (stock Humming
 # W8A16), 1/tp of the GEMM energy, + one all-gather of M x 1792 bf16. Rows >= WQA_SHARD_MIN_M only (prefill, eager).
-# Default ON (end-to-end, 250 W: 16K-step kernel sum 673 -> 658 ms, per layer
-# GEMM 1.16 -> ~0.30 ms + all-gather 0.45 ms on the critical rank; PP c1 16K 21,553 -> 21,627, c16 19,409 -> 20,051;
-# KL top1 0.9904 PASS).
+# Default ON.
 WQA_SHARD = _ON and flags._flag("DS41H_PREFILL_WQA_SHARD", "1")
 WQA_SHARD_MIN_M = max(1, int(os.environ.get("DS41H_PREFILL_WQA_SHARD_MIN_M", "1024")))
 WQA_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.attn\.fused_wqa_wkv$")

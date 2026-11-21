@@ -163,5 +163,5 @@ PREP_FUSE = ENABLED and _flag("DS41H_PREP_FUSE", "0")
 # Prologue path of index/kv-source layers (ds41h/patch_decoder.py _prologue_attention_side): run the
 # compressor (kv_score GEMM + compress) and the compressed-cache insert on the layer's stock aux stream, overlapped
 # with the indexer's weights_proj / q path, exactly like stock _prepare_and_attn does (same kernels, same joins).
-# Exactness gate passed at k=7 and k=5, -0.03..-0.04 ms/cycle. Opt-in here; scripts/serve_ds41h.sh turns it on.
+# Exactness gate passed at k=7 and k=5, -0.03..-0.04 ms/cycle. Opt-in here; production's scripts/serve_ds41h.sh (main branch) turns it on.
 ATTN_SIDE = ENABLED and _flag("DS41H_ATTN_SIDE", "0")

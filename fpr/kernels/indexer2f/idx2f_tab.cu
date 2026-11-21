@@ -19,7 +19,11 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 
+#include <mutex>
+#include <shared_mutex>
 #include <vector>
+
+#include "idx2f_tab_cabi.h"
 
 namespace idx2f_tab {
 
@@ -90,6 +94,14 @@ static std::vector<Handle>& handles() {
 static std::vector<Ring>& rings() {
   static std::vector<Ring> r;
   return r;
+}
+
+// the registries are appended by Python (create / ring: e.g. a GeneralTables growth)
+// while nd's threads may run "idx2f_tab.run" / "wait": every access holds this lock (unique for push_back, shared for
+// reads), and a launch works on local copies taken under it (no reference into a vector that may reallocate)
+static std::shared_mutex& reg_mu() {
+  static std::shared_mutex m;
+  return m;
 }
 
 __global__ void scatter_kernel(Ptrs p, const int32_t* __restrict__ st, Off o) {
@@ -271,6 +283,7 @@ int64_t create(std::vector<torch::Tensor> t, int64_t general) {
   Handle h;
   h.p = p;
   h.device = t[0].get_device();
+  std::unique_lock<std::shared_mutex> lk(reg_mu());
   handles().push_back(h);
   return (int64_t)handles().size() - 1;
 }
@@ -284,45 +297,129 @@ int64_t ring(int64_t device, int64_t k) {
     C10_CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     C10_CUDA_CHECK(cudaEventRecord(e, at::cuda::getCurrentCUDAStream()));
   }
+  std::unique_lock<std::shared_mutex> lk(reg_mu());
   rings().push_back(r);
   return (int64_t)rings().size() - 1;
 }
 
+// status-returning bodies shared by the pybind entries and the C ABI (idx2f_tab_cabi.h): the same
+// calls in the same order; the pybind entries pass the current stream and raise on a non-OK status
+static int wait_on(int64_t rid, int64_t slot) {
+  cudaEvent_t ev;
+  {
+    std::shared_lock<std::shared_mutex> lk(reg_mu());
+    if (rid < 0 || rid >= (int64_t)rings().size() || slot < 0 || slot >= (int64_t)rings()[rid].ev.size()) return FPR_E_ARG;
+    ev = rings()[rid].ev[slot];
+  }
+  return cudaEventSynchronize(ev) == cudaSuccess ? FPR_OK : FPR_E_CUDA;   // at once unless pending (outside the lock)
+}
+
+// the handle's pointers / device and the ring slot's event, copied under the lock (FPR_E_ARG: bad handle / ring / slot /
+// a ring of another device / want_device given and not the handle's)
+static int lookup(int64_t hid, int64_t rid, int64_t slot, int want_device, Ptrs* p, int* device, cudaEvent_t* ev) {
+  std::shared_lock<std::shared_mutex> lk(reg_mu());
+  if (hid < 0 || hid >= (int64_t)handles().size() || rid < 0 || rid >= (int64_t)rings().size() || slot < 0 ||
+      slot >= (int64_t)rings()[rid].ev.size())
+    return FPR_E_ARG;
+  const Handle& h = handles()[hid];
+  if (rings()[rid].device != h.device || (want_device >= 0 && want_device != h.device)) return FPR_E_ARG;
+  *p = h.p, *device = h.device, *ev = rings()[rid].ev[slot];
+  return FPR_OK;
+}
+static int device_of(int64_t hid) {
+  std::shared_lock<std::shared_mutex> lk(reg_mu());
+  return hid >= 0 && hid < (int64_t)handles().size() ? handles()[hid].device : -1;
+}
+
+// one H2D of the staging words + scatter + derive on `stream`; records the ring slot's event after them
+static int run_on(int64_t hid, int64_t rid, int64_t slot, const void* host, void* dev, int64_t n, int64_t S, int64_t U,
+                  int64_t P, int64_t B, cudaStream_t stream, int want_device = -1) {
+  if (n < 0 || S < 0 || U < 0 || P < 0 || B < 0) return FPR_E_ARG;
+  Ptrs hp;
+  int hdev = -1;
+  cudaEvent_t slot_ev;
+  const int lr = lookup(hid, rid, slot, want_device, &hp, &hdev, &slot_ev);   // (incl. "ring of another device")
+  if (lr != FPR_OK) return lr;
+  int cur = -1;                                            // fpr_cabi rule 3: the caller made the device current
+  if (cudaGetDevice(&cur) != cudaSuccess || cur != hdev) return FPR_E_ARG;
+  const Off o = layout((int)n, (int)S, (int)U, (int)P);
+  int32_t* dst = reinterpret_cast<int32_t*>(dev);
+  cudaError_t e = cudaSuccess;
+  if (o.total) e = cudaMemcpyAsync(dst, host, (size_t)o.total * 4, cudaMemcpyHostToDevice, stream);
+  if (e == cudaSuccess) {
+    if (U > 0) scatter_kernel<<<(unsigned)U, 256, 0, stream>>>(hp, dst, o);
+    const int R = hp.R;
+    if (!hp.general) {
+      decode_kernel<<<(R + 255) / 256, 256, 0, stream>>>(hp, dst, o, (int)n, (int)S);
+    } else {
+      const int nb_ir = (int)((4 * B + 255) / 256), nb_row = (R + 255) / 256;
+      general_kernel<<<(unsigned)(nb_ir + nb_row + 1 + B), 256, 0, stream>>>(hp, dst, o, (int)n, (int)S, (int)B, nb_ir,
+                                                                              nb_row);
+    }
+    e = cudaGetLastError();
+  }
+  // after the kernels: the slot's host block AND device block are free again once this event completes
+  if (e == cudaSuccess) e = cudaEventRecord(slot_ev, stream);   // (events are never destroyed: the copy stays valid)
+  return e == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+}
+
 void wait(int64_t rid, int64_t slot) {
-  C10_CUDA_CHECK(cudaEventSynchronize(rings()[rid].ev[slot]));   // returns at once unless the slot's copy is pending
+  const int rc = wait_on(rid, slot);
+  TORCH_CHECK(rc == FPR_OK, "idx2f_tab: wait(", rid, ", ", slot, "): ", rc == FPR_E_ARG ? "no such ring slot" : "CUDA error");
 }
 
 // one H2D of the staging words + scatter + derive on the current stream; records the ring slot's event after them
 void run(int64_t hid, int64_t rid, int64_t slot, int64_t host_ptr, int64_t dev_ptr, int64_t n, int64_t S, int64_t U,
          int64_t P, int64_t B) {
-  Handle& h = handles()[hid];
-  TORCH_CHECK(rings()[rid].device == h.device, "idx2f_tab: ring of another device");
-  c10::cuda::CUDAGuard g(h.device);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  const Off o = layout((int)n, (int)S, (int)U, (int)P);
-  int32_t* dst = reinterpret_cast<int32_t*>(dev_ptr);
-  if (o.total)
-    C10_CUDA_CHECK(cudaMemcpyAsync(dst, reinterpret_cast<const void*>(host_ptr), (size_t)o.total * 4,
-                                   cudaMemcpyHostToDevice, stream));
-  if (U > 0) scatter_kernel<<<(unsigned)U, 256, 0, stream>>>(h.p, dst, o);
-  const int R = h.p.R;
-  if (!h.p.general) {
-    decode_kernel<<<(R + 255) / 256, 256, 0, stream>>>(h.p, dst, o, (int)n, (int)S);
-  } else {
-    const int nb_ir = (int)((4 * B + 255) / 256), nb_row = (R + 255) / 256;
-    general_kernel<<<(unsigned)(nb_ir + nb_row + 1 + B), 256, 0, stream>>>(h.p, dst, o, (int)n, (int)S, (int)B, nb_ir,
-                                                                            nb_row);
-  }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  // after the kernels: the slot's host block AND device block are free again once this event completes
-  C10_CUDA_CHECK(cudaEventRecord(rings()[rid].ev[slot], stream));
+  const int hdev = device_of(hid);
+  TORCH_CHECK(hdev >= 0, "idx2f_tab: handle");
+  c10::cuda::CUDAGuard g(hdev);
+  const int rc = run_on(hid, rid, slot, reinterpret_cast<const void*>(host_ptr), reinterpret_cast<void*>(dev_ptr), n, S, U,
+                        P, B, at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(rc == FPR_OK, "idx2f_tab: run: ", rc == FPR_E_ARG ? "bad arguments" : "CUDA error (launch / copy / event)");
+}
+
+// ---- C ABI (idx2f_tab_cabi.h)
+static int c_wait(const void* a_) {
+  if (a_ == nullptr) return FPR_E_ARG;
+  const auto& a = *static_cast<const FprIdx2fTabWaitArgs*>(a_);
+  return wait_on(a.ring_id, a.slot);
+}
+static int c_run(const void* a_) {
+  if (a_ == nullptr) return FPR_E_ARG;
+  const auto& a = *static_cast<const FprIdx2fTabRunArgs*>(a_);
+  return run_on(a.hid, a.ring_id, a.slot, a.host, a.dev, a.n, a.S, a.U, a.P, a.B, (cudaStream_t)a.call.stream,
+                a.call.device);
+}
+
+// (test) the C entry from Python on an explicit stream; the caller's device
+void run_c(int64_t hid, int64_t rid, int64_t slot, int64_t host_ptr, int64_t dev_ptr, int64_t n, int64_t S, int64_t U,
+           int64_t P, int64_t B, int64_t stream) {
+  FprIdx2fTabRunArgs a{};
+  a.call.stream = reinterpret_cast<decltype(a.call.stream)>(stream);
+  a.call.device = device_of(hid);
+  TORCH_CHECK(a.call.device >= 0, "idx2f_tab: handle");
+  a.hid = hid, a.ring_id = rid, a.slot = slot, a.host = reinterpret_cast<const void*>(host_ptr);
+  a.dev = reinterpret_cast<void*>(dev_ptr), a.n = n, a.S = S, a.U = U, a.P = P, a.B = B;
+  c10::cuda::CUDAGuard g(a.call.device);
+  TORCH_CHECK(c_run(&a) == FPR_OK, "idx2f_tab: C entry run");
 }
 
 }  // namespace idx2f_tab
+
+extern "C" __attribute__((visibility("default"))) const FprExtTable* fpr_idx2f_tab_table(void) {
+  static const FprFnEntry fns[] = {
+      {"idx2f_tab.wait", idx2f_tab::c_wait, nullptr, static_cast<int64_t>(sizeof(FprIdx2fTabWaitArgs))},
+      {"idx2f_tab.run", idx2f_tab::c_run, nullptr, static_cast<int64_t>(sizeof(FprIdx2fTabRunArgs))},
+  };
+  static const FprExtTable t = {FPR_CABI_VERSION, "idx2f_tab", "pybind entries: same bodies (idx2f_tab.cu)", 2, fns};
+  return &t;
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("create", &idx2f_tab::create);
   m.def("ring", &idx2f_tab::ring);
   m.def("wait", &idx2f_tab::wait);
   m.def("run", &idx2f_tab::run);
+  m.def("run_c", &idx2f_tab::run_c);   // (test: the C entry on an explicit stream)
 }

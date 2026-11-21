@@ -181,11 +181,24 @@ __global__ void __launch_bounds__(640) k_combine_push(const __nv_bfloat16* __res
 }
 }  // namespace spc
 
+#include "head_comm_cabi.h"
+#include "../../../engine/mixed_cxx/fpr_cabi_rec.h"   // rule 9: optional record hook
+FPR_CABI_RECORD_DECL(head_comm)
+
 static spc::Peers peers(const std::vector<torch::Tensor>& bufs, const std::vector<torch::Tensor>& flags) {
   spc::Peers p;
   for (int s = 0; s < spc::W; ++s) {
     p.buf[s] = (char*)bufs[s].data_ptr();
     p.flag[s] = (unsigned*)flags[s].data_ptr();
+  }
+  return p;
+}
+// C-ABI variant: the W per-rank pointers of an Args struct
+static spc::Peers peers_c(void* const* bufs, uint32_t* const* flags) {
+  spc::Peers p;
+  for (int s = 0; s < spc::W; ++s) {
+    p.buf[s] = (char*)bufs[s];
+    p.flag[s] = (unsigned*)flags[s];
   }
   return p;
 }
@@ -202,45 +215,106 @@ void enable_peers(int64_t n) {
   }
 }
 
+static int ag_push_core(const FprCommAgPushArgs* p) {   // C ABI "head_comm.ag_push": the launch of pybind ag_push
+  try {
+    if (p->RB % 16 != 0) return FPR_E_ARG;
+    spc::k_ag_push<<<(int)p->ncta * spc::W, spc::THR, 0, p->c.stream>>>((const uint4*)p->src, (int)p->R, (int)p->RB,
+                                                                       (int)p->c.rank, peers_c(p->bufs, p->flags),
+                                                                       (unsigned*)p->epoch);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void ag_push(torch::Tensor src, int64_t rank, std::vector<torch::Tensor> bufs, std::vector<torch::Tensor> flags,
              torch::Tensor epoch, int64_t ncta) {
   const int R = (int)src.size(0), RB = (int)(src.numel() / src.size(0) * src.element_size());
   TORCH_CHECK(RB % 16 == 0);
-  spc::k_ag_push<<<(int)ncta * spc::W, spc::THR, 0, at::cuda::getCurrentCUDAStream()>>>((const uint4*)src.data_ptr(), R, RB,
-                                                                               (int)rank, peers(bufs, flags),
-                                                                               (unsigned*)epoch.data_ptr());
+  FprCommAgPushArgs ca{{at::cuda::getCurrentCUDAStream(), (int)src.get_device(), (int)rank}, src.data_ptr(), R, RB, {},
+                           {}, (uint32_t*)epoch.data_ptr(), (int32_t)ncta};
+  for (int s = 0; s < spc::W; ++s) ca.bufs[s] = bufs[s].data_ptr(), ca.flags[s] = (uint32_t*)flags[s].data_ptr();
+  FPR_CABI_RECORD("head_comm.ag_push", ca);   // rule 9 (fpr_cabi_rec.h)
+  TORCH_CHECK(ag_push_core(&ca) == FPR_OK, "head_comm ag_push: CUDA launch error");
 }
 
+static int ag_push2_core(const FprCommAgPush2Args* p) {   // C ABI "head_comm.ag_push2": the launch of pybind ag_push2
+  try {
+    if (p->RB % 16 != 0 || p->RB2 % 16 != 0) return FPR_E_ARG;
+    spc::k_ag_push2<<<(int)p->ncta * spc::W, spc::THR, 0, p->c.stream>>>(
+        (const uint4*)p->src, (int)p->RB, (const uint4*)p->src2, (int)p->RB2, (int)p->R, (int)p->c.rank,
+        peers_c(p->bufs, p->flags), peers_c(p->bufs2, p->flags), (unsigned*)p->epoch);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 // f rows src [R, RB] to bufs (flags = the f flags), routing rows src2 [R, RB2] to bufs2 (no flags of their own)
 void ag_push2(torch::Tensor src, torch::Tensor src2, int64_t rank, std::vector<torch::Tensor> bufs,
               std::vector<torch::Tensor> flags, std::vector<torch::Tensor> bufs2, torch::Tensor epoch, int64_t ncta) {
   const int R = (int)src.size(0), RB = (int)(src.numel() / src.size(0) * src.element_size());
   const int RB2 = (int)(src2.numel() / src2.size(0) * src2.element_size());
   TORCH_CHECK(RB % 16 == 0 && RB2 % 16 == 0 && src2.size(0) == R, "ag_push2: shapes");
-  spc::k_ag_push2<<<(int)ncta * spc::W, spc::THR, 0, at::cuda::getCurrentCUDAStream()>>>(
-      (const uint4*)src.data_ptr(), RB, (const uint4*)src2.data_ptr(), RB2, R, (int)rank, peers(bufs, flags),
-      peers(bufs2, flags), (unsigned*)epoch.data_ptr());
+  FprCommAgPush2Args ca{{at::cuda::getCurrentCUDAStream(), (int)src.get_device(), (int)rank}, src.data_ptr(), src2.data_ptr(),
+                        R, RB, RB2, {}, {}, {}, (uint32_t*)epoch.data_ptr(), (int32_t)ncta};
+  for (int s = 0; s < spc::W; ++s)
+    ca.bufs[s] = bufs[s].data_ptr(), ca.bufs2[s] = bufs2[s].data_ptr(), ca.flags[s] = (uint32_t*)flags[s].data_ptr();
+  FPR_CABI_RECORD("head_comm.ag_push2", ca);   // rule 9 (fpr_cabi_rec.h)
+  TORCH_CHECK(ag_push2_core(&ca) == FPR_OK, "head_comm ag_push2: CUDA launch error");
 }
 
+static int rs_push_core(const FprCommRsPushArgs* p) {   // C ABI "head_comm.rs_push"
+  try {
+    spc::k_rs_push<<<(int)p->ncta * spc::W, spc::THR, 0, p->c.stream>>>((const uint4*)p->part, (int)p->R, (int)p->H,
+                                                                       (int)p->c.rank, peers_c(p->bufs, p->flags),
+                                                                       (unsigned*)p->epoch);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void rs_push(torch::Tensor part, int64_t rank, std::vector<torch::Tensor> bufs, std::vector<torch::Tensor> flags,
              torch::Tensor epoch, int64_t ncta) {
   const int R = (int)(part.size(0) / spc::W), H = (int)part.size(1);
-  spc::k_rs_push<<<(int)ncta * spc::W, spc::THR, 0, at::cuda::getCurrentCUDAStream()>>>((const uint4*)part.data_ptr(), R, H,
-                                                                               (int)rank, peers(bufs, flags),
-                                                                               (unsigned*)epoch.data_ptr());
+  FprCommRsPushArgs ca{{at::cuda::getCurrentCUDAStream(), (int)part.get_device(), (int)rank}, part.data_ptr(), R, H, {}, {},
+                       (uint32_t*)epoch.data_ptr(), (int32_t)ncta};
+  for (int s = 0; s < spc::W; ++s) ca.bufs[s] = bufs[s].data_ptr(), ca.flags[s] = (uint32_t*)flags[s].data_ptr();
+  FPR_CABI_RECORD("head_comm.rs_push", ca);   // rule 9 (fpr_cabi_rec.h)
+  TORCH_CHECK(rs_push_core(&ca) == FPR_OK, "head_comm rs_push: CUDA launch error");
 }
 
+static int wait_core(const FprCommWaitArgs* p) {   // C ABI "head_comm.wait"
+  try {
+    spc::k_wait<<<1, 32, 0, p->c.stream>>>((const unsigned*)p->flag, (const unsigned*)p->epoch, (unsigned)p->signals);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void wait(torch::Tensor flag, torch::Tensor epoch, int64_t signals) {
-  spc::k_wait<<<1, 32, 0, at::cuda::getCurrentCUDAStream()>>>((const unsigned*)flag.data_ptr(),
-                                                             (const unsigned*)epoch.data_ptr(), (unsigned)signals);
+  FprCommWaitArgs ca{{at::cuda::getCurrentCUDAStream(), (int)flag.get_device(), 0}, (const uint32_t*)flag.data_ptr(),
+                     (const uint32_t*)epoch.data_ptr(), (uint32_t)signals};
+  FPR_CABI_RECORD("head_comm.wait", ca);   // rule 9 (fpr_cabi_rec.h)
+  TORCH_CHECK(wait_core(&ca) == FPR_OK, "head_comm wait: CUDA launch error");
 }
 
+static int rs_sum_core(const FprCommRsSumArgs* p) {   // C ABI "head_comm.rs_sum"
+  try {
+    spc::k_rs_sum<<<(int)p->ncta, spc::THR, 0, p->c.stream>>>(
+        (const __nv_bfloat162*)p->recv, (int)p->R, (int)p->H, (const unsigned*)p->flag, (const unsigned*)p->epoch,
+        (unsigned)p->signals, (__nv_bfloat162*)p->out);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void rs_sum(torch::Tensor recv, torch::Tensor flag, torch::Tensor epoch, int64_t signals, torch::Tensor out,
             int64_t ncta) {
   const int R = (int)recv.size(1), H = (int)recv.size(2);
-  spc::k_rs_sum<<<(int)ncta, spc::THR, 0, at::cuda::getCurrentCUDAStream()>>>(
-      (const __nv_bfloat162*)recv.data_ptr(), R, H, (const unsigned*)flag.data_ptr(),
-      (const unsigned*)epoch.data_ptr(), (unsigned)signals, (__nv_bfloat162*)out.data_ptr());
+  FprCommRsSumArgs ca{{at::cuda::getCurrentCUDAStream(), (int)recv.get_device(), 0}, recv.data_ptr(), R, H,
+                      (const uint32_t*)flag.data_ptr(), (const uint32_t*)epoch.data_ptr(), (uint32_t)signals, out.data_ptr(),
+                      (int32_t)ncta};
+  FPR_CABI_RECORD("head_comm.rs_sum", ca);   // rule 9 (fpr_cabi_rec.h)
+  TORCH_CHECK(rs_sum_core(&ca) == FPR_OK, "head_comm rs_sum: CUDA launch error");
 }
 
 void combine_push(torch::Tensor Y, torch::Tensor slotmap, torch::Tensor sh, int64_t R, int64_t rank,
@@ -260,4 +334,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rs_push", &rs_push);
   m.def("wait", &wait);
   m.def("rs_sum", &rs_sum);
+}
+
+// ---- C ABI (fpr_cabi.h): table. No init entry: no per-device state (no dynamic SMEM, no attributes); enable_peers
+// (walks all devices, changes the current device) stays Python; combine_push is not used by the head.
+extern "C" {
+static int c_ag_push(const void* a) { return ag_push_core((const FprCommAgPushArgs*)a); }
+static int c_ag_push2(const void* a) { return ag_push2_core((const FprCommAgPush2Args*)a); }
+static int c_wait(const void* a) { return wait_core((const FprCommWaitArgs*)a); }
+static int c_rs_push(const void* a) { return rs_push_core((const FprCommRsPushArgs*)a); }
+static int c_rs_sum(const void* a) { return rs_sum_core((const FprCommRsSumArgs*)a); }
+static const FprFnEntry k_head_comm_fns[] = {
+    {"head_comm.ag_push", c_ag_push, nullptr, (int64_t)sizeof(FprCommAgPushArgs)},
+    {"head_comm.ag_push2", c_ag_push2, nullptr, (int64_t)sizeof(FprCommAgPush2Args)},
+    {"head_comm.wait", c_wait, nullptr, (int64_t)sizeof(FprCommWaitArgs)},
+    {"head_comm.rs_push", c_rs_push, nullptr, (int64_t)sizeof(FprCommRsPushArgs)},
+    {"head_comm.rs_sum", c_rs_sum, nullptr, (int64_t)sizeof(FprCommRsSumArgs)},
+};
+static const FprExtTable k_head_comm_table = {FPR_CABI_VERSION, "head_comm", "930c39dd5ae029f9872fbdd33c553bc3", 5,
+                                              k_head_comm_fns};
+__attribute__((visibility("default"))) const FprExtTable* fpr_head_comm_table(void) { return &k_head_comm_table; }
 }

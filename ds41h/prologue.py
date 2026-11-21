@@ -77,9 +77,7 @@ def _mma_from_env() -> str:
 MMA = _mma_from_env()
 FAST_LIGHT_SYNC = 32
 FAST_V3, FAST_V3_HOP, FAST_V3_PACE = 512, 2048, 16384
-# Default fast bits: the v3 schedule (prologue_kernel_v3: clusters of 8, weights -> smem by bulk copies paced to <= 2 x
-# 10 KB in flight per CTA so the latency-critical loads are not queued behind the weight stream, P1a hop, DSMEM k
-# reduction; G1 CTAs exit early so a PDL-launched attention can start). HMMA: bit-identical to fast=0 (stock
+# Default fast bits: the v3 schedule. HMMA: bit-identical to fast=0 (stock
 # rounding). Measured end-to-end-like (m=6, previous-layer kernel end -> attention end, cold code / warm code):
 # hmma fast=0-style f33 46.4 / 39.9 us -> 18944 42.8 / 37.7 us (with DS41H_DECODE_NOPAD + DS41H_ATTN_EARLY: 37.5 / 33.6).
 # Falls back to the regular kernel (with the same bits' EARLY | LIGHT_SYNC meaning ignored) if the 30-cluster grid
@@ -142,12 +140,8 @@ INDEXER_W = os.environ.get("DS41H_PROLOGUE_INDEXER_W", "0").strip().lower() not 
 # clear for that q (patch_prologue.py). -2 kernels (+ gaps) per index-source layer.
 INDEXER_FOLD = INDEXER_W and os.environ.get("DS41H_PROLOGUE_INDEXER_FOLD", "0").strip().lower() not in ("0", "", "false", "no", "off")
 IDX_N, IDXW_N = 4096, 32
-# DS41H_PROLOGUE_AUX=1 (opt-in): run_prologue(aux=True) also returns out["aux"] = residual.mean(dim=1) (the capture_aux of the
-# last layers) computed by the P1a jobs from the bf16 streams they write anyway (one fewer reduce kernel per such layer).
 AUX = os.environ.get("DS41H_PROLOGUE_AUX", "0").strip().lower() not in ("0", "", "false", "no", "off")
-# DS41H_P1A_EXT (opt-in, needs the decoder's XF_P1A = decoder.ffn(..., p1a=...)): the layer kernel of layer L computes layer
-# L+1's P1a (post-mapped residual + collapse xcb / xsq into p1a_buffers) and layer L+1's prologue skips it (run_prologue
-# p1a_done, FAST_V3_EXT_P1A). Glue: ds41h/patch_decoder.py (forward + _prologue_attention_side).
+# Glue: ds41h/patch_decoder.py (forward + _prologue_attention_side).
 P1A_EXT = os.environ.get("DS41H_P1A_EXT", "0").strip().lower() not in ("0", "", "false", "no", "off")
 
 
@@ -301,14 +295,12 @@ def entry_inputs(device: torch.device | int | str, m: int) -> tuple[torch.Tensor
     return r[:m], p[:m], c[:m], e[:m]
 
 
-FAST_V3_EXT_P1A = 268435456  # kernels/prologue.cu: P1a (residual output, collapse xcb / xsq) produced by the previous grid
+FAST_V3_EXT_P1A = 268435456
 SLICES = HID // 32
 
 
 def p1a_buffers(device: torch.device | int | str) -> tuple[torch.Tensor, torch.Tensor]:
-    """(xcb bf16 [8, 5120], xsq f32 [8, 160]) views of the device's prologue scratch that a producer of the P1a outputs
-    (decoder layer kernel XF_P1A, decoder.py DecoderEngine.run(p1a=(resid_out, xcb, xsq))) fills for the NEXT layer's
-    prologue, which then runs with run_prologue(..., p1a_done=resid_out) (FAST_V3_EXT_P1A: no P1a, no C_P1A hop)."""
+    """"""
     buf = ensure_device(device)
     e = ext()
     xcb = buf[int(e.OFF_XCB) : int(e.OFF_XCB) + ENTRY_ROWS * HID * 2].view(torch.bfloat16).view(ENTRY_ROWS, HID)
@@ -316,7 +308,7 @@ def p1a_buffers(device: torch.device | int | str) -> tuple[torch.Tensor, torch.T
     return xcb, xsq
 
 
-_p1a_pending: dict[int, tuple[Any, torch.Tensor]] = {}  # device -> (next layer, resid_out) whose P1a the decoder produced
+_p1a_pending: dict[int, tuple[Any, torch.Tensor]] = {}
 
 
 def set_p1a_pending(device: torch.device | int | str, next_layer: Any, resid_out: torch.Tensor) -> None:
@@ -325,7 +317,7 @@ def set_p1a_pending(device: torch.device | int | str, next_layer: Any, resid_out
 
 
 def take_p1a_pending(layer: Any, device: torch.device | int | str, m: int) -> torch.Tensor | None:
-    """resid_out if the previous layer kernel produced this layer's P1a (else None; a stale entry is dropped)."""
+    """"""
     e = _p1a_pending.pop(_dev_index(device), None)
     if e is None or e[0] is not layer or e[1].shape[0] != m:
         return None
@@ -650,8 +642,8 @@ def run_prologue(
     first layer): pass x_prev = the layer input [M, 5120] bf16 (the stream is x broadcast to the 4 copies) and None for
     residual / post_mix / res_mix / pre_mix (eligible(..., first_layer=True)). Outputs as above: residual = x broadcast,
     a = attn_norm(x) (stream 0), post_mix / res_mix / attn_pre = this attention's mHC coefficients (see entry_inputs).
-    p1a_done = the post-mapped residual [M, 4, 5120] bf16 that the previous layer kernel already wrote together with xcb / xsq
-    (p1a_buffers): the launch skips P1a (FAST_V3_EXT_P1A) and returns it as out["residual"]; no "aux" output then.
+
+    no "aux" output then.
     """
     info = prepare_layer(layer)
     if info is None:

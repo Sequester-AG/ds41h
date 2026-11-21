@@ -34,22 +34,27 @@ from vllm.logger import init_logger
 logger = init_logger("vllm.phys_adapter")
 
 
-def _vision_weight_bytes(model_dir: str) -> int:
-    """Bytes of one vision tower + aligner on a GPU in bfloat16, from the checkpoint's safetensors headers."""
-    import glob
-    import json
-    import struct
+def _hostmap_modules(towers, devs) -> None:
+    """"""
+    import importlib.util
 
-    size = {"F32": 4, "BF16": 2, "F16": 2, "F8_E4M3": 1, "F8_E5M2": 1, "I8": 1, "U8": 1, "I32": 4, "I64": 8}
+    import torch
+    path = os.environ["FPR_C2C_POOL"]
+    spec = importlib.util.spec_from_file_location("c2c_pool", path)
+    c2c = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(c2c)
     n = 0
-    for f in glob.glob(os.path.join(model_dir, "*.safetensors")):
-        with open(f, "rb") as fh:
-            h = json.loads(fh.read(struct.unpack("<Q", fh.read(8))[0]))
-        for k, v in h.items():
-            if k.startswith(("vision.", "aligner.")):
-                b = v["data_offsets"][1] - v["data_offsets"][0]
-                n += b // size.get(v["dtype"], 2) * 2
-    return n
+    for tw, d in zip(towers, devs):
+        for mod in (getattr(tw, "vision", None), getattr(tw, "aligner", None)):
+            if mod is None:
+                continue
+            ts = [t for t in list(mod.parameters()) + list(mod.buffers()) if t.is_cuda and t.numel()]
+            for t, h in zip(ts, c2c.host_pack([t.data for t in ts], d)):
+                t.data = h
+                n += t.numel() * t.element_size()
+        torch.cuda.synchronize(d)
+    torch.cuda.empty_cache()
+    logger.info("phys adapter: FPR_HOSTMAP vision: %.2f GB per GPU of tower weights in host memory", n / len(devs) / 1e9)
 
 
 class Stage4Worker:
@@ -57,12 +62,30 @@ class Stage4Worker:
         import geometry as G
         import worker as W
 
+        if os.environ.get("FPR_MEMPROBE"):
+            import torch
+            torch.cuda.memory._record_memory_history(max_entries=1_000_000, stacks="python")
+
+            def _oom(device, alloc, device_alloc, device_free):   # snapshot at the first out-of-memory
+                import pickle
+                p_ = os.path.join(os.environ["FPR_MEMPROBE"], "oom.pickle")
+                if not os.path.exists(p_):
+                    os.makedirs(os.environ["FPR_MEMPROBE"], exist_ok=True)
+                    with open(p_, "wb") as f_:
+                        pickle.dump(torch.cuda.memory._snapshot(), f_)
+                    logger.info("memprobe: OOM on device %s (alloc %d, device free %d): snapshot %s", device, alloc,
+                                device_free, p_)
+            torch._C._cuda_attach_out_of_memory_observer(_oom)
         mc = vllm_config.model_config
         backend = os.environ.get("PHYS_WORKER_BACKEND", "engine")
         # engine: max_rows = the largest decode-graph bucket (320 rows per rank); the worker sizes the step rows from the
         # engine's mixed-step capacity itself. splayer: its buffer rows (128 = the smoke-tested size).
         max_rows = int(os.environ.get("PHYS_WORKER_MAX_ROWS", "320" if backend == "engine" else "128"))
         cfg = W.WorkerConfig()
+        # PHYS_WORKER_RESERVE = bytes the KV pools leave free (WorkerConfig.reserve_bytes, 8 GB
+        # by default). Together with PHYS_ENGINE's engine_reserve_bytes (10 GB) it decides the pool size
+        if os.environ.get("PHYS_WORKER_RESERVE"):
+            cfg = W.dataclasses.replace(cfg, reserve_bytes=int(float(os.environ["PHYS_WORKER_RESERVE"])))
         model = os.environ.get("DS41H_MODEL_DIR") or mc.model
         cfg = W.dataclasses.replace(cfg, model=model)
         # the engine class: engine/engine.py imports its siblings relatively, so it must be imported as the package
@@ -82,6 +105,10 @@ class Stage4Worker:
             cfg = W.dataclasses.replace(cfg, weights=os.environ["PHYS_WORKER_WEIGHTS"])
         geom = G.Geometry(max_model_len=mc.max_model_len, spec_k=vllm_config.num_speculative_tokens,
                           max_seqs=vllm_config.scheduler_config.max_num_seqs)
+        if os.environ.get("FPR_WORKER_GEOM", "0") == "1":   # PHYS_GEOM for the worker's pools too (e.g. a
+            geom = bridge.geometry_overrides(geom)           # smaller window_pool_bytes; the scheduler applies it anyway)
+            logger.info("phys adapter: worker geometry with PHYS_GEOM %s: window pool %.2f GB, prefill rows %d per rank",
+                        os.environ.get("PHYS_GEOM", ""), geom.window_pool_bytes / 1e9, geom.max_prefill_tokens_per_rank)
         t0 = time.time()
         self.direct = backend == "engine-direct"
         self.sampling: dict = {}
@@ -103,15 +130,6 @@ class Stage4Worker:
                         time.time() - t0, ecfg, self.geom.pools()[0].num_pages, ecfg.buckets)
             self._setup_images(vllm_config, model)
             return
-        if os.environ.get("PHYS_MM", "0") == "1":
-            # The vision towers and the encoder caches are created after the worker sizes the KV pools, so their
-            # memory must be reserved here. Otherwise it comes out of the headroom that the mixed steps' MoE
-            # workspaces need, and a large prompt arriving next to many decoding sequences runs out of memory.
-            extra = (_vision_weight_bytes(model) + int(float(os.environ.get("PHYS_MM_CACHE_MB", "512")) * 2 ** 20)
-                     + int(float(os.environ.get("PHYS_MM_MARGIN_MB", "1024")) * 2 ** 20))
-            cfg = W.dataclasses.replace(cfg, reserve_bytes=cfg.reserve_bytes + extra)
-            logger.info("phys adapter: images on: %.2f GB more left free after the KV pools (towers, encoder "
-                        "cache, margin)", extra / 1e9)
         self.w = W.Worker(cfg, geom, backend, max_rows=max_rows, log=logger.info)
         self.geom = self.w.geom
         self.native = callable(getattr(self.w, "step", None))
@@ -152,6 +170,8 @@ class Stage4Worker:
         t0 = time.time()
         devs = [torch.device("cuda", r) for r in range(self.geom.n_ranks)]
         towers = [vision.VisionTower(model, d, vllm_config=vllm_config) for d in devs]
+        if "vision" in os.environ.get("FPR_HOSTMAP", ""):   # the towers' weights in host memory (c2c_pool)
+            _hostmap_modules(towers, devs)
         streams = getattr(eng, "streams", None)
         self.mm_caches = [MM.EncoderCache(r, self._encoder(towers[r], streams[r] if streams else None), devs[r])
                           for r in range(len(devs))]

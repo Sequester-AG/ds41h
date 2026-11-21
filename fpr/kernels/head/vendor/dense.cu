@@ -166,23 +166,112 @@ __global__ void __launch_bounds__(256) norm_rope2_kernel(const __nv_bfloat16* xq
     norm_rope_row(xk, ldxk, wk, ok, ldok, Dk, eps, pos, cos_sin, blockIdx.x - R);
 }
 
-// launch with programmatic stream serialization (PDL): the kernel may start while the previous one drains
+// launch with programmatic stream serialization (PDL): the kernel may start while the previous one drains; on `stream`
+// (C ABI: the caller's), the launch's own return code
 template <typename... KArgs, typename... Args>
-static void launch_pdl(void (*kern)(KArgs...), int grid, const char* what, Args... args) {
+static cudaError_t launch_pdl(void (*kern)(KArgs...), int grid, cudaStream_t stream, Args... args) {
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = dim3(grid, 1, 1);
   cfg.blockDim = dim3(256, 1, 1);
   cfg.dynamicSmemBytes = 0;
-  cfg.stream = at::cuda::getCurrentCUDAStream();
+  cfg.stream = stream;
   cudaLaunchAttribute attr[1];
   attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attr[0].val.programmaticStreamSerializationAllowed = DENSE_PDL;
   cfg.attrs = attr;
   cfg.numAttrs = 1;
-  TORCH_CHECK(cudaLaunchKernelEx(&cfg, kern, static_cast<KArgs>(args)...) == cudaSuccess, what);
+  return cudaLaunchKernelEx(&cfg, kern, static_cast<KArgs>(args)...);
 }
 
 }  // namespace kd
+
+// C ABI: the host launches are C functions on plain argument structs
+// and an explicit stream, exported through fpr_head_dense_table(); the pybind functions build the structs and call the
+// same functions. Kernels unchanged.
+#include "head_dense_cabi.h"
+#include "../../../engine/mixed_cxx/fpr_cabi_rec.h"   // rule 9: optional record hook
+FPR_CABI_RECORD_DECL(head_dense)
+
+namespace kd {
+
+static inline int rc(cudaError_t e) { return e == cudaSuccess ? FPR_OK : FPR_E_CUDA; }
+
+#ifdef FPR_CABI_DEBUG
+static inline bool dev_ok(const FprCall& c) {
+  int d = -1;
+  return cudaGetDevice(&d) == cudaSuccess && d == c.device;
+}
+#define FPR_DEV_CHECK(c) \
+  if (!dev_ok(c)) return FPR_E_ARG
+#else
+#define FPR_DEV_CHECK(c)
+#endif
+
+// ---- the C functions (the table's entries; the pybind wrappers below call the same ones)
+static int c_norm_rope2(const void* p) {
+  if (p == nullptr) return FPR_E_ARG;
+  const auto& a = *static_cast<const FprAttnDenseNormRope2Args*>(p);
+  FPR_DEV_CHECK(a.call);
+  if (a.dk < 64 || a.pos == nullptr || a.cos_sin == nullptr) return FPR_E_ARG;
+  const int R = static_cast<int>(a.rows);
+  return rc(launch_pdl(norm_rope2_kernel, 2 * R, a.call.stream, static_cast<const __nv_bfloat16*>(a.xq), a.ldxq, a.wq,
+                       static_cast<__nv_bfloat16*>(a.oq), a.ldoq, static_cast<int>(a.dq),
+                       static_cast<const __nv_bfloat16*>(a.xk), a.ldxk, a.wk, static_cast<__nv_bfloat16*>(a.ok), a.ldok,
+                       static_cast<int>(a.dk), R, a.eps, reinterpret_cast<const long long*>(a.pos), a.cos_sin));
+}
+
+static int c_norm_rope(const void* p) {
+  if (p == nullptr) return FPR_E_ARG;
+  const auto& a = *static_cast<const FprAttnDenseNormRopeArgs*>(p);
+  FPR_DEV_CHECK(a.call);
+  if (a.pos != nullptr && (a.cos_sin == nullptr || a.d < 64)) return FPR_E_ARG;
+  return rc(launch_pdl(norm_rope_kernel, static_cast<int>(a.rows), a.call.stream, static_cast<const __nv_bfloat16*>(a.x),
+                       a.ldx, a.w, static_cast<__nv_bfloat16*>(a.out), a.ldo, static_cast<int>(a.d), a.eps,
+                       reinterpret_cast<const long long*>(a.pos), a.cos_sin));
+}
+
+static int c_rope_q_insert(const void* p) {
+  if (p == nullptr) return FPR_E_ARG;
+  const auto& a = *static_cast<const FprAttnDenseRopeQInsertArgs*>(p);
+  FPR_DEV_CHECK(a.call);
+  if (a.nh != 16 && a.nh != 64) return FPR_E_ARG;
+  return rc(launch_pdl(rope_q_insert_kernel, static_cast<int>(a.t), a.call.stream, static_cast<__nv_bfloat16*>(a.q),
+                       static_cast<const __nv_bfloat16*>(a.kv), reinterpret_cast<const long long*>(a.pos), a.cos_sin,
+                       reinterpret_cast<const long long*>(a.slot_mapping), a.cache, a.page_stride, static_cast<int>(a.shift),
+                       a.do_insert ? 1 : 0, static_cast<int>(a.nh)));
+}
+
+static int c_inv_rope(const void* p) {
+  if (p == nullptr) return FPR_E_ARG;
+  const auto& a = *static_cast<const FprAttnDenseInvRopeArgs*>(p);
+  FPR_DEV_CHECK(a.call);
+  if (a.nh != 16 && a.nh != 64) return FPR_E_ARG;
+  return rc(launch_pdl(inv_rope_kernel, static_cast<int>(a.t), a.call.stream, static_cast<__nv_bfloat16*>(a.o),
+                       reinterpret_cast<const long long*>(a.pos), a.cos_sin, static_cast<int>(a.nh)));
+}
+
+}  // namespace kd
+
+extern "C" __attribute__((visibility("default"))) const FprExtTable* fpr_head_dense_table(void) {
+  static const FprFnEntry fns[] = {
+      {"head_dense.norm_rope2", kd::c_norm_rope2, nullptr, static_cast<int64_t>(sizeof(FprAttnDenseNormRope2Args))},
+      {"head_dense.norm_rope", kd::c_norm_rope, nullptr, static_cast<int64_t>(sizeof(FprAttnDenseNormRopeArgs))},
+      {"head_dense.rope_q_insert", kd::c_rope_q_insert, nullptr, static_cast<int64_t>(sizeof(FprAttnDenseRopeQInsertArgs))},
+      {"head_dense.inv_rope", kd::c_inv_rope, nullptr, static_cast<int64_t>(sizeof(FprAttnDenseInvRopeArgs))},
+  };
+  static const FprExtTable t = {FPR_CABI_VERSION, DENSE_PDL ? "head_dense_pdl" : "head_dense",
+                                "b85def80e80484c97d03ea1fe5067272", 4, fns};
+  return &t;
+}
+
+// ---- pybind (signatures, checks and behaviour unchanged; the launch is the C function above)
+static FprCall call_of(const torch::Tensor& t) {
+  FprCall c;
+  c.stream = at::cuda::getCurrentCUDAStream();
+  c.device = t.get_device();
+  c.rank = 0;
+  return c;
+}
 
 void norm_rope(torch::Tensor x, torch::Tensor w, torch::Tensor out, double eps, c10::optional<torch::Tensor> pos,
                c10::optional<torch::Tensor> cos_sin) {
@@ -196,8 +285,20 @@ void norm_rope(torch::Tensor x, torch::Tensor w, torch::Tensor out, double eps, 
     pp = reinterpret_cast<const long long*>(pos->data_ptr<int64_t>());
     cp = cos_sin->data_ptr<float>();
   }
-  kd::launch_pdl(kd::norm_rope_kernel, R, "norm_rope launch", reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), x.stride(0),
-                 w.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), out.stride(0), D, static_cast<float>(eps), pp, cp);
+  FprAttnDenseNormRopeArgs a{};
+  a.call = call_of(x);
+  a.x = x.data_ptr();
+  a.ldx = x.stride(0);
+  a.w = w.data_ptr<float>();
+  a.out = out.data_ptr();
+  a.ldo = out.stride(0);
+  a.d = D;
+  a.rows = R;
+  a.eps = static_cast<float>(eps);
+  a.pos = reinterpret_cast<const int64_t*>(pp);
+  a.cos_sin = cp;
+  FPR_CABI_RECORD("head_dense.norm_rope", a);   // rule 9 (fpr_cabi_rec.h)
+  TORCH_CHECK(kd::c_norm_rope(&a) == FPR_OK, "norm_rope launch");
 }
 
 void norm_rope2(torch::Tensor xq, torch::Tensor wq, torch::Tensor oq, torch::Tensor xk, torch::Tensor wk, torch::Tensor ok,
@@ -208,11 +309,26 @@ void norm_rope2(torch::Tensor xq, torch::Tensor wq, torch::Tensor oq, torch::Ten
   TORCH_CHECK(xk.dtype() == torch::kBFloat16 && xk.stride(1) == 1 && ok.dtype() == torch::kBFloat16 && ok.stride(1) == 1, "kv");
   TORCH_CHECK(wq.dtype() == torch::kFloat32 && wq.numel() == xq.size(1) && wk.dtype() == torch::kFloat32 && wk.numel() == xk.size(1), "w");
   TORCH_CHECK(cos_sin.dtype() == torch::kFloat32 && cos_sin.size(1) == 64 && xk.size(1) >= 64, "cos_sin");
-  kd::launch_pdl(kd::norm_rope2_kernel, 2 * R, "norm_rope2 launch", reinterpret_cast<const __nv_bfloat16*>(xq.data_ptr()), xq.stride(0),
-                 wq.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(oq.data_ptr()), oq.stride(0), static_cast<int>(xq.size(1)),
-                 reinterpret_cast<const __nv_bfloat16*>(xk.data_ptr()), xk.stride(0), wk.data_ptr<float>(),
-                 reinterpret_cast<__nv_bfloat16*>(ok.data_ptr()), ok.stride(0), static_cast<int>(xk.size(1)), R, static_cast<float>(eps),
-                 reinterpret_cast<const long long*>(pos.data_ptr<int64_t>()), cos_sin.data_ptr<float>());
+  FprAttnDenseNormRope2Args a{};
+  a.call = call_of(xq);
+  a.xq = xq.data_ptr();
+  a.ldxq = xq.stride(0);
+  a.wq = wq.data_ptr<float>();
+  a.oq = oq.data_ptr();
+  a.ldoq = oq.stride(0);
+  a.dq = static_cast<int>(xq.size(1));
+  a.xk = xk.data_ptr();
+  a.ldxk = xk.stride(0);
+  a.wk = wk.data_ptr<float>();
+  a.ok = ok.data_ptr();
+  a.ldok = ok.stride(0);
+  a.dk = static_cast<int>(xk.size(1));
+  a.rows = R;
+  a.eps = static_cast<float>(eps);
+  a.pos = pos.data_ptr<int64_t>();
+  a.cos_sin = cos_sin.data_ptr<float>();
+  FPR_CABI_RECORD("head_dense.norm_rope2", a);   // rule 9 (fpr_cabi_rec.h)
+  TORCH_CHECK(kd::c_norm_rope2(&a) == FPR_OK, "norm_rope2 launch");
 }
 
 void rope_q_insert(torch::Tensor q, torch::Tensor kv, torch::Tensor pos, torch::Tensor cos_sin, torch::Tensor slot_mapping,
@@ -222,18 +338,36 @@ void rope_q_insert(torch::Tensor q, torch::Tensor kv, torch::Tensor pos, torch::
   TORCH_CHECK(q.is_contiguous() && (nh == 16 || nh == 64) && q.size(2) == 512 && q.dtype() == torch::kBFloat16, "q");
   TORCH_CHECK(kv.is_contiguous() && kv.size(0) == T && kv.size(1) == 512, "kv");
   TORCH_CHECK(cos_sin.dtype() == torch::kFloat32 && cos_sin.size(1) == 64, "cos_sin");
-  kd::launch_pdl(kd::rope_q_insert_kernel, T, "rope_q_insert launch", reinterpret_cast<__nv_bfloat16*>(q.data_ptr()),
-                 reinterpret_cast<const __nv_bfloat16*>(kv.data_ptr()), reinterpret_cast<const long long*>(pos.data_ptr<int64_t>()),
-                 cos_sin.data_ptr<float>(), reinterpret_cast<const long long*>(slot_mapping.data_ptr<int64_t>()), cache.data_ptr<uint8_t>(),
-                 page_stride, static_cast<int>(shift), do_insert ? 1 : 0, nh);
+  FprAttnDenseRopeQInsertArgs a{};
+  a.call = call_of(q);
+  a.q = q.data_ptr();
+  a.kv = kv.data_ptr();
+  a.pos = pos.data_ptr<int64_t>();
+  a.cos_sin = cos_sin.data_ptr<float>();
+  a.slot_mapping = slot_mapping.data_ptr<int64_t>();
+  a.cache = cache.data_ptr<uint8_t>();
+  a.page_stride = page_stride;
+  a.shift = shift;
+  a.t = T;
+  a.nh = nh;
+  a.do_insert = do_insert ? 1 : 0;
+  FPR_CABI_RECORD("head_dense.rope_q_insert", a);   // rule 9 (fpr_cabi_rec.h)
+  TORCH_CHECK(kd::c_rope_q_insert(&a) == FPR_OK, "rope_q_insert launch");
 }
 
 void inv_rope(torch::Tensor o, torch::Tensor pos, torch::Tensor cos_sin) {
   const int T = static_cast<int>(o.size(0));
   const int nh = static_cast<int>(o.size(1));
   TORCH_CHECK(o.is_contiguous() && (nh == 16 || nh == 64) && o.size(2) == 512 && o.dtype() == torch::kBFloat16, "o");
-  kd::launch_pdl(kd::inv_rope_kernel, T, "inv_rope launch", reinterpret_cast<__nv_bfloat16*>(o.data_ptr()),
-                 reinterpret_cast<const long long*>(pos.data_ptr<int64_t>()), cos_sin.data_ptr<float>(), nh);
+  FprAttnDenseInvRopeArgs a{};
+  a.call = call_of(o);
+  a.o = o.data_ptr();
+  a.pos = pos.data_ptr<int64_t>();
+  a.cos_sin = cos_sin.data_ptr<float>();
+  a.t = T;
+  a.nh = nh;
+  FPR_CABI_RECORD("head_dense.inv_rope", a);   // rule 9 (fpr_cabi_rec.h)
+  TORCH_CHECK(kd::c_inv_rope(&a) == FPR_OK, "inv_rope launch");
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

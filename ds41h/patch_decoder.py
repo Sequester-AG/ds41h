@@ -127,15 +127,13 @@ def _prologue_attention_side(module, layer, x, positions, input_ids, pre_mix, po
     from ds41h import prologue
 
     attn = layer.attn
-    # DS41H_P1A_EXT (prologue-attn, opt-in): the previous layer kernel already produced this layer's P1a (see forward)
     p1a_done = prologue.take_p1a_pending(layer, x.device, x.shape[0]) if prologue.P1A_EXT and not first_layer else None
     out = prologue.run_prologue(layer, x, residual, post_mix, res_mix, pre_mix, positions, get_forward_context().attn_metadata,
                                 aux=bool(capture_previous_aux) and not first_layer, p1a_done=p1a_done, first_layer=first_layer)
     residual = out["residual"]
     # Stock capture_aux: bf16 mean over the post-mapped bf16 streams (tilelang_kernels.py:449-458; the
     # overlap-stream path is literally residual.mean(dim=1), ops/mhc.py:260). One reduce kernel (fp32
-    # accumulation inside) instead of float() + mean + to(bf16); with DS41H_PROLOGUE_AUX the prologue's P1a jobs
-    # emit it (out["aux"], prologue-attn opt-in: no extra kernel).
+    # accumulation inside) instead of float() + mean + to(bf16)
     previous_aux = (out["aux"] if "aux" in out else residual.mean(dim=1)) if capture_previous_aux and not first_layer else None  # stock: None at entry
     a, qr, kv, q = out["a"], out["qr"], out["kv"], out["q"]
     latent = None
@@ -330,8 +328,7 @@ def _patch_model(module: ModuleType) -> None:
 
             p1a = nxt = None
             if prologue.P1A_EXT and residual.dim() == 3 and 0 < residual.shape[0] <= prologue.MAX_TOKENS:
-                # DS41H_P1A_EXT (prologue-attn + decoder XF_P1A, opt-in): this layer kernel also produces the next layer's
-                # P1a (post-mapped residual + collapse into the prologue scratch); the next prologue skips it
+                # the next prologue skips it
                 nxt = _p1a_next(self)
                 if nxt is not None:
                     p1a = (torch.empty_like(residual, memory_format=torch.contiguous_format), *prologue.p1a_buffers(residual.device))

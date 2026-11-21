@@ -4,7 +4,7 @@ fp64 reference and error statistics. One GPU, layer 21 rank 0 (real weights from
 Inputs: x = stock's captured MoE input rows f of layer 21 (a local capture directory (CAP_DIR), 3 decode steps, ~1.4K
 real rows), tiled to T rows. Routing:
   synth : bench.synth_routing (skewed Gamma(0.47) expert popularity, 4-row groups sharing 60 % of their experts)
-  cap   : the layer's real router (ref gate: sqrt-softplus fp32, bias top-6, x 1.5) on the tiled real rows
+  cap: the layer's real router on the tiled real rows
           (the expert histogram of the real decode traffic, scaled by T / 1.4K)
 """
 from __future__ import annotations

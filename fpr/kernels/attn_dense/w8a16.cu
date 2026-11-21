@@ -44,6 +44,7 @@
 // W8_BST) into a workspace shared by all GEMMs of the device (L2-resident), a monotonic per-tile arrival counter (the
 // grid is one resident wave), then each CTA of the tile reduces a token slice over the S partials in the fixed order
 // 0..S-1 (all S loads of two items in flight); optional RoPE (cos / sin from SMEM); coalesced 16-byte bf16 stores.
+#include <atomic>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -54,6 +55,8 @@
 #include <cstdint>
 
 #include "w8a16_wgmma.cuh"
+#include "w8a16_wgmma_wide.cuh"
+#include "w8a16_cabi.h"
 
 #ifndef W8_PROF
 #define W8_PROF 0  // clock64 profile (separate build): prof[cta][wg][16]: mainloop parts, prologue, epilogue, globaltimer
@@ -105,6 +108,9 @@
 #define W8_PDL 1  // programmatic dependent launch: barrier init + the weight stream start before griddepcontrol.wait
                   // (they do not depend on the previous kernel); x / kv / the workspace only after it;
                   // launch_dependents after the mainloop lets the next kernel launch during this one's epilogue
+#endif
+#ifndef W8_WIDE
+#define W8_WIDE 1  // > 128 token rows (splits 1, no RoPE / KV insert): the wide kernel; 0 = served z slices
 #endif
 #ifndef W8_ABL
 #define W8_ABL 0  // timing ablations, separate builds only: 1 = no dequant, 2 = no wgmma, 4 = no x loads,
@@ -879,32 +885,234 @@ __global__ void __launch_bounds__(NTHR, 1) w8a16_kernel(const __grid_constant__ 
   }
 }
 
+
+// Here one CTA = 128 weight rows (half h of a 256-row tile = one packed half block of every chunk) x NW <= 256 token
+// rows: warpgroup c owns 64-row sub-tile c of the half, dequantizes it once per k32 and issues ONE RS wgmma m64 nNW k16 per k16
+// step over all tokens (accumulators 64 x NW fp32: 128 registers at NW 256, as the served 2 x 64 x 128). Per output element the
+// weights (same bytes, same scale), x and the k16 order are the served splits-1 path's -> bitwise equal. Stage s = one x chunk
+// (two TMA tiles of 64 k x NW rows) + the W half block, one mbarrier; the second warpgroup done with a stage refills it.
+template <int NW>
+struct CfgW {
+  static constexpr int XB = NW * 128;
+  static constexpr int XS = 2 * XB;
+  static constexpr int ST = XS + WSTR;
+  static constexpr int YPW = 128 + 4;  // staging pitch (floats) for the CTA's 128 columns
+  static constexpr int YS = NW * YPW * 4;
+  static constexpr int NS0 = (SMEM_MAX - 256 - 1024) / ST;
+  static constexpr int NS = NS0 < 4 ? NS0 : 4;
+  static constexpr int RING = NS * ST;
+  static constexpr int BODY = RING > YS ? RING : YS;
+  static constexpr int BAR = BODY;
+  static constexpr int SMEM = BAR + 256 + 1024;
+  static_assert(NS >= 2, "two stages");
+  static_assert(SMEM <= SMEM_MAX, "smem");
+  static_assert(XS % 1024 == 0, "x tiles 1 KB aligned (SW128)");
+};
+
+template <int NW>
+__global__ void __launch_bounds__(NTHR, 1) w8a16w_kernel(const __grid_constant__ CUtensorMap tmx, const Params p) {
+  using C = CfgW<NW>;
+  constexpr int NS = C::NS;
+  extern __shared__ uint8_t smem_raw[];
+  uint8_t* smem = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
+  const int tid = threadIdx.x, warp = __shfl_sync(0xffffffffu, tid >> 5, 0), lane = tid & 31;
+  const int wg = warp >> 2, w = warp & 3;
+  const int tile = static_cast<int>(blockIdx.y) >> 1, h = static_cast<int>(blockIdx.y) & 1, tiles = static_cast<int>(gridDim.y) >> 1;
+  const int tok0 = static_cast<int>(blockIdx.z) * NW, ntok = min(p.ntok - tok0, NW);
+  const int nc = p.nchunk;
+  const int row0 = tile * TR + h * 128;
+  const int kx0 = (tile * TR / p.rows_per_group) * p.kx_per_group;
+  const uint32_t sbase = smem_u32(smem);
+  const uint32_t xring = sbase, wring = sbase + NS * C::XS, stg = sbase;
+  const uint32_t bfs = sbase + C::BAR, scnt = bfs + 8 * NS;
+  const uint64_t pol = policy_evict_first();
+  auto issue_w = [&](int i) {  // the stage's W half block (expect_tx of the whole stage first)
+    const int s = i % NS;
+    mbar_expect_tx(bfs + 8 * s, C::XS + HB);
+    bulk_g2s_hint(wring + s * WSTR, p.w + (static_cast<size_t>(i) * tiles + tile) * CHUNK + h * HB, HB, bfs + 8 * s, pol);
+  };
+  auto issue_x = [&](int i) {
+    const int s = i % NS;
+    const uint32_t st = xring + s * C::XS;
+    const int kx = kx0 + i * KC;
+    tma2d(st, &tmx, kx, tok0, bfs + 8 * s);
+    tma2d(st + C::XB, &tmx, kx + 64, tok0, bfs + 8 * s);
+  };
+  if (tid == 0) {
+    for (int i = 0; i < NS; ++i) mbar_init(bfs + 8 * i, 1);
+    for (int i = 0; i < NS; ++i) asm volatile("st.shared.u32 [%0], 0;" ::"r"(scnt + 4 * i) : "memory");
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  __syncthreads();
+  if (tid == 0) {
+    for (int i = 0; i < (nc < NS ? nc : NS); ++i) issue_w(i);  // weights: constants, before the PDL wait
+    asm volatile("prefetch.tensormap [%0];" ::"l"(reinterpret_cast<uint64_t>(&tmx)) : "memory");
+  }
+  if constexpr (W8_PDL) asm volatile("griddepcontrol.wait;" ::: "memory");
+  if (tid == 0) {
+    for (int i = 0; i < (nc < NS ? nc : NS); ++i) issue_x(i);
+  }
+  float acc[NW / 2];
+#pragma unroll
+  for (int j = 0; j < NW / 2; ++j) acc[j] = 0.f;
+  unsigned A[2][2][4];  // [buffer][k16 step][reg]
+  uint4 R[2];
+  uint4 SCn = make_uint4(0, 0, 0, 0), SCc = SCn;
+  auto stage_ready = [&](int i) { mbar_wait(bfs + 8 * (i % NS), (i / NS) & 1); };
+  auto lds_kb = [&](int i, int kb, int rb) {
+    const uint32_t wf = wring + (i % NS) * WSTR;
+    if (kb == 0) SCn = lds128(wf + HW);
+    R[rb] = lds128(wf + ((kb * 2 + wg) * 4 + w) * 512 + lane * 16);
+  };
+  auto deq_kb = [&](int rb, int b, int kb) {
+    const unsigned wsc = kb == 0 ? SCc.x : kb == 1 ? SCc.y : kb == 2 ? SCc.z : SCc.w;
+    const unsigned se = (wsc >> (8 * (wg * 2 + (w >> 1)))) & 0xffu;
+    if constexpr (W8_DQ != 0)
+      dequant_frag_int(R[rb], scale_m2(se), A[b][0], A[b][1]);
+    else
+      dequant_frag(R[rb], scale_m2(se), A[b][0], A[b][1]);
+  };
+  if (nc > 0) {
+    stage_ready(0);
+    lds_kb(0, 0, 0);
+    SCc = SCn;
+    deq_kb(0, 0, 0);
+  }
+#pragma unroll 1
+  for (int i = 0; i < nc; ++i) {
+    const int s = i % NS;
+    const uint32_t xs = xring + s * C::XS;
+#pragma unroll
+    for (int kb = 0; kb < 4; ++kb) {
+      const int b = kb & 1;
+      if (kb > 0) {
+        wg_wait<1>();
+        deq_kb(b, b, kb);
+      }
+      wg_fence();
+#pragma unroll
+      for (int k16 = 0; k16 < 2; ++k16) {
+        const uint64_t db = desc_k(xs + (kb >> 1) * C::XB + (kb & 1) * 64 + k16 * 32);
+        WgRS<NW>::mma(acc, A[b][k16], db, 1);
+      }
+      wg_commit();
+      if (kb < 3) {
+        lds_kb(i, kb + 1, (kb + 1) & 1);
+      } else if (i + 1 < nc) {
+        stage_ready(i + 1);
+        lds_kb(i + 1, 0, 0);
+      }
+    }
+    if (i + 1 < nc) {
+      wg_wait<1>();
+      SCc = SCn;
+      deq_kb(0, 0, 0);
+    }
+    wg_wait<0>();
+    // stage s: this warpgroup's wgmmas (x) are complete and its 4 warps have consumed their W LDS; the second warpgroup
+    // here refills the stage with chunk i + NS (no waiting)
+    if (w == 0) {
+      asm volatile("bar.sync %0, 128;" ::"r"(3 + wg) : "memory");
+      unsigned old = 0;
+      if (lane == 0) asm volatile("atom.acq_rel.cta.shared::cta.add.u32 %0, [%1], 1;" : "=r"(old) : "r"(scnt + 4 * s) : "memory");
+      old = __shfl_sync(0xffffffffu, old, 0);
+      if ((old & 1u) && i + NS < nc && lane == 0) {
+        issue_w(i + NS);
+        issue_x(i + NS);
+      }
+    } else {
+      asm volatile("bar.arrive %0, 128;" ::"r"(3 + wg) : "memory");
+    }
+  }
+  if constexpr (W8_PDL) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  __syncthreads();  // every issued stage was consumed; the ring region becomes the staging image
+  {
+    const int g = lane >> 2, t = lane & 3;
+    const int r = wg * 64 + 16 * w + g;
+#pragma unroll
+    for (int j = 0; j < NW / 8; ++j) {
+      const int tk = 8 * j + 2 * t;
+      const uint32_t a0 = stg + (tk * C::YPW + r) * 4;
+      asm volatile("st.shared.f32 [%0], %1;" ::"r"(a0), "f"(acc[4 * j + 0]) : "memory");
+      asm volatile("st.shared.f32 [%0], %1;" ::"r"(a0 + C::YPW * 4), "f"(acc[4 * j + 1]) : "memory");
+      asm volatile("st.shared.f32 [%0], %1;" ::"r"(a0 + 32), "f"(acc[4 * j + 2]) : "memory");
+      asm volatile("st.shared.f32 [%0], %1;" ::"r"(a0 + C::YPW * 4 + 32), "f"(acc[4 * j + 3]) : "memory");
+    }
+  }
+  __syncthreads();
+  const int items = ntok * 16;
+  for (int it = tid; it < items; it += NTHR) {
+    const int tk = it >> 4, rg = it & 15;
+    const uint32_t la = stg + (tk * C::YPW + 8 * rg) * 4;
+    const float4 a = ld_local_f4(la), b = ld_local_f4(la + 16);
+    uint4 o;
+    __nv_bfloat162 hv;
+    hv = __floats2bfloat162_rn(a.x, a.y); o.x = *reinterpret_cast<unsigned*>(&hv);
+    hv = __floats2bfloat162_rn(a.z, a.w); o.y = *reinterpret_cast<unsigned*>(&hv);
+    hv = __floats2bfloat162_rn(b.x, b.y); o.z = *reinterpret_cast<unsigned*>(&hv);
+    hv = __floats2bfloat162_rn(b.z, b.w); o.w = *reinterpret_cast<unsigned*>(&hv);
+    *reinterpret_cast<uint4*>(p.y + static_cast<long long>(tok0 + tk) * p.ldy + row0 + 8 * rg) = o;
+  }
+}
+
 }  // namespace w8
 
 // ------------------------------------------------------------------------------------------------ host
-static CUtensorMap make_tmap(const torch::Tensor& x, int nt) {
-  CUtensorMap m;
-  const cuuint64_t dims[2] = {static_cast<cuuint64_t>(x.size(1)), static_cast<cuuint64_t>(x.size(0))};
-  const cuuint64_t strides[1] = {static_cast<cuuint64_t>(x.stride(0)) * 2};
+// C ABI: run() below is the one launch path of
+// both the pybind gemm (its checks and messages unchanged) and the C entry c_gemm; kernels unchanged. One-time state: the per-device dynamic-SMEM attribute (pybind: lazily on first use, as before; C: init).
+static_assert(W8A16_CHUNK_BYTES == w8::CHUNK, "w8a16_cabi.h W8A16_CHUNK_BYTES");
+
+#ifndef W8_NTMIN
+#define W8_NTMIN 96  // 32 = token tiles of 32 / 64 for buckets of <= 32 / 64 rows
+#endif
+
+// failures of run(), mapped to the pybind path's messages / the C ABI's codes
+enum RunErr { RE_OK = 0, RE_TMAP, RE_SMEM, RE_LAUNCH_EX, RE_LAUNCH, RE_TOKENS, RE_INIT };
+struct RunRes {
+  RunErr e;
+  int detail;  // CUresult / cudaError_t
+};
+
+// per (instantiation, device): the SMEM attribute is set (pybind: on first use, as the old function-local static of each
+// launch1<NT, CS>; C ABI: w8a16.init sets every instantiation of this build)
+template <int NT, bool CS>
+static bool* init_dev() {
+  static bool f[64] = {};
+  return f;
+}
+
+static RunRes make_tmap(const void* base, int64_t rows, int64_t cols, int64_t ld, int nt, CUtensorMap* m) {
+  const cuuint64_t dims[2] = {static_cast<cuuint64_t>(cols), static_cast<cuuint64_t>(rows)};
+  const cuuint64_t strides[1] = {static_cast<cuuint64_t>(ld) * 2};
   const cuuint32_t box[2] = {64, static_cast<cuuint32_t>(nt)};
   const cuuint32_t es[2] = {1, 1};
-  const CUresult r = cuTensorMapEncodeTiled(&m, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, x.data_ptr(), dims, strides, box, es,
-                                            CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+  const CUresult r = cuTensorMapEncodeTiled(m, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, const_cast<void*>(base), dims, strides, box,
+                                            es, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
                                             CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TORCH_CHECK(r == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed: ", static_cast<int>(r));
-  return m;
+  return {r == CUDA_SUCCESS ? RE_OK : RE_TMAP, static_cast<int>(r)};
 }
 
 template <int NT, bool CS>
-static void launch1(const CUtensorMap& tm, const w8::Params& p, int S, int tiles, int nslices, cudaStream_t st) {
+static cudaError_t set_smem() {
+  return cudaFuncSetAttribute(w8::w8a16_kernel<NT, CS>, cudaFuncAttributeMaxDynamicSharedMemorySize, w8::Cfg<NT, CS>::SMEM);
+}
+template <int NT, bool CS>
+static cudaError_t init_one(int dev) {
+  const cudaError_t e = set_smem<NT, CS>();
+  if (e == cudaSuccess) init_dev<NT, CS>()[dev & 63] = true;
+  return e;
+}
+
+static cudaError_t prime_dev(int dev);  // below: every instantiation of the device at once
+template <int NT, bool CS>
+static RunRes launch1(const CUtensorMap& tm, const w8::Params& p, int S, int tiles, int nslices, cudaStream_t st, bool lazy) {
   auto kern = w8::w8a16_kernel<NT, CS>;
   const int smem = w8::Cfg<NT, CS>::SMEM;
-  static bool init_dev[64] = {};  // per device: the 4-GPU one-process harness (sp_layer.py) launches on every device
   int cur_dev = 0;
   cudaGetDevice(&cur_dev);
-  if (!init_dev[cur_dev & 63]) {
-    TORCH_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem) == cudaSuccess, "smem attr");
-    init_dev[cur_dev & 63] = true;
+  if (!init_dev<NT, CS>()[cur_dev & 63]) {
+    if (!lazy) return {RE_INIT, 0};
+    if (prime_dev(cur_dev) != cudaSuccess || !init_dev<NT, CS>()[cur_dev & 63]) return {RE_SMEM, 0};
   }
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = dim3(S, tiles, nslices);
@@ -916,18 +1124,293 @@ static void launch1(const CUtensorMap& tm, const w8::Params& p, int S, int tiles
   attr[0].val.programmaticStreamSerializationAllowed = W8_PDL ? 1 : 0;
   cfg.attrs = attr;
   cfg.numAttrs = 1;
-  TORCH_CHECK(cudaLaunchKernelEx(&cfg, kern, tm, p) == cudaSuccess, "w8a16 launch (ex)");
+  if (cudaLaunchKernelEx(&cfg, kern, tm, p) != cudaSuccess) return {RE_LAUNCH_EX, 0};
   const cudaError_t e = cudaGetLastError();
-  TORCH_CHECK(e == cudaSuccess, "w8a16 launch: ", cudaGetErrorString(e));
+  return {e == cudaSuccess ? RE_OK : RE_LAUNCH, static_cast<int>(e)};
 }
 template <int NT>
-static void launch(const CUtensorMap& tm, const w8::Params& p, int S, int tiles, int nslices, cudaStream_t st) {
+static RunRes launch(const CUtensorMap& tm, const w8::Params& p, int S, int tiles, int nslices, cudaStream_t st, bool lazy) {
   if (p.inv_pos != nullptr)  // the RoPE of y (q_b) needs no cos | sin region: its rows land in x slot 0 late (late_cs)
-    launch1<NT, true>(tm, p, S, tiles, nslices, st);
-  else
-    launch1<NT, false>(tm, p, S, tiles, nslices, st);
+    return launch1<NT, true>(tm, p, S, tiles, nslices, st, lazy);
+  return launch1<NT, false>(tm, p, S, tiles, nslices, st, lazy);
 }
 
+template <int NW>
+static bool* init_dev_w() {
+  static bool f[64] = {};
+  return f;
+}
+template <int NW>
+static cudaError_t init_one_w(int dev) {
+  const cudaError_t e = cudaFuncSetAttribute(w8::w8a16w_kernel<NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, w8::CfgW<NW>::SMEM);
+  if (e == cudaSuccess) init_dev_w<NW>()[dev & 63] = true;
+  return e;
+}
+template <int NW>
+static RunRes launch_w(const CUtensorMap& tm, const w8::Params& p, int tiles, int nz, cudaStream_t st, bool lazy) {
+  int cur_dev = 0;
+  cudaGetDevice(&cur_dev);
+  if (!init_dev_w<NW>()[cur_dev & 63]) {
+    if (!lazy) return {RE_INIT, 0};
+    if (prime_dev(cur_dev) != cudaSuccess || !init_dev_w<NW>()[cur_dev & 63]) return {RE_SMEM, 0};
+  }
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(1, 2 * tiles, nz);
+  cfg.blockDim = dim3(w8::NTHR, 1, 1);
+  cfg.dynamicSmemBytes = w8::CfgW<NW>::SMEM;
+  cfg.stream = st;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = W8_PDL ? 1 : 0;
+  cfg.attrs = attr;
+  cfg.numAttrs = 1;
+  if (cudaLaunchKernelEx(&cfg, w8::w8a16w_kernel<NW>, tm, p) != cudaSuccess) return {RE_LAUNCH_EX, 0};
+  const cudaError_t e = cudaGetLastError();
+  return {e == cudaSuccess ? RE_OK : RE_LAUNCH, static_cast<int>(e)};
+}
+// prime: set the SMEM attribute of EVERY instantiation (served + wide) on device dev, so
+// no module load / attribute call happens at a first call inside a CUDA graph capture (CUDA_MODULE_LOADING=LAZY). Called by the
+// pybind prime() (w8a16.py build() after load: all devices), by c_init, and by any lazy first init (all at once, not per NW).
+// wide path per device: set by prime / c_init; a failed wide init leaves the device on the served z-slice path
+static bool g_wide_ok[64] = {};
+static int g_wide_err[64] = {};                     // the cudaError of a failed wide init, 0 = ok / not tried
+static std::atomic<long long> g_wide_launches{0};   // (obs) host launches / graph captures on the wide kernel
+static std::atomic<long long> g_wide_fallbacks{0};  // (obs) wide-eligible calls that ran the served kernel (wide not ok)
+static cudaError_t prime_dev(int dev) {
+  cudaError_t e = cudaSuccess;
+#define W8_PRIME(NT)                                                \
+  if (e == cudaSuccess) e = init_one<NT, true>(dev);                \
+  if (e == cudaSuccess) e = init_one<NT, false>(dev);
+#if W8_NTMIN <= 32
+  W8_PRIME(32)
+#endif
+#if W8_NTMIN <= 64
+  W8_PRIME(64)
+#endif
+  W8_PRIME(96)
+  W8_PRIME(104)
+  W8_PRIME(112)
+  W8_PRIME(120)
+  W8_PRIME(128)
+#undef W8_PRIME
+  if (e != cudaSuccess) return e;  // served path failed: fatal (as before)
+#if W8_WIDE
+  cudaError_t ew = cudaSuccess;
+  if (ew == cudaSuccess) ew = init_one_w<64>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<72>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<80>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<88>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<96>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<104>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<112>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<120>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<128>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<136>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<144>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<152>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<160>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<168>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<176>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<184>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<192>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<200>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<208>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<216>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<224>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<232>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<240>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<248>(dev);
+  if (ew == cudaSuccess) ew = init_one_w<256>(dev);
+  g_wide_ok[dev & 63] = ew == cudaSuccess;  // wide failure: not fatal, the device keeps the served path
+  g_wide_err[dev & 63] = static_cast<int>(ew);
+  if (ew != cudaSuccess) (void)cudaGetLastError();
+#endif
+  return cudaSuccess;
+}
+
+// wide token tiling for ntok > 128
+// nz = max(2, ceil(ntok / 256)) z slices of NW = ceil(ntok / nz) rounded up to a multiple of 8 (>= 64) token rows
+static void wide_tiling(int ntok, int* nw, int* nz) {
+  int z = (ntok + 255) / 256;
+  if (z < 2) z = 2;
+  const int per = (ntok + z - 1) / z;
+  *nw = per < 64 ? 64 : (per + 7) / 8 * 8;
+  *nz = (ntok + *nw - 1) / *nw;
+}
+static bool use_wide(const FprW8a16GemmArgs& a) {
+  // decode buckets only; larger calls (mixed wo up to max_mixed_rows) keep the served path
+  return W8_WIDE && a.ntok > 128 && a.ntok <= 320 && a.splits == 1 && a.pos == nullptr && a.inv_pos == nullptr && a.kv == nullptr &&
+         a.prof == nullptr && g_wide_ok[a.call.device & 63];
+}
+
+// the launch (both paths): Params from the argument struct, the token tile, the TMA map, one launch
+static RunRes run(const FprW8a16GemmArgs& a, bool lazy) {
+  w8::Params p{};
+  p.w = a.packed;
+  p.y = static_cast<__nv_bfloat16*>(a.y);
+  p.ldy = static_cast<int>(a.ldy);
+  p.ntok = static_cast<int>(a.ntok);
+  p.nchunk = static_cast<int>(a.nchunk);
+  p.rows_per_group = static_cast<int>(a.rows_per_group);
+  p.kx_per_group = static_cast<int>(a.kx_per_group);
+  if (a.prof != nullptr) p.prof = reinterpret_cast<unsigned long long*>(a.prof);
+  if (a.splits > 1) {
+    p.ws = a.ws;
+    p.cnt = reinterpret_cast<unsigned*>(a.cnt);
+  }
+  if (a.pos != nullptr) {
+    p.pos = reinterpret_cast<const long long*>(a.pos);
+    p.cs = a.cs;
+  }
+  if (a.inv_pos != nullptr) {
+    p.inv_pos = reinterpret_cast<const long long*>(a.inv_pos);
+    p.cs = a.cs;
+  }
+  if (a.kv != nullptr) {
+    p.kv = static_cast<const __nv_bfloat16*>(a.kv);
+    p.slot = reinterpret_cast<const long long*>(a.slot);
+    p.cache = a.cache;
+    p.page_stride = a.page_stride;
+    p.shift = static_cast<int>(a.shift);
+  }
+  const int ntok = static_cast<int>(a.ntok);
+  const int nslices = (ntok + 127) / 128;
+  if (W8_WIDE && ntok > 128 && ntok <= 320 && a.splits == 1 && a.pos == nullptr && a.inv_pos == nullptr && a.kv == nullptr &&
+      a.prof == nullptr && !g_wide_ok[a.call.device & 63])
+    g_wide_fallbacks.fetch_add(1, std::memory_order_relaxed);   // (obs) eligible, but this device's wide init failed
+  const int tiles = static_cast<int>(a.tiles);
+  if (use_wide(a)) {
+    g_wide_launches.fetch_add(1, std::memory_order_relaxed);
+    int nw = 0, nz = 0;
+    wide_tiling(ntok, &nw, &nz);
+    CUtensorMap tmw;
+    const RunRes rw = make_tmap(a.x, a.ntok, a.kx, a.x_ld, nw, &tmw);
+    if (rw.e != RE_OK) return rw;
+    switch (nw) {
+      case 64: return launch_w<64>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 72: return launch_w<72>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 80: return launch_w<80>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 88: return launch_w<88>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 96: return launch_w<96>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 104: return launch_w<104>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 112: return launch_w<112>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 120: return launch_w<120>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 128: return launch_w<128>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 136: return launch_w<136>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 144: return launch_w<144>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 152: return launch_w<152>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 160: return launch_w<160>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 168: return launch_w<168>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 176: return launch_w<176>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 184: return launch_w<184>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 192: return launch_w<192>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 200: return launch_w<200>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 208: return launch_w<208>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 216: return launch_w<216>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 224: return launch_w<224>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 232: return launch_w<232>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 240: return launch_w<240>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 248: return launch_w<248>(tmw, p, tiles, nz, a.call.stream, lazy);
+      case 256: return launch_w<256>(tmw, p, tiles, nz, a.call.stream, lazy);
+      default: return {RE_TOKENS, 0};
+    }
+  }
+  const int nt = nslices > 1 ? 128 : (ntok + 7) / 8 * 8;
+  const int ntx = (W8_NTMIN <= 32 && nt <= 32) ? 32 : (W8_NTMIN <= 64 && nt <= 64) ? 64 : nt < 96 ? 96 : nt;
+  CUtensorMap tm;
+  const RunRes r = make_tmap(a.x, a.ntok, a.kx, a.x_ld, ntx, &tm);
+  if (r.e != RE_OK) return r;
+  cudaStream_t st = a.call.stream;
+  const int S = static_cast<int>(a.splits);
+  switch (ntx) {
+#if W8_NTMIN <= 32
+    case 32: return launch<32>(tm, p, S, tiles, nslices, st, lazy);
+#endif
+#if W8_NTMIN <= 64
+    case 64: return launch<64>(tm, p, S, tiles, nslices, st, lazy);
+#endif
+    case 96: return launch<96>(tm, p, S, tiles, nslices, st, lazy);
+    case 104: return launch<104>(tm, p, S, tiles, nslices, st, lazy);
+    case 112: return launch<112>(tm, p, S, tiles, nslices, st, lazy);
+    case 120: return launch<120>(tm, p, S, tiles, nslices, st, lazy);
+    case 128: return launch<128>(tm, p, S, tiles, nslices, st, lazy);
+    default: return {RE_TOKENS, 0};
+  }
+}
+
+// ---- C ABI
+static int c_init(const void* p) {
+  if (p == nullptr) return FPR_E_ARG;
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess || dev != static_cast<const FprW8a16InitArgs*>(p)->call.device) return FPR_E_ARG;
+  cudaError_t e = cudaSuccess;
+#define W8_SET(NT)                                                  \
+  if (e == cudaSuccess) e = init_one<NT, true>(dev);                \
+  if (e == cudaSuccess) e = init_one<NT, false>(dev);
+#if W8_NTMIN <= 32
+  W8_SET(32)
+#endif
+#if W8_NTMIN <= 64
+  W8_SET(64)
+#endif
+  W8_SET(96)
+  W8_SET(104)
+  W8_SET(112)
+  W8_SET(120)
+  W8_SET(128)
+#undef W8_SET
+#if W8_WIDE
+  if (e == cudaSuccess) e = prime_dev(dev);  // wide instantiations: non-fatal (g_wide_ok), served already set
+#endif
+  return e == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+}
+
+static int c_gemm(const void* p) {
+  if (p == nullptr) return FPR_E_ARG;
+  const auto& a = *static_cast<const FprW8a16GemmArgs*>(p);
+#ifdef FPR_CABI_DEBUG
+  int d = -1;
+  if (cudaGetDevice(&d) != cudaSuccess || d != a.call.device) return FPR_E_ARG;
+#endif
+  // the pybind path's value checks (its dtype / layout checks are the caller's contract here)
+  if (a.x == nullptr || a.packed == nullptr || a.y == nullptr || a.ntok < 1 || a.x_ld % 8) return FPR_E_ARG;
+  const int64_t nslices = (a.ntok + 127) / 128;
+  if ((nslices != 1 && a.splits != 1) || nslices > 65535) return FPR_E_ARG;
+  if (a.y_cols < a.tiles * w8::TR || a.splits < 1 || a.splits > W8_SMAX || a.splits > a.nchunk) return FPR_E_ARG;
+  if (a.splits > 1) {
+    int dev = 0, nsm = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
+    if (a.splits * a.tiles > nsm || a.ws == nullptr || a.cnt == nullptr || a.ws_floats < a.splits * a.tiles * 128 * w8::YP ||
+        a.cnt_n < a.tiles)
+      return FPR_E_ARG;
+  }
+  if ((a.pos != nullptr || a.inv_pos != nullptr) && a.cs == nullptr) return FPR_E_ARG;
+  if (a.pos != nullptr && a.inv_pos != nullptr) return FPR_E_ARG;
+  if (a.kv != nullptr && (a.slot == nullptr || a.cache == nullptr)) return FPR_E_ARG;
+  const RunRes r = run(a, false);
+  switch (r.e) {
+    case RE_OK: return FPR_OK;
+    case RE_INIT: return FPR_E_INIT;
+    case RE_TOKENS: return FPR_E_SHAPE;
+    default: return FPR_E_CUDA;
+  }
+}
+
+extern "C" __attribute__((visibility("default"))) int fpr_w8a16_wide_ok(int dev) { return g_wide_ok[dev & 63] ? 1 : 0; }   // (obs)
+extern "C" __attribute__((visibility("default"))) int fpr_w8a16_wide_err(int dev) { return g_wide_err[dev & 63]; }
+extern "C" __attribute__((visibility("default"))) long long fpr_w8a16_wide_launches(void) { return g_wide_launches.load(); }
+extern "C" __attribute__((visibility("default"))) long long fpr_w8a16_wide_fallbacks(void) { return g_wide_fallbacks.load(); }
+extern "C" __attribute__((visibility("default"))) const FprExtTable* fpr_w8a16_table(void) {
+  static const FprFnEntry fns[] = {
+      {"w8a16.init", c_init, nullptr, static_cast<int64_t>(sizeof(FprW8a16InitArgs))},
+      {"w8a16.gemm", c_gemm, nullptr, static_cast<int64_t>(sizeof(FprW8a16GemmArgs))},
+  };
+  static const FprExtTable t = {FPR_CABI_VERSION, "w8a16", "0ccd41d2149fb4d2d4cb9e13c194ee13", 2, fns};
+  return &t;
+}
+
+// ---- pybind (signature, checks, messages and behaviour unchanged; the launch is run() above)
 // x [ntok, Kx] bf16 (row stride multiple of 8), packed [nchunk, tiles, CHUNK] uint8 (chunk-major), y [ntok, >= N] bf16.
 void gemm(torch::Tensor x, torch::Tensor packed, torch::Tensor y, int64_t rows_per_group, int64_t kx_per_group, int64_t splits,
           c10::optional<torch::Tensor> pos, c10::optional<torch::Tensor> cs, c10::optional<torch::Tensor> kv,
@@ -945,15 +1428,24 @@ void gemm(torch::Tensor x, torch::Tensor packed, torch::Tensor y, int64_t rows_p
   const int tiles = static_cast<int>(packed.size(1));
   TORCH_CHECK(y.size(1) >= static_cast<long long>(tiles) * w8::TR, "y too narrow");
   TORCH_CHECK(splits >= 1 && splits <= W8_SMAX && splits <= packed.size(0), "splits");
-  w8::Params p{};
-  p.w = packed.data_ptr<uint8_t>();
-  p.y = reinterpret_cast<__nv_bfloat16*>(y.data_ptr());
-  p.ldy = static_cast<int>(y.stride(0));
-  p.ntok = ntok;
-  p.nchunk = static_cast<int>(packed.size(0));
-  p.rows_per_group = static_cast<int>(rows_per_group);
-  p.kx_per_group = static_cast<int>(kx_per_group);
-  if (prof.has_value()) p.prof = reinterpret_cast<unsigned long long*>(prof->data_ptr<int64_t>());
+  FprW8a16GemmArgs a{};
+  a.call.stream = at::cuda::getCurrentCUDAStream();
+  a.call.device = x.get_device();
+  a.call.rank = 0;
+  a.x = x.data_ptr();
+  a.ntok = x.size(0);
+  a.kx = x.size(1);
+  a.x_ld = x.stride(0);
+  a.packed = packed.data_ptr<uint8_t>();
+  a.nchunk = packed.size(0);
+  a.tiles = packed.size(1);
+  a.y = y.data_ptr();
+  a.ldy = y.stride(0);
+  a.y_cols = y.size(1);
+  a.rows_per_group = rows_per_group;
+  a.kx_per_group = kx_per_group;
+  a.splits = splits;
+  if (prof.has_value()) a.prof = prof->data_ptr<int64_t>();
   if (splits > 1) {
     // split-K: the CTAs of a tile meet at a counter barrier, so the whole grid must be resident (1 CTA per SM)
     int dev = 0, nsm = 0;
@@ -963,46 +1455,71 @@ void gemm(torch::Tensor x, torch::Tensor packed, torch::Tensor y, int64_t rows_p
     TORCH_CHECK(ws.has_value() && cnt.has_value(), "split-K needs ws / cnt");
     TORCH_CHECK(ws->dtype() == torch::kFloat32 && ws->numel() >= splits * packed.size(1) * 128 * w8::YP, "ws too small");
     TORCH_CHECK(cnt->dtype() == torch::kInt32 && cnt->numel() >= packed.size(1), "cnt");
-    p.ws = ws->data_ptr<float>();
-    p.cnt = reinterpret_cast<unsigned*>(cnt->data_ptr<int>());
+    a.ws = ws->data_ptr<float>();
+    a.ws_floats = ws->numel();
+    a.cnt = cnt->data_ptr<int>();
+    a.cnt_n = cnt->numel();
   }
   if (pos.has_value()) {
     TORCH_CHECK(cs.has_value() && cs->dtype() == torch::kFloat32 && cs->size(1) == 64, "cos_sin");
-    p.pos = reinterpret_cast<const long long*>(pos->data_ptr<int64_t>());
-    p.cs = cs->data_ptr<float>();
+    a.pos = pos->data_ptr<int64_t>();
+    a.cs = cs->data_ptr<float>();
   }
   if (inv_pos.has_value()) {
     TORCH_CHECK(cs.has_value() && cs->dtype() == torch::kFloat32 && cs->size(1) == 64, "cos_sin");
     TORCH_CHECK(!pos.has_value(), "RoPE of y and inverse RoPE of x are exclusive");
-    p.inv_pos = reinterpret_cast<const long long*>(inv_pos->data_ptr<int64_t>());
-    p.cs = cs->data_ptr<float>();
+    a.inv_pos = inv_pos->data_ptr<int64_t>();
+    a.cs = cs->data_ptr<float>();
   }
   if (kv.has_value()) {
     TORCH_CHECK(kv->dtype() == torch::kBFloat16 && kv->is_contiguous() && kv->size(0) == ntok && kv->size(1) == 512, "kv");
     TORCH_CHECK(slot.has_value() && cache.has_value(), "slot / cache");
-    p.kv = reinterpret_cast<const __nv_bfloat16*>(kv->data_ptr());
-    p.slot = reinterpret_cast<const long long*>(slot->data_ptr<int64_t>());
-    p.cache = cache->data_ptr<uint8_t>();
-    p.page_stride = page_stride;
-    p.shift = static_cast<int>(shift);
+    a.kv = kv->data_ptr();
+    a.slot = slot->data_ptr<int64_t>();
+    a.cache = cache->data_ptr<uint8_t>();
+    a.page_stride = page_stride;
+    a.shift = shift;
   }
-  const int nt = nslices > 1 ? 128 : (ntok + 7) / 8 * 8;
-  const int ntx = nt < 96 ? 96 : nt;
-  const CUtensorMap tm = make_tmap(x, ntx);
-  cudaStream_t st = at::cuda::getCurrentCUDAStream();
-  switch (ntx) {
-    case 96: launch<96>(tm, p, static_cast<int>(splits), tiles, nslices, st); break;
-    case 104: launch<104>(tm, p, static_cast<int>(splits), tiles, nslices, st); break;
-    case 112: launch<112>(tm, p, static_cast<int>(splits), tiles, nslices, st); break;
-    case 120: launch<120>(tm, p, static_cast<int>(splits), tiles, nslices, st); break;
-    case 128: launch<128>(tm, p, static_cast<int>(splits), tiles, nslices, st); break;
+  const RunRes r = run(a, true);
+  switch (r.e) {
+    case RE_OK: return;
+    case RE_TMAP: TORCH_CHECK(false, "cuTensorMapEncodeTiled failed: ", r.detail);
+    case RE_SMEM: TORCH_CHECK(false, "smem attr");
+    case RE_LAUNCH_EX: TORCH_CHECK(false, "w8a16 launch (ex)");
+    case RE_LAUNCH: TORCH_CHECK(false, "w8a16 launch: ", cudaGetErrorString(static_cast<cudaError_t>(r.detail)));
     default: TORCH_CHECK(false, "token count");
   }
 }
 
 int64_t chunk_bytes() { return w8::CHUNK; }
 
+// prime(devs): every instantiation's SMEM attribute on the given devices, so no first-use module load / attribute call falls inside
+// a CUDA graph capture. w8a16.py build(prime_devs=...) calls it right after loading (the engine passes its devices). Returns the
+// number of devices primed (0 = no device visible, e.g. a login-node build); raises if the served path cannot be set.
+int64_t prime(std::vector<int64_t> devs) {
+  int n = 0, cur = 0;
+  if (cudaGetDeviceCount(&n) != cudaSuccess || n <= 0) {
+    (void)cudaGetLastError();
+    return 0;
+  }
+  cudaGetDevice(&cur);
+  if (devs.empty()) devs.push_back(cur);
+  for (const int64_t d : devs) {
+    TORCH_CHECK(d >= 0 && d < n, "w8a16 prime: no device ", d);
+    cudaSetDevice(static_cast<int>(d));
+    TORCH_CHECK(prime_dev(static_cast<int>(d)) == cudaSuccess, "w8a16 prime: device ", d);
+  }
+  cudaSetDevice(cur);
+  return static_cast<int64_t>(devs.size());
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gemm", &gemm, "fused W8A16 GEMM (exact fp8 weights, bf16 MMA, fp32 accumulation; optional RoPE + KV insert)");
   m.def("chunk_bytes", &chunk_bytes);
+  m.def("prime", &prime, "set every kernel instantiation's SMEM attribute on the given devices (empty: current) -- no lazy load at first use",
+        pybind11::arg("devs") = std::vector<int64_t>{});
+  m.def("wide_ok", [](int64_t dev) { return g_wide_ok[dev & 63]; }, "(obs) wide init status of a device");
+  m.def("wide_err", [](int64_t dev) { return g_wide_err[dev & 63]; }, "(obs) the cudaError of a failed wide init (0: ok / not tried)");
+  m.def("wide_launches", []() { return g_wide_launches.load(); }, "(obs) host launches / captures on the wide kernel");
+  m.def("wide_fallbacks", []() { return g_wide_fallbacks.load(); }, "(obs) wide-eligible calls served by the narrow kernel");
 }

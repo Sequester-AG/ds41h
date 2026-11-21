@@ -10,6 +10,7 @@ date and compiles nothing.
   python engine/prebuild_ext.py --list                           # the targets and where each one lands
   CUDA_VISIBLE_DEVICES= python engine/prebuild_ext.py --only head_comm,idx2f_tab
   CUDA_VISIBLE_DEVICES= python engine/prebuild_ext.py --root /fast/disk
+  CUDA_VISIBLE_DEVICES= python engine/prebuild_ext.py --moe-x2 --only moe_x2   # ENG_MOE_X2=1 configs (c1sm5w)
 
 Build locations:
   - extensions whose loaders take a configurable directory go under --root (default: the repository):
@@ -123,12 +124,22 @@ def _async_targets(E):
     return [("eng_rowexp", ROOT / "engine/build/eng_rowexp/eng_rowexp.so", rowexp)]
 
 
+def _moe_x2_targets(E):
+    """ENG_MOE_X2=1: kernels/moe_x2 as
+    Engine.moe_x2 loads it at init (engine/build/moe_x2 or MOE_X2_BUILD; ENG_MOE_X2_ASC selects the variant)."""
+    stub = types.SimpleNamespace(log=print)
+    root = Path(os.environ.get("MOE_X2_BUILD", os.path.join(E.PHYS, "engine/build/moe_x2")))
+    tag = f"_asc{1 if E.MOE_X2_ASC == '32' else 0}_fastepi1_pre0_slds1_w81"
+    return [("moe_x2", root / f"x2{tag}/moe_x2{tag}.so", lambda: E.Engine.moe_x2(stub))]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--root", type=Path, default=ROOT, help="base of the configurable build directories (default: repo)")
     ap.add_argument("--only", default="", help="comma-separated target names (see --list)")
     ap.add_argument("--list", action="store_true", help="print the targets and exit")
     ap.add_argument("--async", dest="asyn", action="store_true", help="also the pipelined decode path's extension")
+    ap.add_argument("--moe-x2", dest="moe_x2", action="store_true", help="also kernels/moe_x2 (ENG_MOE_X2=1 configurations)")
     a = ap.parse_args()
     if os.environ.get("CUDA_VISIBLE_DEVICES", None) != "" and not a.list:
         print("prebuild_ext: run on the CPU: CUDA_VISIBLE_DEVICES= (empty)", file=sys.stderr)
@@ -152,7 +163,7 @@ def main() -> int:
             if (Path(p) / "cuext.py").exists():
                 os.environ["DS41H_DEPLOY"] = env["DS41H_DEPLOY"] = str(Path(p).parent)
                 break
-    targets = _targets(E) + (_async_targets(E) if a.asyn else [])
+    targets = _targets(E) + (_async_targets(E) if a.asyn else []) + (_moe_x2_targets(E) if a.moe_x2 else [])
     if a.only:
         want = set(a.only.split(","))
         unknown = want - {n for n, _, _ in targets}

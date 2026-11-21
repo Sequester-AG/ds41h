@@ -125,12 +125,16 @@ _V4 = None
 
 
 def v4_ext():
-    """The kernels/moe_v4 drafter drop-in (v4.py, imported read-only, built into kernels/head/build_v4)."""
+    """The kernels/moe_v4 drafter drop-in (v4.py, imported read-only).
+    the SAME build as engine.moe_v4(): v4.load()'s default
+    root (MOE_V4_BUILD = engine/build/moe_v4), same name, sources and flags -> torch's in-process versioner never bumps it to
+    <name>_v1, whatever the load order, and no second build dir exists to go stale. Same kernels (the drafter's old build_v4
+    copy was compiled from the same moe_v4.cu / route2.cu with the same defines), so output-neutral."""
     global _V4
     if _V4 is None:
         sys.path.insert(0, os.path.join(os.path.dirname(HERE)))
         from moe_v4 import v4
-        _V4 = v4.load(build_root=os.path.join(HERE, "build_v4"))
+        _V4 = v4.load()
     return _V4
 
 
@@ -172,6 +176,34 @@ def _get(key, build, dev):
     return c(key, build, device=dev, verbose=False)
 
 
+# HSD_SKW8=1
+# the drafter blocks' q_b / wo_a / wo_b (HSD_SKW8_NAMES) at <= 32 drafter rows on kernels/attn_dense/skw8t.cu from fp8
+# copies of the checkpoint's e4m3 weights (exact dequant; +~350 MB per GPU), split counts HSD_SKW8_S (name:S,...).
+HSD_SKW8 = os.environ.get("HSD_SKW8", "0") == "1"
+# HSD_W8QB=1: the drafter blocks' q_b + RoPE(q) + window-KV insert in ONE fused W8A16 call
+# (kernels/attn_dense/w8a16.cu, the main model's q_b kernel) from the checkpoint's e4m3 q_b (exact dequant; +42 MB per block
+# per GPU) instead of bf16 cuBLAS + rope_q_insert, in drafter buckets of <= HSD_W8QB_MAXR rows.
+HSD_W8QB = os.environ.get("HSD_W8QB", "0") == "1"
+HSD_W8QB_MAXR = int(os.environ.get("HSD_W8QB_MAXR", "32"))
+# HSD_R2R=1: the v4 drafter MoE routes with moe_v4's route2r, which reads ids / weights in
+# place from the 64-B routing rows (the engine's decode path) instead of two .contiguous() copies + route2: same k_one
+# launch, same tables byte for byte; two elementwise kernels fewer per block. Rows <= 1365 (the k_one limit).
+HSD_R2R = os.environ.get("HSD_R2R", "0") == "1"
+# HSD_TPWO=1: the blocks' wo_a / wo_b split over the 4 GPUs (as the
+# engine's ENG_C1_TPWO: rank g takes heads 16g.. of every rank's drafter rows, wo_a groups 2g, 2g+1 and wo_b's K quarter
+# g; the owners sum the fp32 partials), in drafter buckets of <= HSD_TPWO_MAXR rows per rank (peer mode only).
+# HSD_ATTN_HG: the drafter's attention on fpr/kernels/attn_hg (ds41h's 16-head sparse decode
+# kernel, 4 head groups per launch) instead of FlashMLA; same records / indices / lengths / sink / scale.
+HSD_ATTN_HG = os.environ.get("HSD_ATTN_HG", "0") == "1"
+HSD_ATTN_HG_MAXR = int(os.environ.get("HSD_ATTN_HG_MAXR", "32"))   # drafter buckets of <= this many rows only (C1); above:
+                                                                     # FlashMLA (its planner suits large batches)
+HSD_TPWO = os.environ.get("HSD_TPWO", "0") == "1"
+HSD_TPWO_MAXR = int(os.environ.get("HSD_TPWO_MAXR", "32"))
+HSD_SKW8_NAMES = tuple(x for x in os.environ.get("HSD_SKW8_NAMES", "wq_b,wo_a,wo_b").split(",") if x)
+HSD_SKW8_S = dict(dict(wq_b=1, wo_a=2, wo_b=4), **{k: int(v) for k, v in (kv.split(":") for kv in
+                                                                           os.environ.get("HSD_SKW8_S", "").split(",") if kv)})
+
+
 def load_block(rd, cfg, i, rank, dev, mhc):
     A = _get(f"dspark_b{i}_attn_bf16_{WCACHE_V}", lambda: block_attn_cpu(rd, cfg, i), dev)
     F = _get(f"dspark_b{i}_r{rank}_tp4_raw_experts_{WCACHE_V}", lambda: block_ffn_cpu(rd, i, rank), dev)
@@ -181,6 +213,27 @@ def load_block(rd, cfg, i, rank, dev, mhc):
     B["sw13"] = torch.cat([A["sh_w1"][sl], A["sh_w3"][sl]], 0).contiguous()
     B["sw2"] = A["sh_w2"][:, sl].contiguous()
     B.update(F)
+    if HSD_W8QB:
+        ad = os.path.join(os.path.dirname(HERE), "attn_dense")
+        if ad not in sys.path:
+            sys.path.insert(0, ad)
+        import w8a16 as W8
+        with torch.cuda.device(dev):
+            B["w8qb"] = W8.Gemm(W8.build(), rd.get(f"mtp.{i}.attn.wq_b.weight").to(dev).contiguous(),
+                                rd.get(f"mtp.{i}.attn.wq_b.scale").to(dev).contiguous(), 1)
+    if HSD_SKW8:
+        ad = os.path.join(os.path.dirname(HERE), "attn_dense")
+        if ad not in sys.path:
+            sys.path.insert(0, ad)
+        import w8a16 as W8
+        B["pk8"] = {}
+        with torch.cuda.device(dev):
+            for nm in HSD_SKW8_NAMES:
+                w = rd.get(f"mtp.{i}.attn.{nm}.weight").to(dev)
+                sc = rd.get(f"mtp.{i}.attn.{nm}.scale").to(dev).contiguous()
+                if nm == "wo_a":
+                    w, sc = w.reshape(8192, 4096), sc.reshape(256, 128)
+                B["pk8"][nm] = W8.repack(w.contiguous(), sc)
     return B
 
 
@@ -462,23 +515,64 @@ class DraftRank:
             torch.mm(b["a"], B["wqkv_a"].t(), out=b["qakv"])
         kd.norm_rope2(b["qakv"][:, :1280], B["q_norm"], b["qr"], b["qakv"][:, 1280:], B["kv_norm"], b["kv"], self.eps,
                       b["q_pos"], self.cos_sin)
-        if self.dense_fp8:
-            self._mm8(b["qr"], B, "wq_b", b["q"].view(Rd, NH * HD))
-        else:
-            torch.mm(b["qr"], B["wq_b"].t(), out=b["q"].view(Rd, NH * HD))
         q3 = b["q"].view(Rd, NH, HD)
-        kd.rope_q_insert(q3, b["kv"], b["q_pos"], self.cos_sin, b["q_slot"], self.cache[i], self.page_stride, PAGE_SHIFT,
-                         bool(insert))
-        flash_mla_with_kvcache(q=b["q"], k_cache=self.k_cache[i], block_table=None, cache_seqlens=None, head_dim_v=HD,
-                               tile_scheduler_metadata=self.sched, is_fp8_kvcache=True, indices=b["idx"],
-                               topk_length=b["lens"], softmax_scale=HD ** -0.5, attn_sink=B["sink"], out=b["o"])
+        if HSD_W8QB and B.get("w8qb") is not None and Rd <= HSD_W8QB_MAXR:   # fused q_b + RoPE + insert (same math)
+            B["w8qb"](b["qr"], b["q"].view(Rd, NH * HD), pos=b["q_pos"], cs=self.cos_sin, kv=b["kv"] if insert else None,
+                      slot=b["q_slot"] if insert else None, cache=self.cache[i] if insert else None,
+                      page_stride=self.page_stride, shift=PAGE_SHIFT)
+        else:
+            if self.dense_fp8:
+                self._mm8(b["qr"], B, "wq_b", b["q"].view(Rd, NH * HD))
+            elif not self._sk(B, "wq_b", b["qr"], b["q"].view(Rd, NH * HD), 32768, 1280):
+                torch.mm(b["qr"], B["wq_b"].t(), out=b["q"].view(Rd, NH * HD))
+            kd.rope_q_insert(q3, b["kv"], b["q_pos"], self.cos_sin, b["q_slot"], self.cache[i], self.page_stride, PAGE_SHIFT,
+                             bool(insert))
+        if HSD_ATTN_HG and Rd <= HSD_ATTN_HG_MAXR:
+            import importlib
+            _EA = importlib.import_module("engine.attn")
+            kc = self.k_cache[i]
+            _EA.attn_hg().sparse_decode(b["q"].view(Rd, NH, HD), b["o"].view(Rd, NH, HD), kc.select(2, 0) if kc.dim() == 4 else kc,
+                                        b["idx"], b["lens"], B["sink"], float(HD ** -0.5), cluster=0, spread=True, pdl=True, hg=4,
+                                        skip_empty=True)   # padding rows (length 0) exit after the PDL wait
+        else:
+            flash_mla_with_kvcache(q=b["q"], k_cache=self.k_cache[i], block_table=None, cache_seqlens=None, head_dim_v=HD,
+                                   tile_scheduler_metadata=self.sched, is_fp8_kvcache=True, indices=b["idx"],
+                                   topk_length=b["lens"], softmax_scale=HD ** -0.5, attn_sink=B["sink"], out=b["o"])
         o3 = b["o"].view(Rd, NH, HD)
         kd.inv_rope(o3, b["q_pos"], self.cos_sin)
-        torch.bmm(o3.view(Rd, 8, 4096).transpose(0, 1), B["wo_aT"], out=b["z"].view(Rd, 8, 1024).transpose(0, 1))
+        if getattr(self, "tpc", None) is not None:   # HSD_TPWO: wo_a / wo_b in the tps / wo_tp / tpr stages
+            return
+        if not self._sk(B, "wo_a", b["o"].view(Rd, NH * HD), b["z"], 8192, 4096, 1024, 4096):
+            torch.bmm(o3.view(Rd, 8, 4096).transpose(0, 1), B["wo_aT"], out=b["z"].view(Rd, 8, 1024).transpose(0, 1))
         if self.dense_fp8:
             self._mm8(b["z"], B, "wo_b", b["y"])
-        else:
+        elif not self._sk(B, "wo_b", b["z"], b["y"], 5120, 8192):
             torch.mm(b["z"], B["wo_b"].t(), out=b["y"])
+
+    def wo_tp(self, i):
+        """HSD_TPWO local stage: z = wo_a (groups 2r, 2r+1) of every rank's rows, the fp32 wo_b partial, its RS push."""
+        c, B, r = self.tpc, self.blocks[i], self.rank
+        T = W * self.Rd
+        torch.bmm(c.og[r].view(T, 2, 4096).transpose(0, 1), B["wo_aT"][2 * r:2 * r + 2],
+                  out=c.z[r].view(T, 2, 1024).transpose(0, 1))
+        torch.mm(c.z[r], B["wo_b"][:, 2048 * r:2048 * (r + 1)].t(), out_dtype=torch.float32, out=c.yp[r])
+        c.x.tp_rs(c.yp[r], c.vm[r], r, c.tprsb, c.fl2, c.ep2[r], c.ncta)
+
+    def _sk(self, B, nm, x, y, N, K, rpg=0, kxg=0):
+        """HSD_SKW8: y = x @ W^T on skw8t (fp8 copy); False: the bf16 path."""
+        pk = B.get("pk8")
+        if pk is None or nm not in pk or x.shape[0] > 32:
+            return False
+        sk = getattr(self, "_skws", None)
+        if sk is None:
+            import importlib
+            EA = importlib.import_module("engine.attn")
+            sk = self._skws = (EA.skw8(), torch.empty(8 * 32 * 32768, dtype=torch.float32, device=x.device),
+                               {n: torch.zeros(512, dtype=torch.int32, device=x.device) for n in ("wq_b", "wo_a", "wo_b")},
+                               torch.empty(0, dtype=torch.uint8, device=x.device))
+        fn, ws, cnt, none = sk
+        fn(x, pk[nm], y, N, K, rpg, kxg, HSD_SKW8_S[nm], ws, cnt[nm], none)
+        return True
 
     def ffn_bd(self, i):
         b, B = self.b, self.blocks[i]
@@ -510,6 +604,8 @@ class DraftRank:
         b, B, m, e = self.b, self.blocks[i], self.m, self.me
         Tall = self.Tall
         fall = b["gf"].view(torch.bfloat16).view(Tall, D)
+        if self.moe_mode == "v4" and HSD_R2R and Tall <= 1365:
+            return self._moe_v4(B, m, fall, None, None, Tall, rows=b["gr"])
         ids = b["gr"][:, :24].contiguous().view(torch.int32).view(Tall, TOPK_PAD)
         wts = b["gr"][:, 24:48].contiguous().view(torch.float32).view(Tall, TOPK_PAD)
         if self.moe_mode == "v4":
@@ -534,7 +630,7 @@ class DraftRank:
             e.gemm2r8(B["w2"], B["s2"], m["ecs"], m["ec8"], m["counts"], m["himg"], m["Y"], 0)
         e.combine(m["Y"], m["slotmap"], m["sh"], m["part"])
 
-    def _moe_v4(self, B, m, fall, ids, wts, Tall):
+    def _moe_v4(self, B, m, fall, ids, wts, Tall, rows=None):
         """The kernels/moe_v4 drop-in: its route2 (pair items in t2) + prepr6 + its GEMMs,
         the shared expert on a side stream (forked before route2, joined before combine). H, Y bit-identical."""
         e4, r4 = v4_ext()
@@ -552,7 +648,10 @@ class DraftRank:
             torch.mm(m["hsh"], B["sw2"].t(), out=m["sh"])
             ev2 = torch.cuda.Event()
             ev2.record(self.sh_stream)
-        r4.route2(ids, wts, Tall, m["ecs"], m["t1"], m["t2"], m["counts"], m["slotmap"], m["rts"], m["sms"], m["empty_f"])
+        if rows is not None:   # HSD_R2R: ids / weights read in place from the routing rows (identical tables)
+            r4.route2r(rows, Tall, m["ecs"], m["t1"], m["t2"], m["counts"], m["slotmap"], m["rts"], m["sms"])
+        else:
+            r4.route2(ids, wts, Tall, m["ecs"], m["t1"], m["t2"], m["counts"], m["slotmap"], m["rts"], m["sms"], m["empty_f"])
         e4.prepr6(fall, m["ecs"], m["counts"], m["img"], m["ptok"], m["inv"], m["sms"])
         e4.gemm1r(B["w13"], B["s13"], m["ecs"], m["t1"], m["counts"], m["img"], m["himg"], 0)
         e4.gemm2r(B["w2"], B["s2"], m["ecs"], m["t2"], m["counts"], m["himg"], m["Y"], 0)
@@ -599,8 +698,42 @@ class PeerComm:
         self.gf = [r.b["gf"] for r in ranks]
         self.gr = [r.b["gr"] for r in ranks]
         self.rsb = [r.b["rs"].view(torch.uint8) for r in ranks]
+        self.tp = HSD_TPWO and ranks[0].Rd <= HSD_TPWO_MAXR
+        if self.tp:
+            from torch.utils.cpp_extension import load
+            phys = os.path.dirname(os.path.dirname(HERE))
+            bd = os.path.join(phys, "engine/build/eng_comm_c1")
+            os.makedirs(bd, exist_ok=True)
+            self.x = load(name="eng_comm_c1", sources=[os.path.join(phys, "kernels/sp_layer/comm_c1.cu")], build_directory=bd,
+                          extra_cuda_cflags=["-O3", "-std=c++17", "-gencode=arch=compute_90a,code=sm_90a"], verbose=False)
+            Rd, T, bf = ranks[0].Rd, W * ranks[0].Rd, torch.bfloat16
+            mk = lambda shape, dt, r: torch.zeros(shape, dtype=dt, device=r.dev)  # noqa: E731
+            self.og = [mk((T, 8192), bf, r) for r in ranks]
+            self.vm = [mk((T,), torch.uint8, r) for r in ranks]
+            self.ones = [torch.ones(Rd, dtype=torch.uint8, device=r.dev) for r in ranks]   # every drafter row is pushed
+            self.z = [mk((T, 2048), bf, r) for r in ranks]
+            self.yp = [mk((T, D), torch.float32, r) for r in ranks]
+            self.rsx = [mk((W, Rd, D), torch.float32, r) for r in ranks]
+            self.tprsb = [x.view(torch.uint8) for x in self.rsx]   # (not self.rsb: that is the MoE reduce-scatter's)
+            self.fl1, self.fl2 = [z(r) for r in ranks], [z(r) for r in ranks]
+            self.ep1 = [torch.zeros(1, dtype=torch.int32, device=r.dev) for r in ranks]
+            self.ep2 = [torch.zeros(1, dtype=torch.int32, device=r.dev) for r in ranks]
+            self.tk = [z(r) for r in ranks]
+            self.none = [torch.zeros(0, dtype=torch.int64, device=r.dev) for r in ranks]
+            for r in ranks:
+                r.tpc = self
         for r in ranks:  # the zero-filled flags / epochs must be visible before any peer signals them
             torch.cuda.synchronize(r.dev)
+
+    def tps_rank(self, i):
+        """HSD_TPWO: rank i's attention output head slices to every rank (+ the wait for its own)."""
+        r = self.ranks[i]
+        self.x.tp_scatter(r.b["o"].view(r.Rd, NH * HD), self.ones[i], i, self.og, self.fl1, self.vm, self.ep1[i], self.ncta,
+                          self.fl1[i], W * self.ncta, self.tk[i], self.none[i], self.none[i])
+
+    def tpr_rank(self, i):
+        r = self.ranks[i]
+        self.x.tp_rs_sum(self.rsx[i], self.fl2[i], self.ep2[i], W * self.ncta, r.b["y"], 132, self.ones[i])
 
     def ag_f_rank(self, i):
         r = self.ranks[i]
@@ -622,8 +755,10 @@ def stages(ranks, comm):
     st = [("context_kv", "local", lambda d: d.context_kv())]
     for i in range(len(ranks[0].blocks)):
         st += [(f"b{i}.attn_bd", "local", lambda d, i=i: d.attn_bd(i)),
-               (f"b{i}.attn", "local", lambda d, i=i: d.attention(i)),
-               (f"b{i}.ffn_bd", "local", lambda d, i=i: d.ffn_bd(i)),
+               (f"b{i}.attn", "local", lambda d, i=i: d.attention(i))]
+        if getattr(ranks[0], "tpc", None) is not None:   # HSD_TPWO
+            st += [(f"b{i}.tps", "tps", None), (f"b{i}.wo", "local", lambda d, i=i: d.wo_tp(i)), (f"b{i}.tpr", "tpr", None)]
+        st += [(f"b{i}.ffn_bd", "local", lambda d, i=i: d.ffn_bd(i)),
                (f"b{i}.router", "local", lambda d, i=i: d.router(i)),
                (f"b{i}.ag", "ag", None),
                (f"b{i}.moe", "local", lambda d, i=i: d.moe(i)),

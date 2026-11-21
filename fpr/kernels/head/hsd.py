@@ -90,6 +90,11 @@ class HSD:
         self.k, self.max_seqs, self.mode, self.ncta = k, max_seqs, mode, ncta
         self.MR = W * (max_seqs + 1)
         self.seq_buckets = tuple(b for b in seq_buckets if b <= max_seqs) + (() if max_seqs in seq_buckets else (max_seqs,))
+        if os.environ.get("FPR_HSD_CAP_BUCKETS", "0") == "1" and max(seq_buckets) < max_seqs:
+            # max_seqs is the state-slot count (512 with the serve state pool), but no
+            # step carries more sequences per rank than the engine's largest decode bucket / 4 (80); the appended
+            # max_seqs bucket only sized the step buffers (noise, verify / draft logits, h_all) for 2,048 rows per rank
+            self.seq_buckets = tuple(b for b in seq_buckets if b <= max_seqs)
         self.row_buckets = tuple(b * (k + 1) for b in self.seq_buckets)
         loc = V // W
         self.loc = loc
@@ -115,8 +120,13 @@ class HSD:
                     pool = dict(page_stride=WINDOW_PAGE_BYTES,
                                 base=[window_pools[r].window_base(40 + i) for i in range(3)],
                                 view=[window_pools[r].window_view(40 + i) for i in range(3)])
+                # max_pos: the drafter's RoPE table must cover every position the engine serves (geometry.MAX_MODEL_LEN,
+                # 655,360). DraftRank's default (262,144) made prompts past 262K read beyond the table.
+                # + 64: at the last rows the drafter's positions reach max_model_len + k - 1 (655,362 at k 3)
+                # the table ended exactly at 655,360 (a 2-MiB-aligned 160 MiB tensor: the next VA can be unmapped)
                 self.ranks0.append(DR.DraftRank(r, dv, reader, cfg, D_max, k, ctx_rows=max(S_max, max_tail_rows),
-                                                moe_mode=moe_mode, pool=pool))
+                                                moe_mode=moe_mode, pool=pool,
+                                                max_pos=int(os.environ.get("FPR_DRAFT_MAX_POS", "655424"))))
         self.pool = window_pools is not None
         # drafter drop-ins (bit-identical, flags): the MoE RS wait + sum folded into the next mHC boundary; the mHC split
         # boundary (mixes on a side stream); moe_mode "v4" = moe_v4's drafter MoE. None: drafter.py's env defaults.
@@ -740,6 +750,8 @@ class HSD:
                 self._mark(r, name)
             elif kind == "ag":
                 yield ("dag", Dp)
+            elif kind in ("tps", "tpr"):      # drafter.HSD_TPWO
+                yield (kind, Dp)
             else:
                 yield ("drs", Dp)
         yield ("ag", "hd", d.b["hd"], [x[: n * k] for x in self.hd_all])
@@ -821,6 +833,11 @@ class HSD:
             elif kind == "dag":
                 ranks = [self.draft_rank(r, reqs[0][1]) for r in range(W)]
                 self._dag(ranks)
+            elif kind in ("tps", "tpr"):
+                comm = self.dcomm[self.draft_rank(0, reqs[0][1]).n]
+                for r in range(W):
+                    with torch.cuda.device(self.devs[r]):
+                        (comm.tps_rank if kind == "tps" else comm.tpr_rank)(r)
             else:
                 ranks = [self.draft_rank(r, reqs[0][1]) for r in range(W)]
                 self._drs(ranks)
@@ -872,6 +889,10 @@ class HSD:
                 self.gather.e.wait(flags[r], epochs[r], W * nc)
             elif req[0] == "dag":
                 comm.ag_f_rank(r)
+            elif req[0] == "tps":
+                comm.tps_rank(r)
+            elif req[0] == "tpr":
+                comm.tpr_rank(r)
             else:
                 comm.rs_rank(r)
 

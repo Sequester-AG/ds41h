@@ -120,7 +120,7 @@ def stage_fp8(w: torch.Tensor, perm8: bool = True) -> torch.Tensor:
     Per (64-row block, 128-byte K group): 16 fragments (K32 block q, 16-row tile rt) of 512 B;
     lane (g, t) holds row g's 8 bytes at K 32q + 8t.. then row g+8's, each 8-group permuted by
     P8 when ``perm8`` (FP8 weights feeding the f16 HMMA). bf16 matrices are passed as their
-    uint8 view with ``perm8=False`` (the gate's bf16 HMMA consumes natural order). K is
+    uint8 view with ``perm8=False``. K is
     zero-padded to a multiple of 128 bytes.
     """
     w = w.contiguous().view(torch.uint8)
@@ -341,9 +341,7 @@ class DecoderEngine:
         self.set_coarse(int(os.environ.get("DS41H_DECODER_R1KP", "0")), int(os.environ.get("DS41H_DECODER_LAG", "0")))
 
     def set_coarse(self, r1kp: int = 0, lag: int = 0) -> None:
-        """Coarse routed path (m <= 8) knobs: R1 K parts (0 = auto by m: the lossless path uses 5 / 2 / 1 K
-        parts for m = 1 / 2-3 / 4-8; 1 = full K per job, 2, lossless also 5) and the expert lag of the R2 jobs
-        behind their R1 jobs (0 = auto, about 1.5 grids of R1 jobs). Env defaults: DS41H_DECODER_R1KP,
+        """Env defaults: DS41H_DECODER_R1KP
         DS41H_DECODER_LAG."""
         self.ext.set_coarse(self.handle, r1kp, lag)
 
@@ -380,11 +378,7 @@ class DecoderEngine:
         """Run layer `idx` on M = residual.shape[0] tokens. Shapes follow stock exactly:
         o bf16 [>=M, >=16, 512] (head stride 512, e.g. the stock [M, 64, 512] buffer), positions
         int64 [M], cos_sin fp32 [max_pos, 64], residual bf16 [M, 4, 5120], post_mix fp32
-        [M, 4, 1], res_mix fp32 [M, 4, 4], attn_pre fp32 [M, 4].
-
-        p1a = (resid_out bf16 [>=M, 4, 5120], xcb bf16 [>=M, 5120], xsq fp32 [>=M, 160]) or None: the kernel
-        also writes the next layer's prologue phase P1a (post-mapped residual stream, ffn_pre collapse, per
-        32-column slice square sums), bit-identical to prologue.cu p1_collapse (decoder.cu xf_p1a)."""
+        [M, 4, 1], res_mix fp32 [M, 4, 4], attn_pre fp32 [M, 4]."""
         m = residual.shape[0]
         dev = residual.device
         x = torch.empty((m, HID), dtype=torch.bfloat16, device=dev)
@@ -657,7 +651,7 @@ def prepare_model(lm) -> None:
         layer._ds41h_cos_sin = cos_sin
         layer._ds41h_decoder = eng.add_layer(dense, experts[lid])
     pf = os.environ.get("DS41H_DECODER_PREFETCH", "0")
-    if pf in ("1", "2"):  # 1: during the OWNA jobs, 2: during the routed R1 jobs (streaming phase, coarse m)
+    if pf in ("1", "2"):
         _set_prologue_prefetch(eng, layers, phase=int(pf) - 1)
     if os.environ.get("DS41H_DECODER_DPF", "0") == "1":
         _set_dense_prefetch(eng, layers)
@@ -671,8 +665,7 @@ def prepare_model(lm) -> None:
 
 def _set_prologue_prefetch(eng: DecoderEngine, layers: list, phase: int = 0) -> None:
     """Layer i's kernel L2-prefetches layer i+1's prologue weights (ds41h.prologue: fused wq_a|wkv,
-    wq_b, hc_attn_fn; only when that layer runs the ds41h prologue), evict_last; phase 0 = during the OWNA jobs,
-    1 = during the coarse R1 jobs (DS41H_DECODER_PREFETCH=2)."""
+    wq_b, hc_attn_fn; only when that layer runs the ds41h prologue), evict_last"""
     if not flags.PROLOGUE:
         return
     try:
@@ -756,8 +749,8 @@ def raw_attention_output(attn):
 
 
 def ffn(layer, o: torch.Tensor, positions, residual, post_mix, res_mix, attn_pre, p1a=None):
-    """Fused post-attention half of DeepseekV4DecoderLayer.forward (model.py:597-625). p1a = (resid_out, xcb, xsq):
-    also write the next layer's prologue phase P1a (DecoderEngine.run, decoder.cu xf_p1a); None = off."""
+    """Fused post-attention half of DeepseekV4DecoderLayer.forward (model.py:597-625).
+    None = off."""
     if not isinstance(o, torch.Tensor) or o.dtype != torch.bfloat16 or o.dim() != 3:
         raise RuntimeError(f"ds41h decoder: unexpected attention output {type(o)}")
     # The kernel needs dense row-major mixes / residual (the stock producers already return

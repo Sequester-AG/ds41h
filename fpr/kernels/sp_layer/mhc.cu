@@ -593,6 +593,8 @@ __global__ void __launch_bounds__(THR) k_mhc_finish(
 }
 }  // namespace mhc
 
+#include "mhc_cabi.h"
+
 // y [R, D] bf16, rs [R, 4, D] bf16, post [R, 4] f32, comb [R, 4, 4] f32, lag [R, 4] f32, fn [24, 4D] f32, scale [3],
 // base [24], normw [D] f32 -> xn [R, 4, D] bf16, pre/post_n [R, 4], comb_n [R, 4, 4], out [R, D] bf16; part scratch
 // [20 * R * 25] f32.
@@ -713,13 +715,24 @@ void k1a_rs(torch::Tensor recv, torch::Tensor flag, torch::Tensor epoch, int64_t
       nullptr, (const __nv_bfloat16*)rs.data_ptr(), post.data_ptr<float>(), comb.data_ptr<float>(),
       (const float2*)fn.data_ptr(), R, (__nv_bfloat16*)xn.data_ptr(), part.data_ptr<float>(), fo);
 }
+static int k1b_out_core(const FprMhcK1bOutArgs* p) {   // C ABI "mhc.k1b_out": the launch of pybind k1b_out
+  try {
+    const int R = (int)p->R;
+    mhc::k_mhc_finish<1><<<R, mhc::THR, 0, p->c.stream>>>(
+        nullptr, (const __nv_bfloat16*)p->xn, const_cast<float*>(p->lag), nullptr, nullptr, const_cast<float*>(p->normw), R,
+        p->norm_eps, 0.f, 0, nullptr, nullptr, nullptr, (__nv_bfloat16*)p->out, mhc::Push{}, (int*)p->ptok_o);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void k1b_out(torch::Tensor xn, torch::Tensor lag, torch::Tensor normw, double norm_eps, torch::Tensor out,
              torch::Tensor ptok_o) {
   const int R = (int)xn.size(0);
-  mhc::k_mhc_finish<1><<<R, mhc::THR, 0, at::cuda::getCurrentCUDAStream()>>>(
-      nullptr, (const __nv_bfloat16*)xn.data_ptr(), lag.data_ptr<float>(), nullptr, nullptr, normw.data_ptr<float>(), R,
-      (float)norm_eps, 0.f, 0, nullptr, nullptr, nullptr, (__nv_bfloat16*)out.data_ptr(), mhc::Push{},
-      ptok_o.numel() ? ptok_o.data_ptr<int>() : nullptr);
+  FprMhcK1bOutArgs ca{{at::cuda::getCurrentCUDAStream(), (int)xn.get_device(), 0}, xn.data_ptr(), lag.data_ptr<float>(),
+                      normw.data_ptr<float>(), (float)norm_eps, out.data_ptr(), ptok_o.numel() ? ptok_o.data_ptr<int>() : nullptr,
+                      R};
+  TORCH_CHECK(k1b_out_core(&ca) == FPR_OK, "mhc k1b_out: CUDA launch error");
 }
 void k1b_mix(torch::Tensor part, int64_t R, torch::Tensor scale, torch::Tensor base, double norm_eps, double hc_eps,
              int64_t iters, torch::Tensor pre_o, torch::Tensor post_o, torch::Tensor comb_o) {
@@ -730,12 +743,24 @@ void k1b_mix(torch::Tensor part, int64_t R, torch::Tensor scale, torch::Tensor b
 }
 
 // K1a split: k1a_x (phase 1, xn only; the critical path) + k1a_mix (part from xn; side stream) = k1a.
+static int k1a_x_core(const FprMhcK1aXArgs* p) {   // C ABI "mhc.k1a_x"
+  try {
+    const int R = (int)p->R;
+    if (!MHC_ROWS_OK(R)) return FPR_E_SHAPE;
+    mhc::k_mhc_post_mix2<false, 1><<<dim3(mhc::NCH / 2, (R + MHC_RPC - 1) / MHC_RPC), mhc::THR, 0, p->c.stream>>>(
+        (const __nv_bfloat16*)p->y, (const __nv_bfloat16*)p->rs, const_cast<float*>(p->post), const_cast<float*>(p->comb),
+        nullptr, R, (__nv_bfloat16*)p->xn, nullptr);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void k1a_x(torch::Tensor y, torch::Tensor rs, torch::Tensor post, torch::Tensor comb, torch::Tensor xn) {
   const int R = (int)y.size(0);
   TORCH_CHECK(MHC_ROWS_OK(R), "mhc k1a_x: rows per call");
-  mhc::k_mhc_post_mix2<false, 1><<<dim3(mhc::NCH / 2, (R + MHC_RPC - 1) / MHC_RPC), mhc::THR, 0, at::cuda::getCurrentCUDAStream()>>>(
-      (const __nv_bfloat16*)y.data_ptr(), (const __nv_bfloat16*)rs.data_ptr(), post.data_ptr<float>(), comb.data_ptr<float>(),
-      nullptr, R, (__nv_bfloat16*)xn.data_ptr(), nullptr);
+  FprMhcK1aXArgs ca{{at::cuda::getCurrentCUDAStream(), (int)y.get_device(), 0}, y.data_ptr(), rs.data_ptr(), post.data_ptr<float>(),
+                    comb.data_ptr<float>(), xn.data_ptr(), R};
+  TORCH_CHECK(k1a_x_core(&ca) == FPR_OK, "mhc k1a_x: CUDA launch error");
 }
 void k1a_x_rs(torch::Tensor recv, torch::Tensor flag, torch::Tensor epoch, int64_t signals, torch::Tensor rs,
               torch::Tensor post, torch::Tensor comb, torch::Tensor xn) {
@@ -789,6 +814,18 @@ torch::Tensor prep_fn(torch::Tensor fn) {
   return out;
 }
 
+// ---- C ABI (fpr_cabi.h): table. No init entry: no per-device state (no dynamic SMEM, no attributes).
+extern "C" {
+static int c_k1a_x(const void* a) { return k1a_x_core((const FprMhcK1aXArgs*)a); }
+static int c_k1b_out(const void* a) { return k1b_out_core((const FprMhcK1bOutArgs*)a); }
+static const FprFnEntry k_mhc_fns[] = {
+    {"mhc.k1a_x", c_k1a_x, nullptr, (int64_t)sizeof(FprMhcK1aXArgs)},
+    {"mhc.k1b_out", c_k1b_out, nullptr, (int64_t)sizeof(FprMhcK1bOutArgs)},
+};
+static const FprExtTable k_mhc_table = {FPR_CABI_VERSION, "mhc", "", 2, k_mhc_fns};
+__attribute__((visibility("default"))) const FprExtTable* fpr_mhc_table(void) { return &k_mhc_table; }
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("boundary", &boundary);
   m.def("boundary2", &boundary2);
@@ -802,4 +839,30 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("k1b_out", &k1b_out);
   m.def("k1b_mix", &k1b_mix);
   m.def("prep_fn", &prep_fn);
+}
+
+// ---- fpr_kwarm(dev): cudaFuncGetAttributes on every __global__ this .so launches (incl. the
+// template instances), on device dev (current device restored). Under CUDA_MODULE_LOADING=LAZY that loads the module at
+// driver init instead of at the first launch on a pool thread. Host code only: the kernels are unchanged.
+extern "C" __attribute__((visibility("default"))) int fpr_kwarm(int dev) {
+  int prev = 0;
+  if (cudaGetDevice(&prev) != cudaSuccess) return -1;
+  if (cudaSetDevice(dev) != cudaSuccess) return -1;
+  cudaFuncAttributes fa;
+  int bad = 0;
+  const void* fns[] = {
+      (const void*)&mhc::k_mhc_post_mix,
+      (const void*)&mhc::k_mhc_post_mix2<false, 0>,
+      (const void*)&mhc::k_mhc_post_mix2<true, 0>,
+      (const void*)&mhc::k_mhc_post_mix2<false, 1>,
+      (const void*)&mhc::k_mhc_post_mix2<true, 1>,
+      (const void*)&mhc::k_mhc_post_mix2<false, 2>,
+      (const void*)&mhc::k_mhc_finish<0>,
+      (const void*)&mhc::k_mhc_finish<1>,
+      (const void*)&mhc::k_mhc_finish<2>,
+  };
+  for (const void* fn : fns) bad += cudaFuncGetAttributes(&fa, fn) != cudaSuccess;
+  cudaGetLastError();
+  cudaSetDevice(prev);
+  return bad ? -1 : (int)(sizeof(fns) / sizeof(fns[0]));   // kernels warmed (mhc)
 }

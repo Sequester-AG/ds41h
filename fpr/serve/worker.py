@@ -65,15 +65,142 @@ class WorkerConfig:
                                            # engine.step_compact: O(sequences) host tables instead of O(rows x 128)
 
 
+def _before_sizing(devices, log) -> None:
+    """Right before the KV pools are sized: what is on the GPUs.
+    FPR_MEMPROBE=<dir>: torch memory snapshot (with the stacks recorded since Stage4Worker started) -> <dir>/snapshot.pickle;
+    FPR_PROBE_EXIT=1: stop the start there. FPR_SIZE_EMPTY_CACHE=1: return the allocator's idle cache before sizing."""
+    import torch
+    for d in devices:
+        if getattr(torch.device(d), "type", "cuda") == "cuda":
+            torch.cuda.synchronize(d)
+    if not any(getattr(torch.device(d), "type", "cuda") == "cuda" for d in devices):
+        return                    # CPU test workers (mock / CPU backends): no CUDA memory to probe
+
+    def row(tag):
+        return f"memprobe {tag}: " + "; ".join(
+            f"gpu{d} free {torch.cuda.mem_get_info(d)[0] / 1e9:.2f} allocated {torch.cuda.memory_allocated(d) / 1e9:.2f} "
+            f"reserved {torch.cuda.memory_reserved(d) / 1e9:.2f} GB" for d in devices)
+    log(row("before sizing"))
+    probe = os.environ.get("FPR_MEMPROBE")
+    if probe:
+        import pickle
+        os.makedirs(probe, exist_ok=True)
+        with open(os.path.join(probe, "snapshot.pickle"), "wb") as f:
+            pickle.dump(torch.cuda.memory._snapshot(), f)
+        log(f"memprobe: snapshot in {probe}/snapshot.pickle")
+    if os.environ.get("FPR_SIZE_EMPTY_CACHE", "0") == "1":
+        torch.cuda.empty_cache()
+        log(row("after empty_cache"))
+    if os.environ.get("FPR_PROBE_EXIT", "0") == "1":
+        raise SystemExit("memprobe: FPR_PROBE_EXIT=1, stopping before the pools")
+
+
 def size_pools(free_bytes: int, cfg: WorkerConfig, geom: Geometry, extra_weight_bytes: int = 0) -> Geometry:
     """Geometry whose pools fill what is free on the device after the weights (minus reserve, minus the weights that a
     reuse-mode run does not load but the real engine would)."""
     kv = int(free_bytes - cfg.reserve_bytes - extra_weight_bytes)
     if cfg.max_kv_bytes:
         kv = min(kv, cfg.max_kv_bytes)
+    host = host_kv_bytes()
+    if host:   # the paged pool lives in host memory; HBM keeps the window + state pools only
+        from kv_manager import hbm_pages
+        host += hbm_pages() * PAGE_BYTES   # tiered: its leading FPR_KV_HBM_PAGES pages in HBM (one range)
+        hbm = geom.window_pool_bytes + geom.state_pool_slots * STATE_SLOT_BYTES + PAGE_BYTES
+        mir = idx_mirror_bytes()   # (lever (a): HBM next to the window / state pools; not part of the paged pool)
+        assert kv >= hbm + mir, (f"not enough memory for the window + state pools + index-key mirror ({kv / 1e9:.1f} GB < "
+                                 f"{(hbm + mir) / 1e9:.1f} GB)")
+        return dataclasses.replace(geom, kv_bytes_per_rank=hbm - PAGE_BYTES + host)
     assert kv > geom.window_pool_bytes + geom.state_pool_slots * STATE_SLOT_BYTES + 100 * PAGE_BYTES, \
         f"not enough memory for KV pools ({kv / 1e9:.1f} GB)"
     return dataclasses.replace(geom, kv_bytes_per_rank=kv)
+
+
+def idx_mirror_bytes() -> int:
+    """Lever (a), the HBM index-key mirror: FPR_KV_IDX_MIRROR=<slots>
+    (default 0 = off; tiered pools only) slots of the 4 sources' index-key span of a 64-token page (22,464 B) in HBM."""
+    n = int(os.environ.get("FPR_KV_IDX_MIRROR", "0") or 0)
+    if n <= 0:
+        return 0
+    from geometry import KV_SOURCE_LAYERS, PAGE_LAYOUT
+    return n * sum(PAGE_LAYOUT[f"idx{s}"] for s in KV_SOURCE_LAYERS)
+
+
+def _pagecopy():
+    """kernels/pagecopy (FPR_PAGECOPY): the batched page-copy module, imported from this tree's fpr/kernels."""
+    import sys
+    p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "kernels", "pagecopy")
+    if p not in sys.path:
+        sys.path.insert(0, p)
+    import pagecopy
+    return pagecopy
+
+
+def host_kv_bytes() -> int:
+    """The window and state pools stay in HBM; what HBM the paged pool would have taken stays free."""
+    gb = float(os.environ.get("FPR_KV_HOST_GB", "0") or 0)
+    return int(gb * 1e9) // PAGE_BYTES * PAGE_BYTES
+
+
+# FPR_CANARY=1 puts a pattern-filled guard region of
+# FPR_CANARY_MB (default 4) right after each torch-allocated KV pool (window incl. its scratch page, state; paged when not
+# host-mapped). Before every FPR_CANARY_EVERY-th step (default 1) all devices are synchronized and the guards compared:
+# a write past a pool's end is logged with rank, pool, first / last corrupted offset and the steps since the last check.
+# Off: the pools are allocated exactly as before.
+CANARY = os.environ.get("FPR_CANARY", "0") == "1"
+# FPR_PAGECOPY=1: Worker.copies issues one kernels/pagecopy launch per
+# (pool, src rank, dst rank) instead of one copy_ per contiguous run. With scattered free lists nearly every run is a
+# single page, and an HtoH pinned -> pinned copy_ costs ~60 us of host time per page. Byte copy: bitwise. The device syncs after the copies stay as they were.
+PAGECOPY = os.environ.get("FPR_PAGECOPY", "0") == "1"
+PAGECOPY_LOG_S = float(os.environ.get("FPR_PAGECOPY_LOG_S", "30") or 30)
+CANARY_BYTES = int(float(os.environ.get("FPR_CANARY_MB", "4")) * 2 ** 20)
+CANARY_EVERY = max(1, int(os.environ.get("FPR_CANARY_EVERY", "1") or 1))
+CANARY_BYTE = 0xA5
+
+
+def _guarded(nbytes: int, device, zero: bool, name: str, canaries: list):
+    import torch
+    if not CANARY:
+        return (torch.zeros if zero else torch.empty)(nbytes, dtype=torch.uint8, device=device)
+    buf = torch.empty(nbytes + CANARY_BYTES, dtype=torch.uint8, device=device)
+    if zero:
+        buf[:nbytes].zero_()
+    buf[nbytes:].fill_(CANARY_BYTE)
+    canaries.append((name, buf[nbytes:]))
+    return buf[:nbytes]
+
+
+def log_pool_ranges(pools: list, log=print) -> None:
+    """each rank's KV pool address ranges, the
+    caching-allocator segment that holds each pool and the next segment above it on that device, so an Xid fault address
+    can be matched to a pool end. A host-mapped pool is not a torch segment ("segment ?")."""
+    try:
+        import torch
+        segs: dict = {}
+        try:
+            for s_ in torch.cuda.memory_snapshot():
+                segs.setdefault(int(s_["device"]), []).append((int(s_["address"]), int(s_["total_size"])))
+        except Exception as e:  # noqa: BLE001
+            log(f"worker: pool ranges: no allocator snapshot ({e})")
+        for r, p in enumerate(pools):
+            ss = sorted(segs.get(p.device.index, []))
+            for name in ("paged", "window", "state", "idxmirror"):
+                t = getattr(p, name, None)
+                if t is None:
+                    continue
+                a, n = int(t.data_ptr()), int(t.numel() * t.element_size())
+                seg = next(((sa, sn) for sa, sn in ss if sa <= a < sa + sn), None)
+                if seg is not None:
+                    se = seg[0] + seg[1]
+                    nxt = next((sa for sa, sn in ss if sa >= se), None)
+                    tail = (f"segment [0x{seg[0]:x}, 0x{se:x}) = pool end + {se - a - n:,} B; next segment "
+                            + (f"0x{nxt:x} (+{nxt - se:,} B)" if nxt is not None else "none above"))
+                else:
+                    tail = "segment ? (not a torch allocation)"
+                cn = sum(int(c.numel()) for nm, c in getattr(p, "canaries", []) if nm == name)
+                log(f"worker: pool range rank {r} cuda:{p.device.index} {name}: [0x{a:x}, 0x{a + n:x}) {n:,} B"
+                    f"{f' + canary {cn:,} B' if cn else ''}; {tail}")
+    except Exception as e:  # noqa: BLE001
+        log(f"worker: pool ranges not logged ({e})")
 
 
 # ---------------------------------------------------------------------------------------------- pools
@@ -87,15 +214,35 @@ class Pools:
         p, w, s = geom.pools()
         self.n_paged, self.n_window, self.n_state = p.num_pages, w.num_pages, s.num_pages
         self.device = torch.device(device)
+        self.canaries: list = []     # FPR_CANARY: (pool name, guard view) after each torch-allocated pool
         u8 = torch.uint8
-        self.paged = torch.empty(self.n_paged * PAGE_BYTES, dtype=u8, device=self.device)
-        self.window = torch.empty((self.n_window + 1) * WINDOW_PAGE_BYTES, dtype=u8, device=self.device)
-        self.state = torch.zeros(self.n_state * STATE_SLOT_BYTES, dtype=u8, device=self.device)
+        if host_kv_bytes():
+            import importlib.util
+            path = os.environ["FPR_C2C_POOL"]
+            spec = importlib.util.spec_from_file_location("c2c_pool", path)
+            c2c = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(c2c)
+            from kv_manager import hbm_pages
+            n_hbm = hbm_pages()
+            if n_hbm:   # tiered: [HBM pages | host pages] in one range (kv_manager.TierFree hands out HBM first)
+                assert 0 < n_hbm < self.n_paged, (n_hbm, self.n_paged)
+                self.paged = c2c.tier_u8(self.device.index, n_hbm * PAGE_BYTES, (self.n_paged - n_hbm) * PAGE_BYTES)
+            else:
+                self.paged = c2c.host_u8(self.device.index, self.n_paged * PAGE_BYTES)
+            self.n_hbm_pages = n_hbm
+            mb = idx_mirror_bytes()
+            self.idxmirror = _guarded(mb, self.device, False, "idxmirror", self.canaries) if mb and n_hbm else None
+        else:
+            self.paged = _guarded(self.n_paged * PAGE_BYTES, self.device, False, "paged", self.canaries)
+            self.n_hbm_pages = self.n_paged
+        self.window = _guarded((self.n_window + 1) * WINDOW_PAGE_BYTES, self.device, False, "window", self.canaries)
+        self.state = _guarded(self.n_state * STATE_SLOT_BYTES, self.device, True, "state", self.canaries)
         self.scratch_window_page = self.n_window
 
     @property
     def nbytes(self) -> int:
-        return self.paged.numel() + self.window.numel() + self.state.numel()
+        m = getattr(self, "idxmirror", None)
+        return self.paged.numel() + self.window.numel() + self.state.numel() + (m.numel() if m is not None else 0)
 
     def comp_base(self, src: int):
         """1-D view starting at source layer `src`'s compressed records (page stride PAGE_BYTES)."""
@@ -186,8 +333,8 @@ class TableBuilder:
     """StepBatch -> RankTables, O(rows) and vectorized per rank (torch, CPU): per sequence only small Python slices of
     the window / compressed pages its rows actually read, then one set of tensor ops for all rows.
 
-    Block tables go out as DELTAS (contract D12): a sequence's full table once per (rank, state slot, uid) -- first
-    scheduling, after a rank move or a preemption -- then only the pages appended since; the engine keeps its own
+    Block tables go out as DELTAS (contract D12): a sequence's full table once per (rank, state slot, uid)
+    then only the pages appended since; the engine keeps its own
     persistent per-slot device table. full_block_tables=True also materializes seq_block_table [S, maxB] (tests).
     stub_indexer=False skips the stub top-512 tables (an engine with the real indexer ignores them, D9)."""
 
@@ -810,7 +957,10 @@ class Worker:
             Engine = getattr(importlib.import_module(mod), cls)
             self.backend = Engine(devices=cfg.devices, model_dir=cfg.model, max_rows=max_rows, **cfg.engine_kw)
             self.tb.stub_indexer = bool(getattr(self.backend, "wants_stub_indexer", False))
+            _before_sizing(self.backend.devices, log)
             free = min(self.backend.free_bytes())
+            if os.environ.get("FPR_KV_GB"):   # fixed KV pool bytes per rank (window + state + paged)
+                free = int(float(os.environ["FPR_KV_GB"]) * 1e9) + cfg.reserve_bytes
             # rows per rank per step: the engine's mixed-step capacity (decode-only steps use its graph buckets <=
             # max_rows; seats stay min(max_seqs_per_rank, ...) so all-decode rows fit the largest bucket)
             ecfg = getattr(self.backend, "cfg", None)
@@ -825,7 +975,18 @@ class Worker:
             self.pools = [Pools(self.geom, d) for d in self.backend.devices]
             self.backend.bind_pools(self.pools)
             p = self.geom.pools()[0]
-            log(f"worker[engine]: KV pools {self.geom.kv_bytes_per_rank / 1e9:.1f} GB per rank = {p.num_pages:,} pages")
+            log(f"worker[engine]: KV pools {self.geom.kv_bytes_per_rank / 1e9:.1f} GB per rank = {p.num_pages:,} pages"
+                f" ({self.pools[0].n_hbm_pages:,} in HBM, {p.num_pages - self.pools[0].n_hbm_pages:,} in host memory;"
+                f" {p.num_pages * PAGE_TOKENS / 1e6:.2f}M tokens per rank)")
+            log_pool_ranges(self.pools, log)
+            if CANARY:
+                log(f"worker: FPR_CANARY on: {CANARY_BYTES:,} B guard after "
+                    f"{', '.join(n for n, _ in self.pools[0].canaries)} on every rank, checked every {CANARY_EVERY} step(s)")
+            if PAGECOPY:   # load (or build) kernels/pagecopy now: never a JIT build at the first copy while serving
+                t_ = time.perf_counter()
+                _pagecopy().ext()
+                log(f"worker: FPR_PAGECOPY on: batched page copies (kernels/pagecopy), extension ready in "
+                    f"{time.perf_counter() - t_:.1f} s; copy stats every {PAGECOPY_LOG_S:.0f} s with copies")
         else:
             import weights as Wt
 
@@ -845,6 +1006,42 @@ class Worker:
             log(f"worker: KV pools {self.geom.kv_bytes_per_rank / 1e9:.1f} GB per rank = {p.num_pages:,} pages "
                 f"({p.num_pages * PAGE_TOKENS / 1e6:.1f}M tokens), free before {free / 1e9:.1f} GB, reuse-mode "
                 f"weight allowance {extra / 1e9:.1f} GB")
+
+    def _canary_check(self, batches: list) -> None:
+        """FPR_CANARY (debug): before this step's work, every FPR_CANARY_EVERY-th step, synchronize all devices and compare
+        every pool's guard region with the pattern. A trip logs rank, pool, first / last corrupted offset, the first 16
+        bytes there and the steps issued since the last clean check (one of them wrote past the pool end), then re-arms."""
+        import torch
+
+        ring = self.__dict__.setdefault("_canary_ring", [])
+        n = self.__dict__.get("_canary_n", 0) + 1
+        self._canary_n = n
+        if n % CANARY_EVERY == 0 and ring:
+            for p in self.pools:
+                torch.cuda.synchronize(p.device)
+            trips = 0
+            for r, p in enumerate(self.pools):
+                for name, c in p.canaries:
+                    bad = (c != CANARY_BYTE).nonzero()
+                    if bad.numel():
+                        trips += 1
+                        lo, hi = int(bad[0]), int(bad[-1])
+                        self.log(f"worker: CANARY TRIPPED rank {r} pool {name}: {int(bad.numel()):,} B changed, offsets "
+                                 f"{lo:,}..{hi:,} past the pool end (0x{int(c.data_ptr()) + lo:x}); bytes there "
+                                 f"{c[lo:lo + 16].tolist()}; steps since the last clean check (step, rows per rank, max "
+                                 f"position, sample rows): {ring[-8:]}")
+                        c.fill_(CANARY_BYTE)
+            self.stats_canary = getattr(self, "stats_canary", 0) + trips
+            if n % (CANARY_EVERY * 5000) == 0:
+                self.log(f"worker: canary: {n:,} steps, checked every {CANARY_EVERY}, {self.stats_canary} trips so far")
+            ring.clear()
+        try:
+            ring.append((getattr(batches[0], "step", n) if batches else n, [int(sb.n_rows) for sb in batches],
+                         max((max(sb.positions) if sb.positions else 0) for sb in batches) if batches else 0,
+                         sum(len(sb.sample_rows) for sb in batches)))
+        except Exception:  # noqa: BLE001
+            ring.append((n,))
+        del ring[:-64]
 
     def poison(self, batches: list) -> int:
         """Debug ($PHYS_POISON_ON_FREE): fill the pages / slots the KV manager freed since the last step with 0xFF, before
@@ -890,15 +1087,41 @@ class Worker:
 
         size = dict(paged=PAGE_BYTES, window=WINDOW_PAGE_BYTES, state=STATE_SLOT_BYTES)
         touched = set()
-        for pool, sr, s0, dr, d0, n in copy_runs(list(ops.values())):
-            src = getattr(self.pools[sr], pool)
-            dst = getattr(self.pools[dr], pool)
-            b = size[pool]
-            dst[d0 * b:(d0 + n) * b].copy_(src[s0 * b:(s0 + n) * b], non_blocking=True)
-            touched |= {src.device, dst.device}
+        if PAGECOPY:                       # one launch per (pool, src rank, dst rank), on the destination GPU
+            groups = {}
+            for c in ops.values():
+                g_ = groups.setdefault((c.pool, c.src_rank, c.dst_rank), ([], []))
+                g_[0].append(c.src_page)
+                g_[1].append(c.dst_page)
+            pc = _pagecopy()
+            t_pc = time.perf_counter()
+            for (pool, sr, dr), (sp_, dp_) in groups.items():
+                src, dst = getattr(self.pools[sr], pool), getattr(self.pools[dr], pool)
+                pc.copy_pages(src, dst, sp_, dp_, size[pool])
+                touched |= {src.device, dst.device}
+        else:
+            for pool, sr, s0, dr, d0, n in copy_runs(list(ops.values())):
+                src = getattr(self.pools[sr], pool)
+                dst = getattr(self.pools[dr], pool)
+                b = size[pool]
+                dst[d0 * b:(d0 + n) * b].copy_(src[s0 * b:(s0 + n) * b], non_blocking=True)
+                touched |= {src.device, dst.device}
         for d in touched:                  # v0: the step's streams must see the copied pages (copies are rare)
             if d.type == "cuda":
                 torch.cuda.synchronize(d)
+        if PAGECOPY:                       # FPR_PAGECOPY: the copy stats line (calls, pages, groups, host ms incl. syncs)
+            pcs = self.__dict__.setdefault("_pc_stats", dict(calls=0, pages=0, groups=0, ms=0.0, ms_max=0.0, t=time.time()))
+            dt_ = (time.perf_counter() - t_pc) * 1e3
+            pcs["calls"] += 1
+            pcs["pages"] += len(ops)
+            pcs["groups"] += len(groups)
+            pcs["ms"] += dt_
+            pcs["ms_max"] = max(pcs["ms_max"], dt_)
+            if time.time() - pcs["t"] >= PAGECOPY_LOG_S:
+                self.log(f"worker: FPR_PAGECOPY {time.time() - pcs['t']:.0f}s: {pcs['calls']} steps with copies, "
+                         f"{pcs['pages']:,} pages in {pcs['groups']} launches, host {pcs['ms']:.1f} ms incl. device syncs "
+                         f"(max {pcs['ms_max']:.1f} ms per step)")
+                pcs.update(calls=0, pages=0, groups=0, ms=0.0, ms_max=0.0, t=time.time())
         # engine-side per-slot state that is not in the pools follows a moved sequence's state slot (Engram's token-history
         # ring; left behind on a rank move, the moved sequence would get a wrong n-gram lookback)
         hook = getattr(self.backend, "copy_state_slots", None)
@@ -909,7 +1132,7 @@ class Worker:
 
     def step(self, ps, grammar: dict | None = None, mm: list | None = None) -> list:
         """The adapter's worker protocol (adapter/bridge.py PhysStep; D11): batches + per-row input
-        tokens + the request lifecycle (new requests with their sampling params, finished / preempted) + grammar rows.
+        tokens + the request lifecycle + grammar rows.
         `mm`: the step's image rows, per rank (idx int32 [M], emb [M, hidden]) on that rank's device or None (the
         caller encodes and gathers them; interfaces.image_rows lists the rows); passed on as StepContext.mm.
         Returns one StepResult per rank (+ drafts for structured-output requests)."""
@@ -920,6 +1143,8 @@ class Worker:
         batches = ps.batches
         t0 = _t.perf_counter()
         self._shape_log(ps, batches, t0)
+        if CANARY and self.pools is not None:
+            self._canary_check(batches)
         self.poison(batches)
         self.copies(batches)
         t1 = _t.perf_counter()
@@ -1052,3 +1277,26 @@ def fill_synthetic(pools: Pools, tables: RankTables, layers, sources=(20,)) -> i
         AH._write_pages(pools.comp_base(src), PAGE_BYTES, bs, c // bs, c % bs, synthetic_records(c.numel()))
         total += c.numel()
     return total
+
+
+if __import__("os").environ.get("PHYS_CXX_TABLES") == "1":   # stage 2a: TableBuilder / build_compact in C++
+    import os as _os                               # an explicit switch: if the extension does not load, the import FAILS
+    import sys as _sys                             # (no silent fallback to the Python version)
+    _d = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "core", "src", "py")
+    if _d not in _sys.path:
+        _sys.path.insert(0, _d)
+    import cxx_kv as _ck
+    _ck.install_worker(_sys.modules[__name__])
+    print("worker: PHYS_CXX_TABLES=1: " + "TableBuilder / build_compact in C++ (" + _ck.X.__file__ + ")", flush=True)
+
+
+if os.environ.get("PHYS_GTRACE") and "tables" not in os.environ.get("PHYS_GTRACE_SKIP", "").split(","):
+    try:
+        import sys as _sys
+        _d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "core", "src", "tables")
+        if _d not in _sys.path:
+            _sys.path.insert(0, _d)
+        import gtrace_tables as _gt
+        _gt.install_worker(_sys.modules[__name__])
+    except Exception as _e:  # noqa: BLE001
+        print(f"worker: golden-trace recorder not installed ({type(_e).__name__}: {str(_e)[:200]})", flush=True)

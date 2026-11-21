@@ -40,6 +40,8 @@
 #include <deep_gemm/ptx/utils.cuh>
 #include <deep_gemm/ptx/wgmma.cuh>
 
+#include "idx2f_pf4_cabi.h"
+
 namespace idx2f_pf4 {
 
 constexpr int NN = 4;             // rows per pseudo-request (next_n)
@@ -354,6 +356,9 @@ __global__ void __launch_bounds__(kThreads, 1)
 }
 
 // ------------------------------------------------------------------------------------------------ host
+// C ABI: run() is the host work + launch of
+// both the pybind logits_prefill (checks / messages / CUDAGuard / lazy SMEM attribute unchanged) and the C entry of
+// fpr_idx2f_pf4_table(). Kernel unchanged.
 PFN_cuTensorMapEncodeTiled_v12000 encode_fn() {
   static PFN_cuTensorMapEncodeTiled_v12000 fn = [] {
     void* ptr = nullptr;
@@ -365,30 +370,74 @@ PFN_cuTensorMapEncodeTiled_v12000 encode_fn() {
   return fn;
 }
 
-CUtensorMap encode(const void* base, int rank, const cuuint64_t* dims, const cuuint64_t* strides, const cuuint32_t* box,
-                   CUtensorMapSwizzle sw, const char* name) {
-  CUtensorMap m;
+CUresult encode_rc(const void* base, int rank, const cuuint64_t* dims, const cuuint64_t* strides, const cuuint32_t* box,
+                   CUtensorMapSwizzle sw, CUtensorMap* m) {
   cuuint32_t es[5] = {1, 1, 1, 1, 1};
-  const CUresult r = encode_fn()(&m, CU_TENSOR_MAP_DATA_TYPE_UINT8, rank, const_cast<void*>(base), dims, strides, box, es,
-                                 CU_TENSOR_MAP_INTERLEAVE_NONE, sw, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-                                 CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TORCH_CHECK(r == CUDA_SUCCESS, "cuTensorMapEncodeTiled(", name, ") failed: ", int(r));
-  return m;
+  return encode_fn()(m, CU_TENSOR_MAP_DATA_TYPE_UINT8, rank, const_cast<void*>(base), dims, strides, box, es,
+                     CU_TENSOR_MAP_INTERLEAVE_NONE, sw, CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 }
 
+int cur_dev() {
+  int d = 0;
+  cudaGetDevice(&d);
+  return d;
+}
+
+// per (ABL instantiation, device): the SMEM attribute is set (pybind: on first use, as the old static; C ABI: init)
 template <int ABL>
-void launch(const Args& a, const CUtensorMap& tm_q, const CUtensorMap& tm_kvp, int G) {
-  static bool set_dev[64] = {};
-  int dev = 0;
-  cudaGetDevice(&dev);
-  if (!set_dev[dev]) {
-    TORCH_CHECK(cudaFuncSetAttribute(pf_logits_kernel<ABL>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes(kMaxG)) == cudaSuccess,
-                "pf smem attribute (", smem_bytes(kMaxG), " B)");
-    set_dev[dev] = true;
+bool* smem_set() {
+  static bool f[64] = {};
+  return f;
+}
+
+enum RunErr { RE_OK = 0, RE_ENCODE, RE_SMEM, RE_LAUNCH, RE_INIT, RE_ABL };
+struct RunRes {
+  RunErr e;
+  int detail;
+  const char* what;
+};
+
+template <int ABL>
+RunRes launch(const Args& a, const CUtensorMap& tm_q, const CUtensorMap& tm_kvp, int G, cudaStream_t st, bool lazy) {
+  bool& set = smem_set<ABL>()[cur_dev() & 63];
+  if (!set) {
+    if (!lazy) return {RE_INIT, 0, nullptr};
+    if (cudaFuncSetAttribute(pf_logits_kernel<ABL>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes(kMaxG)) != cudaSuccess)
+      return {RE_SMEM, smem_bytes(kMaxG), nullptr};
+    set = true;
   }
-  const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-  pf_logits_kernel<ABL><<<sms, kThreads, smem_bytes(G), at::cuda::getCurrentCUDAStream()>>>(a, tm_q, tm_kvp);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  int sms = 0;
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, cur_dev());
+  pf_logits_kernel<ABL><<<sms, kThreads, smem_bytes(G), st>>>(a, tm_q, tm_kvp);
+  const cudaError_t e = cudaGetLastError();
+  return {e == cudaSuccess ? RE_OK : RE_LAUNCH, int(e), nullptr};
+}
+
+RunRes run(const FprIdx2fPf4LogitsPrefillArgs& c, bool lazy) {
+  const int B = int(c.b), G = int(c.g), P = int(c.page_tok);
+  if (!B || !G) return {RE_OK, 0, nullptr};
+  const cuuint64_t qd[2] = {cuuint64_t(kHeadDim), cuuint64_t(B) * NN * kHeads};
+  const cuuint64_t qs[1] = {cuuint64_t(kHeadDim)};
+  const cuuint32_t qb[2] = {cuuint32_t(kHeadDim), cuuint32_t(NN * kHeads)};
+  CUtensorMap tm_q, tm_kvp;
+  CUresult r = encode_rc(c.q, 2, qd, qs, qb, CU_TENSOR_MAP_SWIZZLE_128B, &tm_q);
+  if (r != CUDA_SUCCESS) return {RE_ENCODE, int(r), "q"};
+  const cuuint64_t kd[3] = {cuuint64_t(kHeadDim), cuuint64_t(P), cuuint64_t(c.num_pages)};
+  const cuuint64_t kst[2] = {cuuint64_t(kHeadDim), cuuint64_t(c.page_stride)};
+  const cuuint32_t kbp[3] = {cuuint32_t(kHeadDim), cuuint32_t(P), 1};
+  r = encode_rc(c.kv, 3, kd, kst, kbp, CU_TENSOR_MAP_SWIZZLE_128B, &tm_kvp);
+  if (r != CUDA_SUCCESS) return {RE_ENCODE, int(r), "kv page"};
+  Args a{c.gstart, G, c.ctx, c.block_table, c.ld_bt, int(c.bt_cols), c.weights, c.kv, c.page_stride, c.out, c.ld_out, P};
+  switch (int(c.abl)) {
+    case 0: return launch<0>(a, tm_q, tm_kvp, G, c.call.stream, lazy);
+    case 1: return launch<1>(a, tm_q, tm_kvp, G, c.call.stream, lazy);
+    case 2: return launch<2>(a, tm_q, tm_kvp, G, c.call.stream, lazy);
+    case 3: return launch<3>(a, tm_q, tm_kvp, G, c.call.stream, lazy);
+    case 4: return launch<4>(a, tm_q, tm_kvp, G, c.call.stream, lazy);
+    case 6: return launch<6>(a, tm_q, tm_kvp, G, c.call.stream, lazy);
+    case 7: return launch<7>(a, tm_q, tm_kvp, G, c.call.stream, lazy);
+    default: return {RE_ABL, 0, nullptr};
+  }
 }
 
 void logits_prefill(at::Tensor q, at::Tensor kv, at::Tensor weights, at::Tensor ctx, at::Tensor block_table, at::Tensor gstart,
@@ -413,30 +462,95 @@ void logits_prefill(at::Tensor q, at::Tensor kv, at::Tensor weights, at::Tensor 
                   out.size(0) >= long(B) * NN && out.stride(0) % 4 == 0, "out [rows, width] f32");
   if (!B || !G) return;
   const c10::cuda::CUDAGuard guard(q.device());
-  const cuuint64_t qd[2] = {cuuint64_t(kHeadDim), cuuint64_t(B) * NN * kHeads};
-  const cuuint64_t qs[1] = {cuuint64_t(kHeadDim)};
-  const cuuint32_t qb[2] = {cuuint32_t(kHeadDim), cuuint32_t(NN * kHeads)};
-  const CUtensorMap tm_q = encode(q.data_ptr(), 2, qd, qs, qb, CU_TENSOR_MAP_SWIZZLE_128B, "q");
-  const cuuint64_t kd[3] = {cuuint64_t(kHeadDim), cuuint64_t(P), cuuint64_t(kv.size(0))};
-  const cuuint64_t kst[2] = {cuuint64_t(kHeadDim), cuuint64_t(kv.stride(0))};
-  const cuuint32_t kbp[3] = {cuuint32_t(kHeadDim), cuuint32_t(P), 1};
-  const CUtensorMap tm_kvp = encode(kv.data_ptr(), 3, kd, kst, kbp, CU_TENSOR_MAP_SWIZZLE_128B, "kv page");
-  Args a{gstart.data_ptr<int>(), G, ctx.data_ptr<int>(), block_table.data_ptr<int>(), block_table.stride(0),
-         int(block_table.size(1)), weights.data_ptr<float>(), reinterpret_cast<const uint8_t*>(kv.data_ptr()), kv.stride(0),
-         out.data_ptr<float>(), out.stride(0), P};
-  switch (int(abl)) {
-    case 0: launch<0>(a, tm_q, tm_kvp, G); break;
-    case 1: launch<1>(a, tm_q, tm_kvp, G); break;
-    case 2: launch<2>(a, tm_q, tm_kvp, G); break;
-    case 3: launch<3>(a, tm_q, tm_kvp, G); break;
-    case 4: launch<4>(a, tm_q, tm_kvp, G); break;
-    case 6: launch<6>(a, tm_q, tm_kvp, G); break;
-    case 7: launch<7>(a, tm_q, tm_kvp, G); break;
-    default: TORCH_CHECK(false, "abl in {0,1,2,3,4,6,7} (0 = production)");
+  FprIdx2fPf4LogitsPrefillArgs c{};
+  c.call.stream = at::cuda::getCurrentCUDAStream();
+  c.call.device = q.get_device();
+  c.call.rank = 0;
+  c.q = q.data_ptr();
+  c.b = B;
+  c.kv = reinterpret_cast<const uint8_t*>(kv.data_ptr());
+  c.num_pages = kv.size(0);
+  c.page_stride = kv.stride(0);
+  c.page_tok = P;
+  c.weights = weights.data_ptr<float>();
+  c.ctx = ctx.data_ptr<int>();
+  c.block_table = block_table.data_ptr<int>();
+  c.ld_bt = block_table.stride(0);
+  c.bt_cols = block_table.size(1);
+  c.gstart = gstart.data_ptr<int>();
+  c.g = G;
+  c.out = out.data_ptr<float>();
+  c.ld_out = out.stride(0);
+  c.abl = abl;
+  const RunRes r = run(c, true);
+  switch (r.e) {
+    case RE_OK: return;
+    case RE_ENCODE: TORCH_CHECK(false, "cuTensorMapEncodeTiled(", r.what, ") failed: ", r.detail);
+    case RE_SMEM: TORCH_CHECK(false, "pf smem attribute (", r.detail, " B)");
+    case RE_ABL: TORCH_CHECK(false, "abl in {0,1,2,3,4,6,7} (0 = production)");
+    default: C10_CUDA_CHECK(static_cast<cudaError_t>(r.detail));
+  }
+}
+
+// ---- C ABI entries
+int c_init(const void* p) {
+  if (p == nullptr) return FPR_E_ARG;
+  const int dev = cur_dev();
+  if (dev != static_cast<const FprIdx2fPf4InitArgs*>(p)->call.device) return FPR_E_ARG;
+  try {
+    (void)encode_fn();
+  } catch (...) {
+    return FPR_E_INIT;
+  }
+  cudaError_t e = cudaSuccess;
+#define PF_SET(A)                                                                                                       \
+  if (e == cudaSuccess && !smem_set<A>()[dev & 63]) {                                                                   \
+    e = cudaFuncSetAttribute(pf_logits_kernel<A>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes(kMaxG));     \
+    if (e == cudaSuccess) smem_set<A>()[dev & 63] = true;                                                               \
+  }
+  PF_SET(0)
+  PF_SET(1)
+  PF_SET(2)
+  PF_SET(3)
+  PF_SET(4)
+  PF_SET(6)
+  PF_SET(7)
+#undef PF_SET
+  return e == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+}
+
+int c_logits_prefill(const void* p) {
+  if (p == nullptr) return FPR_E_ARG;
+  const auto& c = *static_cast<const FprIdx2fPf4LogitsPrefillArgs*>(p);
+#ifdef FPR_CABI_DEBUG
+  if (cur_dev() != c.call.device) return FPR_E_ARG;
+#endif
+  if (c.b < 0 || c.g < 0 || c.g > kMaxG) return FPR_E_ARG;
+  if (c.b && c.g &&
+      (!(c.page_tok == 64 || c.page_tok == 32) || c.page_stride % 16 || c.page_stride < c.page_tok * (kHeadDim + 4) ||
+       reinterpret_cast<uintptr_t>(c.kv) % 16 || reinterpret_cast<uintptr_t>(c.weights) % 16 || c.ld_out % 4 ||
+       c.gstart == nullptr))
+    return FPR_E_ARG;
+  const RunRes r = run(c, false);
+  switch (r.e) {
+    case RE_OK: return FPR_OK;
+    case RE_INIT: return FPR_E_INIT;
+    case RE_ABL: return FPR_E_ARG;
+    default: return FPR_E_CUDA;
   }
 }
 
 }  // namespace idx2f_pf4
+
+extern "C" __attribute__((visibility("default"))) const FprExtTable* fpr_idx2f_pf4_table(void) {
+  using namespace idx2f_pf4;
+  static const FprFnEntry fns[] = {
+      {"idx2f_pf4.init", c_init, nullptr, static_cast<int64_t>(sizeof(FprIdx2fPf4InitArgs))},
+      {"idx2f_pf4.logits_prefill", c_logits_prefill, nullptr, static_cast<int64_t>(sizeof(FprIdx2fPf4LogitsPrefillArgs))},
+  };
+  static const FprExtTable t = {FPR_CABI_VERSION, "idx2f_pf4", "13003b3ef5cba353f9a590fafe726121", 2, fns};
+  return &t;
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("logits_prefill", &idx2f_pf4::logits_prefill,

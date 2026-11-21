@@ -1,5 +1,4 @@
 // ds41h decode-shaped routed-MoE W4A16 kernels ("moe_dec") for calls with 1..~512 tokens
-// (multi-request decode c2..c64 at k=7 = 16..512 tokens, prefill replay chunks <= SMALL_T).
 //
 // Same layouts, numerics and outputs as moe_small16_kernel<MODE, 16> (moe_prefill.cu, forward variant 0x500), BIT FOR BIT:
 //   * every weight element is expanded exactly FP4 -> bf16 with its ue8m0 scale folded in (the same raw bf16 bits

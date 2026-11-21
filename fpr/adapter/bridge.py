@@ -72,36 +72,21 @@ def get_image_support() -> bool:
     return bool(_REG.get("images", False))
 
 
+def set_decode_buckets(buckets) -> None:
+    """The engine's decode graph buckets (rows per rank; None: unknown): SchedConfig.decode_buckets when
+    PHYS_SCHED bucket_aware=1."""
+    _REG["decode_buckets"] = None if not buckets else tuple(int(b) for b in buckets)
+
+
+def get_decode_buckets():
+    return _REG.get("decode_buckets")
+
+
 SAMPLING_FEATURES = ("top_p", "top_k", "min_p", "penalties", "logit_bias", "bad_words", "allowed_token_ids", "logprobs",
                      "prompt_logprobs", "min_tokens")
 
 
-def sampling_features(sp) -> set:
-    """The non-default sampling features a vLLM SamplingParams uses (beyond temperature / seed / stop / max_tokens)."""
-    used = set()
-    if sp is None:
-        return used
-    if sp.top_p is not None and sp.top_p < 1.0:
-        used.add("top_p")
-    if sp.top_k is not None and sp.top_k > 0:
-        used.add("top_k")
-    if sp.min_p is not None and sp.min_p > 0.0:
-        used.add("min_p")
-    if (sp.presence_penalty or 0.0) != 0.0 or (sp.frequency_penalty or 0.0) != 0.0 or (sp.repetition_penalty or 1.0) != 1.0:
-        used.add("penalties")
-    if getattr(sp, "logit_bias", None):
-        used.add("logit_bias")
-    if getattr(sp, "bad_words", None) or getattr(sp, "bad_words_token_ids", None):
-        used.add("bad_words")
-    if getattr(sp, "allowed_token_ids", None):
-        used.add("allowed_token_ids")
-    if sp.logprobs is not None:
-        used.add("logprobs")
-    if sp.prompt_logprobs is not None:
-        used.add("prompt_logprobs")
-    if (sp.min_tokens or 0) > 0:
-        used.add("min_tokens")
-    return used
+from adapter.sampling_features import sampling_features  # noqa: E402,F401
 
 
 def get_geometry() -> Geometry:
@@ -143,11 +128,11 @@ def geometry_from_env() -> Geometry:
 # ------------------------------------------------------------------------------------------------ step message
 @dataclass
 class ReqInit:
-    """A request entering the worker (first scheduling, or re-admission after a preemption: recompute)."""
+    """A request entering the worker."""
     rid: str
     rank: int
     prompt_token_ids: list            # the prompt
-    output_token_ids: list            # outputs so far (non-empty after a preemption: they are recomputed as prefill)
+    output_token_ids: list            # outputs so far
     sampling_params: Any              # vllm.SamplingParams (penalties, seed, temperature, logprobs, ...)
     structured: bool = False          # grammar-constrained (bitmask rows arrive in sample_tokens)
 
@@ -163,7 +148,7 @@ class PhysStep:
     prev_tokens     rid -> the up to 3 token ids before the sequence's first row this step (Engram n-gram context).
     new_reqs        requests whose worker-side state starts this step (sampling params, token history).
     finished        requests that ended (stop, abort, length) since the previous step: drop their state.
-    preempted       requests preempted this step (their KV is gone; they come back as new_reqs).
+
     order           vLLM's request order of this step (ModelRunnerOutput.req_ids).
     num_spec        rid -> draft rows scheduled for the decode group (k, or less at max_model_len).
     mm              adapter/mm.py MMStep (images to encode / rows taking span embeddings / cache drops, per rank), or

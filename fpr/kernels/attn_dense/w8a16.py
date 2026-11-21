@@ -20,7 +20,8 @@ HB = HW + 64       # half block: fragments + 16 B scales + pad
 CHUNK = 2 * HB
 
 
-def build(verbose: bool = False, abl: int = 0, prof: bool = False, dq: int | None = None, extra_defs: tuple = ()):
+def build(verbose: bool = False, abl: int = 0, prof: bool = False, dq: int | None = None, extra_defs: tuple = (),
+          prime_devs=None):
     """abl != 0: a separate timing-ablation build (W8_ABL; 1 no dequant, 2 no wgmma, 4 no x loads; results are wrong).
     prof: clock64 profile build (W8_PROF). dq: dequant variant (W8_DQ; default from env W8A16_DQ, else 1; 0 = cvt path,
     1 = integer bit placement)."""
@@ -34,8 +35,17 @@ def build(verbose: bool = False, abl: int = 0, prof: bool = False, dq: int | Non
     os.makedirs(bdir, exist_ok=True)
     flags = ["-O3", "-std=c++17", "-gencode=arch=compute_90a,code=sm_90a", "-lineinfo", "-Xptxas=-v", f"-DW8_ABL={abl}",
              f"-DW8_PROF={int(prof)}", f"-DW8_DQ={dq}"] + [f"-D{d}" for d in defs]
-    return load(name="w8a16_ext" + sfx, sources=[os.path.join(HERE, "w8a16.cu")], extra_cuda_cflags=flags, extra_ldflags=["-lcuda"],
-                extra_include_paths=[HERE], build_directory=bdir, verbose=verbose)
+    ext = load(name="w8a16_ext" + sfx, sources=[os.path.join(HERE, "w8a16.cu")], extra_cuda_cflags=flags, extra_ldflags=["-lcuda"],
+               extra_include_paths=[HERE], build_directory=bdir, verbose=verbose)
+    if hasattr(ext, "prime"):  # every instantiation's SMEM attribute now (prime_devs; None = current device), never in a capture
+        n_ = ext.prime([int(d) for d in prime_devs] if prime_devs is not None else [])
+        if n_ and hasattr(ext, "wide_ok"):  # one line per primed device: is the wide (129-320 rows) path live?
+            import sys as _sys
+            ds_ = [int(d) for d in prime_devs] if prime_devs is not None else [torch.cuda.current_device()]
+            for d_ in ds_:
+                w_ = "wide ok" if ext.wide_ok(d_) else f"wide FAILED (cudaError {ext.wide_err(d_)})"
+                print(f"w8a16 {os.path.basename(bdir)}: device {d_}: served ok, {w_}", file=_sys.stderr, flush=True)
+    return ext
 
 
 def _maps(device):

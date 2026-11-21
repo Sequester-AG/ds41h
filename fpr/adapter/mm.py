@@ -8,11 +8,9 @@ scheduled_encoder_inputs). After the rank scheduler's plan, MMPlanner maps the r
 they cover, and keeps per rank a model of the spans resident in the worker's encoder cache. Per step and rank:
 
   encode[r]  images to encode on rank r before the step's kernels (needed now, not resident)
-  rows[r]    MMRows(row0, n, key, lo): rows row0 .. row0 + n - 1 of rank r's StepBatch take span rows lo .. lo + n - 1
-  drop[r]    keys to free on rank r (unreferenced, least recently used, over the cache budget)
+  rows[r]    MMRows(row0, n, key, lo): rows row0 .. row0 + n - 1 of rank r's StepBatch take span rows lo ..
 
-The rows of a prefill entry are an owner chunk, the replay rows after a prefix hit, a CP helper's sub-chunk or a
-recompute after a preemption: all are planned the same way. A request holds a key on a rank while its prefill there
+A request holds a key on a rank while its prefill there
 still has rows of the span ahead. A released key stays resident (LRU) until evicted, so a replay or a recompute can
 reuse it. The worker's EncoderCache applies drop, encode and gather in that order, and asserts that it mirrors the
 planner.
@@ -136,7 +134,7 @@ class MMPlanner:
         return self.reqs.get(rid)
 
     def release(self, rid) -> None:
-        """The request stopped prefilling (preempted, finished, aborted): its keys stay resident but evictable."""
+        """The request stopped prefilling: its keys stay resident but evictable."""
         for refs in self.refs:
             for key in [k for k, s in refs.items() if rid in s]:
                 s = refs[key]

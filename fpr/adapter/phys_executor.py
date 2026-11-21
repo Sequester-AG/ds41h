@@ -65,6 +65,18 @@ def warm_thread_blas(devs, streams) -> None:
         torch.cuda.synchronize(d)
 
 
+
+def _decode_buckets(worker):
+    """The engine's decode graph buckets (EngineConfig.buckets, rows per rank) behind the worker wrapper, for the
+    scheduler's PHYS_SCHED bucket_aware=1; None when the backend has none."""
+    w = getattr(worker, "w", None)
+    for o in (worker, w, getattr(w, "backend", None)):
+        b = getattr(getattr(o, "cfg", None), "buckets", None) if o is not None else None
+        if b:
+            return tuple(int(x) for x in b)
+    return None
+
+
 class _LazyFuture(Future):
     """A step's output computed on the thread that asks for it (vLLM's engine loop: step_with_batch_queue only calls
     result()), like vLLM's own AsyncOutputFuture (uniproc_executor.py). D13: the handle's extraction, and any graph
@@ -90,6 +102,22 @@ def _done(value) -> Future:
     f: Future = Future()
     f.set_result(value)
     return f
+
+
+
+def _install_caps_utility() -> None:
+    """The EngineCore utility `phys_sampling_caps`: the API server's
+    adapter/sampling_guard.py (and frontend_cxx) call it once over vLLM's utility channel and reject unsupported sampling
+    features with a 400 before streaming. Returns sorted(bridge.get_sampling_caps()), or None = everything supported."""
+    from vllm.v1.engine.core import EngineCore
+    if getattr(EngineCore, "phys_sampling_caps", None) is not None:
+        return
+
+    def phys_sampling_caps(self):
+        caps = bridge.get_sampling_caps()
+        return None if caps is None else sorted(caps)
+
+    EngineCore.phys_sampling_caps = phys_sampling_caps
 
 
 class PhysExecutor(Executor):
@@ -125,8 +153,10 @@ class PhysExecutor(Executor):
         self._rt_first = bool(os.environ.get("PHYS_DUMP_RUNTIME"))
         bridge.set_geometry(self.worker.geom)
         bridge.set_sampling_caps(getattr(self.worker, "sampling_caps", None))
+        _install_caps_utility()                      # EngineCore.phys_sampling_caps for the API server's 400
         bridge.set_cost_default(getattr(self.worker, "cost_default", None))
         bridge.set_image_support(bool(getattr(self.worker, "supports_images", False)))
+        bridge.set_decode_buckets(_decode_buckets(self.worker))
         self._phys = None
         self._so = None
         self._drafts: DraftTokenIds | None = None

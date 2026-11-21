@@ -1,0 +1,21 @@
+# fe_api: routes, errors, Responses store, /metrics glue, engine adapter.
+add_library(fe_api_jw STATIC jw.cpp)
+target_include_directories(fe_api_jw PUBLIC ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(fe_api_jw PUBLIC fe_common)
+
+set(FE_API_DEPS fe_http fe_engine fe_parser fe_render fe_image fe_tokenizer fe_common)
+set(_missing "")
+foreach(d ${FE_API_DEPS})
+  if(NOT TARGET ${d})
+    list(APPEND _missing ${d})
+  endif()
+endforeach()
+if(_missing)
+  message(WARNING "fe_api not built: missing ${_missing}")
+else()
+  add_library(fe_api STATIC app.cpp chat.cpp chat_common.cpp completions.cpp responses.cpp tokenize.cpp
+              errors.cpp pyd.cpp config.cpp util.cpp http_metrics.cpp backend_engine.cpp)
+  target_include_directories(fe_api PUBLIC ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(fe_api PRIVATE -Wall -Wno-unused-function -Wno-unused-variable)
+  target_link_libraries(fe_api PUBLIC fe_api_jw ${FE_API_DEPS})
+endif()

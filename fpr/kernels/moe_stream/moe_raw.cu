@@ -23,6 +23,7 @@
 #include <cub/block/block_scan.cuh>
 
 #include "wgmma_rs_gen.cuh"
+#include "../pdl2.cuh"
 
 #ifndef MS3_MMA_MAXN
 #define MS3_MMA_MAXN 32  // n_pad <= this: mma.sync path; larger: RS-wgmma (sweep: 32 best, 16 -3 %, 64 -5 %)
@@ -455,16 +456,32 @@ __global__ void __launch_bounds__(640) k_gather2(const __nv_bfloat16* __restrict
 #define MSR_G5BS 0  // > 0: dynamic batches of MSR_G5BS contiguous slots (atomic counter): blocks that start late (SMs held by
                     // the concurrent shared-expert GEMM) take less; 0: static round-robin slots
 #endif
+// the EC slot-base table holds up to G5_MAXE ECs = route2's max_ec(MAXT x 6)
+// = 384 + 8192 * 6 / 64 = 1152 (was 512, k_route's bound: route2 numbering reaches 384 + ceil(6T / 64), 624 at a 2,560-row
+// mixed fork step, and nec > 512 overran sbase into soff / stok -> wild loads / stores on every rank). A launch with more ECs
+// than that (impossible for T <= 8192; prepr5 checks T) writes nothing and sets g_gather5_err (gather5_take / gather5_err).
+constexpr int G5_MAXE = 384 + 8192 * 6 / 64;
+__device__ unsigned g_gather5_err = 0u;
+__device__ int g_gather5_maxnec = 0;      // (diagnostic) the largest nec since the last take, and launches with nec > 512 (the old
+__device__ unsigned g_gather5_over = 0u;  // bound): one atomic each by block 0 / thread 0 per launch; no output depends on them
 __global__ void __launch_bounds__(640, MSR_G5B) k_gather5(const __nv_bfloat16* __restrict__ x, EC* __restrict__ ecs,
                                                           const int* __restrict__ ptok, char* __restrict__ img,
                                                           const int* __restrict__ counts, int pstride,
                                                           int* __restrict__ ctr = nullptr) {
-  constexpr int U = MSR_G5U, MAXE = 512, MAXJ = 64;
+  constexpr int U = MSR_G5U, MAXE = G5_MAXE, MAXJ = 64;
   __shared__ int sbase[MAXE + 1];
   __shared__ long long soff[MAXJ];  // per slot of this batch: image byte offset of slab 0, n_pad * 128 (slab stride)
   __shared__ int sstr[MAXJ], stok[MAXJ], snn[MAXJ];
   __shared__ float ssc[MAXJ];
   const int nec = counts[0], S = counts[3] / (80 * 128), G = gridDim.x;
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    atomicMax(&g_gather5_maxnec, nec);
+    if (nec > 512) atomicAdd(&g_gather5_over, 1u);
+  }
+  if (nec < 0 || nec > MAXE) {  // never past sbase: skip, flag (uniform per launch: every block returns)
+    if (blockIdx.x == 0 && threadIdx.x == 0) atomicOr(&g_gather5_err, 1u);
+    return;
+  }
   for (int i = threadIdx.x; i < nec; i += blockDim.x) sbase[i] = (int)(ecs[i].img_off / (80 * 128));
   if (threadIdx.x == 0) sbase[nec] = S;
   __syncthreads();
@@ -1534,6 +1551,7 @@ __global__ void k_router_top(const float* __restrict__ logits, const float* __re
                              int* __restrict__ ids, float* __restrict__ wts, float route_scale,
                              unsigned char* __restrict__ row = nullptr, int nvalid = 1 << 30,
                              const int* __restrict__ ptok_in = nullptr, const unsigned char* __restrict__ vmask = nullptr) {
+  pdl2::enter();  // ENG_PDL2 launches (router_top_pack3); no-op otherwise
   const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
   if (warp >= T) return;
   const bool rowpad = vmask && row && !vmask[warp];
@@ -1617,6 +1635,7 @@ __global__ void k_router_top(const float* __restrict__ logits, const float* __re
 // k_swiglu: shared expert middle step on the bf16 [T, 2 I] output of the fused gate|up GEMM -> bf16 h [T, I]
 // (stock: up clamp(-10, 10), gate clamp(max 10), silu in fp32, h rounded to bf16). grid T, block I / 8.
 __global__ void k_swiglu(const __nv_bfloat16* __restrict__ gu, __nv_bfloat16* __restrict__ h, int I) {
+  pdl2::enter();
   const int t = blockIdx.x, i0 = threadIdx.x * 8;
   const uint4 gv = *(const uint4*)(gu + (size_t)t * 2 * I + i0), uv = *(const uint4*)(gu + (size_t)t * 2 * I + I + i0);
   const __nv_bfloat162* g2 = (const __nv_bfloat162*)&gv;
@@ -1637,6 +1656,7 @@ __global__ void k_swiglu(const __nv_bfloat16* __restrict__ gu, __nv_bfloat16* __
 // -> bf16 rank partial (stock: y = bf16(routed + shared)). grid T, block 640 x 8 elements.
 __global__ void k_combine(const __nv_bfloat16* __restrict__ Y, const int* __restrict__ slotmap,
                           const __nv_bfloat16* __restrict__ sh, __nv_bfloat16* __restrict__ out) {
+  pdl2::enter();
   const int t = blockIdx.x, d0 = threadIdx.x * 8;
   int sl[6];
 #pragma unroll
@@ -1671,8 +1691,30 @@ __global__ void k_combine(const __nv_bfloat16* __restrict__ Y, const int* __rest
 }  // namespace msr
 
 // ------------------------------------------------------------------------------------------------ bindings
+#include "moe_raw_cabi.h"
 using namespace msr;
 static int g_sms = 0;
+// C ABI: g_sms without a data race (4 driver threads; every GPU of the node has the same SM count), 0 on error
+static int sms_c(int dev) {
+  int v = __atomic_load_n(&g_sms, __ATOMIC_ACQUIRE);
+  if (!v) {
+    if (cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) return 0;
+    __atomic_store_n(&g_sms, v, __ATOMIC_RELEASE);
+  }
+  return v;
+}
+// C ABI: a dynamic-SMEM opt-in once per (kernel, device), no exceptions, the device bit set atomically
+template <typename K>
+static bool smem_attr_c(K kern, int bytes, unsigned long long* done) {
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return false;
+  if (!(__atomic_load_n(done, __ATOMIC_ACQUIRE) >> dev & 1ull)) {
+    if (cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) != cudaSuccess) return false;
+    __atomic_fetch_or(done, 1ull << dev, __ATOMIC_RELEASE);
+  }
+  return true;
+}
+static unsigned long long g_gemm_attr[3] = {0, 0, 0};   // [MODE]: k_gemm<MODE>'s opt-in per device (C path + pybind gemm1r / gemm2r)
 
 void route(torch::Tensor ids, torch::Tensor w, int64_t T, torch::Tensor ecs, torch::Tensor t1, torch::Tensor t2,
            torch::Tensor counts, torch::Tensor slotmap, torch::Tensor rts, int64_t grid, torch::Tensor inv) {
@@ -1694,11 +1736,23 @@ void route(torch::Tensor ids, torch::Tensor w, int64_t T, torch::Tensor ecs, tor
                                               (Tile*)t2.data_ptr(), grid > 0 ? (int)grid : g_sms,
                                               inv.numel() ? inv.data_ptr<float>() : nullptr);
 }
+static int swiglu_core(const FprMoeRawSwigluArgs* p) {   // C ABI "moe_raw.swiglu": the launch of pybind swiglu
+  try {
+    const int I = (int)p->I;
+    if (I % 8 != 0) return FPR_E_ARG;
+    pdl2::launch(k_swiglu, dim3((unsigned)p->T), dim3(I / 8), 0, p->c.stream, (const __nv_bfloat16*)p->gu,
+                 (__nv_bfloat16*)p->h, I);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void swiglu(torch::Tensor gu, torch::Tensor h) {
-  auto stream = at::cuda::getCurrentCUDAStream();
   const int I = (int)h.size(1);
   TORCH_CHECK(I % 8 == 0 && gu.size(1) == 2 * I, "swiglu shapes");
-  k_swiglu<<<(unsigned)h.size(0), I / 8, 0, stream>>>((const __nv_bfloat16*)gu.data_ptr(), (__nv_bfloat16*)h.data_ptr(), I);
+  FprMoeRawSwigluArgs ca{{at::cuda::getCurrentCUDAStream(), (int)h.get_device(), 0}, gu.data_ptr(), h.data_ptr(),
+                         (int32_t)h.size(0), I};
+  TORCH_CHECK(swiglu_core(&ca) == FPR_OK, "moe_raw swiglu: CUDA launch error");
 }
 int64_t route_scratch_ints() { return RS_INTS; }
 void router_top(torch::Tensor logits, torch::Tensor bias, torch::Tensor ids, torch::Tensor wts, double route_scale) {
@@ -1723,16 +1777,26 @@ void router_top_pack(torch::Tensor logits, torch::Tensor bias, torch::Tensor ids
 // router_top_pack2 + the row-valid mask (bool / uint8 [T]): an invalid row's routing row becomes the padding row (ids -1,
 // weights 0, prescale 0) in-kernel -- engine.p_router's torch.where(valid, route_row, padrow) + copy_ (2 launches) folded;
 // same bytes. ids / wts are written for every row as by router_top_pack2.
+static int router_top_pack3_core(const FprMoeRawRouterTopPack3Args* p) {   // C ABI "moe_raw.router_top_pack3"
+  try {
+    const int T = (int)p->T;
+    pdl2::launch(k_router_top, dim3((T + MSR_RT_W - 1) / MSR_RT_W), dim3(32 * MSR_RT_W), 0, p->c.stream,
+                 const_cast<float*>(p->logits), const_cast<float*>(p->bias), T, (int*)p->ids, (float*)p->wts, p->route_scale,
+                 (unsigned char*)p->row, 1 << 30, const_cast<int*>(p->ptok), (const unsigned char*)p->valid);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void router_top_pack3(torch::Tensor logits, torch::Tensor bias, torch::Tensor ids, torch::Tensor wts, double route_scale,
                       torch::Tensor row, torch::Tensor valid, torch::Tensor ptok) {
-  auto stream = at::cuda::getCurrentCUDAStream();
   const int T = (int)logits.size(0);
   TORCH_CHECK(logits.size(1) == NEXP && row.numel() >= (int64_t)T * 64 && ptok.numel() >= T, "router_top_pack3: shapes");
   TORCH_CHECK(valid.numel() >= T && valid.element_size() == 1 && valid.is_contiguous(), "router_top_pack3: valid [T] bool / uint8");
-  k_router_top<<<(T + MSR_RT_W - 1) / MSR_RT_W, 32 * MSR_RT_W, 0, stream>>>(logits.data_ptr<float>(), bias.data_ptr<float>(), T,
-                                                                           ids.data_ptr<int>(), wts.data_ptr<float>(), (float)route_scale,
-                                                                           (unsigned char*)row.data_ptr(), 1 << 30,
-                                                                           ptok.data_ptr<int>(), (const unsigned char*)valid.data_ptr());
+  FprMoeRawRouterTopPack3Args ca{{at::cuda::getCurrentCUDAStream(), (int)logits.get_device(), 0}, logits.data_ptr<float>(),
+                                 bias.data_ptr<float>(), ids.data_ptr<int>(), wts.data_ptr<float>(), (float)route_scale,
+                                 row.data_ptr(), valid.data_ptr(), ptok.data_ptr<int>(), T};
+  TORCH_CHECK(router_top_pack3_core(&ca) == FPR_OK, "moe_raw router_top_pack3: CUDA launch error");
 }
 
 // router_top_pack + the prescale exponent of each row (int32 [T], from mhc boundary2) into the row's bytes 48..51
@@ -1755,15 +1819,26 @@ void prepr2(torch::Tensor x, torch::Tensor ecs, torch::Tensor counts, int64_t ma
 }
 // prepr2 by the persistent k_gather5 (route2's EC numbering; same image bytes / ec.inv as prepr2)
 // ctr: int32 [2] zeros (dynamic batches, MSR_G5BS > 0; left zero after every call), may be empty when MSR_G5BS == 0
+static int prepr5_core(const FprMoeRawPrepr5Args* p) {   // C ABI "moe_raw.prepr5"
+  try {
+    if (MSR_G5BS != 0 && p->ctr == nullptr) return FPR_E_ARG;
+    k_gather5<<<(unsigned)(MSR_G5B * (int64_t)p->sms), 640, 0, p->c.stream>>>((const __nv_bfloat16*)p->x, (EC*)p->ecs,
+                                                                            (const int*)p->rows + 12, (char*)p->img,
+                                                                            const_cast<int*>(p->counts), 16, (int*)p->ctr);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void prepr5(torch::Tensor x, torch::Tensor ecs, torch::Tensor counts, torch::Tensor img, torch::Tensor rows, int64_t sms,
             torch::Tensor ctr) {
-  auto stream = at::cuda::getCurrentCUDAStream();
   TORCH_CHECK(rows.numel() >= x.size(0) * 64, "prepr5: routing rows [T, 64]");
+  TORCH_CHECK(x.size(0) <= 8192, "prepr5: T <= 8192 (route2's MAXT: keeps n_ec <= k_gather5's G5_MAXE)");
   TORCH_CHECK(MSR_G5BS == 0 || (ctr.numel() >= 2 && ctr.scalar_type() == torch::kInt32), "prepr5: ctr int32 [2]");
-  k_gather5<<<(unsigned)(MSR_G5B * sms), 640, 0, stream>>>((const __nv_bfloat16*)x.data_ptr(), (EC*)ecs.data_ptr(),
-                                                           (const int*)rows.data_ptr() + 12, (char*)img.data_ptr(),
-                                                           counts.data_ptr<int>(), 16,
-                                                           ctr.numel() ? ctr.data_ptr<int>() : nullptr);
+  FprMoeRawPrepr5Args ca{{at::cuda::getCurrentCUDAStream(), (int)x.get_device(), 0}, x.data_ptr(), ecs.data_ptr(),
+                         counts.data_ptr<int>(), img.data_ptr(), rows.data_ptr(), (int32_t)sms,
+                         ctr.numel() ? ctr.data_ptr<int>() : nullptr};
+  TORCH_CHECK(prepr5_core(&ca) == FPR_OK, "moe_raw prepr5: CUDA launch error");
 }
 void prepr(torch::Tensor x, torch::Tensor ecs, torch::Tensor counts, int64_t max_ec, torch::Tensor img, torch::Tensor ptok,
            torch::Tensor inv) {
@@ -1835,21 +1910,41 @@ static void launch(Args<MODE>& a, int64_t grid) {
   }
   k_gemm<MODE><<<grid > 0 ? (int)grid : g_sms, 32 + 32 * NCW, Lay<MODE>::SMEM, stream>>>(a);
 }
+// C-ABI variant of launch: the caller's stream, the per-device opt-in set atomically, no exceptions
+template <int MODE>
+static int launch_c(const Args<MODE>& a, int grid, int sms, cudaStream_t stream) {
+  if (!smem_attr_c(k_gemm<MODE>, Lay<MODE>::SMEM, &g_gemm_attr[MODE])) return FPR_E_CUDA;
+  k_gemm<MODE><<<grid > 0 ? grid : sms, 32 + 32 * NCW, Lay<MODE>::SMEM, stream>>>(a);
+  return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+}
 // raw w13 [E, 2I, H/2], s13 [E, 2I, H/32] (uint8), counts[1] = GEMM1 tiles
+static int gemm1r_core(const FprMoeRawGemm1rArgs* p) {   // C ABI "moe_raw.gemm1r" (tensor maps encoded on the host per call)
+  try {
+    const int sms = sms_c(p->c.device);
+    if (!sms) return FPR_E_CUDA;
+    void* w13 = const_cast<void*>(p->w13);
+    void* s13 = const_cast<void*>(p->s13);
+    Args<1> a{};
+    a.ecs = (const EC*)p->ecs, a.tiles = (const Tile*)p->tiles, a.bimg = (const char*)p->img;
+    a.himg = (char*)p->himg, a.nt_dev = const_cast<int*>(p->counts) + 1;
+    a.w2 = (const unsigned char*)w13;  // GEMM1: raw w13 (only the MS3_ABL 9 timing ablation reads it directly)
+    const uint64_t rows = (uint64_t)p->E * 1152;
+    a.tmw = tmap2d(w13, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 2, rows, 128, 64, CU_TENSOR_MAP_SWIZZLE_128B);
+    a.tms = tmap2d(s13, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 32, rows, 16, 64, CU_TENSOR_MAP_SWIZZLE_NONE);
+    a.tmw2 = tmap2d(w13, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 2, rows, 128, 128, CU_TENSOR_MAP_SWIZZLE_128B);
+    a.tms2 = tmap2d(s13, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 32, rows, 16, 128, CU_TENSOR_MAP_SWIZZLE_NONE);
+    return launch_c<1>(a, (int)p->grid, sms, p->c.stream);
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void gemm1r(torch::Tensor w13, torch::Tensor s13, torch::Tensor ecs, torch::Tensor tiles, torch::Tensor counts,
             torch::Tensor img, torch::Tensor himg, int64_t grid) {
   TORCH_CHECK(w13.size(1) == 1152 && w13.size(2) == D / 2 && s13.size(2) == D / 32, "gemm1r: raw w13 / s13 shapes");
-  if (!g_sms) cudaDeviceGetAttribute(&g_sms, cudaDevAttrMultiProcessorCount, w13.get_device());
-  Args<1> a{};
-  a.ecs = (const EC*)ecs.data_ptr(), a.tiles = (const Tile*)tiles.data_ptr(), a.bimg = (const char*)img.data_ptr();
-  a.himg = (char*)himg.data_ptr(), a.nt_dev = counts.data_ptr<int>() + 1;
-  a.w2 = (const unsigned char*)w13.data_ptr();  // GEMM1: raw w13 (only the MS3_ABL 9 timing ablation reads it directly)
-  const uint64_t rows = (uint64_t)w13.size(0) * 1152;
-  a.tmw = tmap2d(w13.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 2, rows, 128, 64, CU_TENSOR_MAP_SWIZZLE_128B);
-  a.tms = tmap2d(s13.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 32, rows, 16, 64, CU_TENSOR_MAP_SWIZZLE_NONE);
-  a.tmw2 = tmap2d(w13.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 2, rows, 128, 128, CU_TENSOR_MAP_SWIZZLE_128B);
-  a.tms2 = tmap2d(s13.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, D / 32, rows, 16, 128, CU_TENSOR_MAP_SWIZZLE_NONE);
-  launch<1>(a, grid);
+  FprMoeRawGemm1rArgs ca{{at::cuda::getCurrentCUDAStream(), (int)w13.get_device(), 0}, w13.data_ptr(), s13.data_ptr(),
+                         (int64_t)w13.size(0), ecs.data_ptr(), tiles.data_ptr(), counts.data_ptr<int>(), img.data_ptr(),
+                         himg.data_ptr(), (int32_t)grid};
+  TORCH_CHECK(gemm1r_core(&ca) == FPR_OK, "moe_raw gemm1r: CUDA launch error");
 }
 // gemm1r with skip8 = 1: the tile stream leaves the n_pad-8 tiles to gemm1r8
 void gemm1rs(torch::Tensor w13, torch::Tensor s13, torch::Tensor ecs, torch::Tensor tiles, torch::Tensor counts,
@@ -1891,20 +1986,30 @@ void gemm1r8(torch::Tensor w13, torch::Tensor s13, torch::Tensor ecs, torch::Ten
   k_gemm1r8<MSR_R8NW, MSR_R8S><<<grid > 0 ? (int)grid : g_sms, 32 + 32 * MSR_R8NW, SM8, stream>>>(a);
 }
 // raw w2 [E, H, I/2], s2 [E, H, I/32] (uint8), counts[2] = GEMM2 tiles; yout bf16 [slots][H]
+static int gemm2r_core(const FprMoeRawGemm2rArgs* p) {   // C ABI "moe_raw.gemm2r" (tensor maps encoded on the host per call)
+  try {
+    const int sms = sms_c(p->c.device);
+    if (!sms) return FPR_E_CUDA;
+    void* w2 = const_cast<void*>(p->w2);
+    Args<2> a{};
+    a.s2 = (const unsigned char*)p->s2, a.ecs = (const EC*)p->ecs, a.tiles = (const Tile*)p->tiles;
+    a.w2 = (const unsigned char*)w2;
+    a.bimg = (const char*)p->himg, a.nt_dev = const_cast<int*>(p->counts) + 2;
+    a.yout = (__nv_bfloat16*)p->yout;
+    a.tmw = tmap2d(w2, CU_TENSOR_MAP_DATA_TYPE_UINT16, 2, IR / 4, (uint64_t)p->E * D, 48, 128, CU_TENSOR_MAP_SWIZZLE_NONE);
+    a.tmw2 = tmap2d(w2, CU_TENSOR_MAP_DATA_TYPE_UINT16, 2, IR / 4, (uint64_t)p->E * D, 48, 256, CU_TENSOR_MAP_SWIZZLE_NONE);
+    return launch_c<2>(a, (int)p->grid, sms, p->c.stream);
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void gemm2r(torch::Tensor w2, torch::Tensor s2, torch::Tensor ecs, torch::Tensor tiles, torch::Tensor counts,
             torch::Tensor himg, torch::Tensor yout, int64_t grid) {
   TORCH_CHECK(w2.size(1) == D && w2.size(2) == IR / 2 && s2.size(2) == IR / 32, "gemm2r: raw w2 / s2 shapes");
-  if (!g_sms) cudaDeviceGetAttribute(&g_sms, cudaDevAttrMultiProcessorCount, w2.get_device());
-  Args<2> a{};
-  a.s2 = (const unsigned char*)s2.data_ptr(), a.ecs = (const EC*)ecs.data_ptr(), a.tiles = (const Tile*)tiles.data_ptr();
-  a.w2 = (const unsigned char*)w2.data_ptr();
-  a.bimg = (const char*)himg.data_ptr(), a.nt_dev = counts.data_ptr<int>() + 2;
-  a.yout = (__nv_bfloat16*)yout.data_ptr();
-  a.tmw = tmap2d(w2.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT16, 2, IR / 4, (uint64_t)w2.size(0) * D, 48, 128,
-                 CU_TENSOR_MAP_SWIZZLE_NONE);
-  a.tmw2 = tmap2d(w2.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT16, 2, IR / 4, (uint64_t)w2.size(0) * D, 48, 256,
-                  CU_TENSOR_MAP_SWIZZLE_NONE);
-  launch<2>(a, grid);
+  FprMoeRawGemm2rArgs ca{{at::cuda::getCurrentCUDAStream(), (int)w2.get_device(), 0}, w2.data_ptr(), s2.data_ptr(),
+                         (int64_t)w2.size(0), ecs.data_ptr(), tiles.data_ptr(), counts.data_ptr<int>(), himg.data_ptr(),
+                         yout.data_ptr(), (int32_t)grid};
+  TORCH_CHECK(gemm2r_core(&ca) == FPR_OK, "moe_raw gemm2r: CUDA launch error");
 }
 void gemm2rs(torch::Tensor w2, torch::Tensor s2, torch::Tensor ecs, torch::Tensor tiles, torch::Tensor counts,
              torch::Tensor himg, torch::Tensor yout, int64_t grid, int64_t skip8) {
@@ -1942,16 +2047,78 @@ void gemm2r8(torch::Tensor w2, torch::Tensor s2, torch::Tensor ecs, torch::Tenso
   }
   k_gemm2r8<<<grid > 0 ? (int)grid : g_sms, 32 + 32 * NCW, q8::SMEM, stream>>>(a);
 }
+static int combine_core(const FprMoeRawCombineArgs* p) {   // C ABI "moe_raw.combine"
+  try {
+    pdl2::launch(k_combine, dim3((unsigned)p->T), dim3(D / 8), 0, p->c.stream, (const __nv_bfloat16*)p->Y,
+                 const_cast<int*>(p->slotmap), (const __nv_bfloat16*)p->sh, (__nv_bfloat16*)p->out);
+    return cudaGetLastError() == cudaSuccess ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
 void combine(torch::Tensor Y, torch::Tensor slotmap, torch::Tensor sh, torch::Tensor out) {
-  auto stream = at::cuda::getCurrentCUDAStream();
-  k_combine<<<(unsigned)out.size(0), D / 8, 0, stream>>>((const __nv_bfloat16*)Y.data_ptr(), slotmap.data_ptr<int>(),
-                                                          sh.numel() ? (const __nv_bfloat16*)sh.data_ptr() : nullptr,
-                                                          (__nv_bfloat16*)out.data_ptr());
+  FprMoeRawCombineArgs ca{{at::cuda::getCurrentCUDAStream(), (int)out.get_device(), 0}, Y.data_ptr(), slotmap.data_ptr<int>(),
+                          sh.numel() ? sh.data_ptr() : nullptr, out.data_ptr(), (int32_t)out.size(0)};
+  TORCH_CHECK(combine_core(&ca) == FPR_OK, "moe_raw combine: CUDA launch error");
 }
 int64_t route_max_ec() { return RT_MAXEC; }
+// k_gather5's EC capacity and its skipped-launch flag word (this device's g_gather5_err)
+//   gather5_take(out): int32 [3] = {skip flag, max nec, launches with nec > 512} since the last take, each read-and-cleared by
+//                      atomicExch on the CURRENT stream (async; the served poll: mixed_cxx_moe._g5_poll, a side stream + pinned
+//                      slots + event per device, as rs_oob)
+//   gather5_err():     synchronous read-and-clear (legacy default stream, current device): TESTS ONLY, never per step
+__global__ void k_gather5_take(int* out) {
+  out[0] = (int)atomicExch(&g_gather5_err, 0u);
+  out[1] = atomicExch(&g_gather5_maxnec, 0);
+  out[2] = (int)atomicExch(&g_gather5_over, 0u);
+}
+int64_t gather5_max_ec() { return G5_MAXE; }
+void gather5_take(torch::Tensor out) {
+  TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kInt32 && out.numel() >= 3, "gather5_take: int32 [3] on the device");
+  k_gather5_take<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(out.data_ptr<int>());
+}
+int64_t gather5_err() {
+  unsigned v = 0u, z = 0u;
+  cudaMemcpyFromSymbol(&v, g_gather5_err, sizeof(v));
+  cudaMemcpyToSymbol(g_gather5_err, &z, sizeof(z));
+  return (int64_t)v;
+}
 int64_t gemm_ctas() { return MS3_CTAS; }
 
 int64_t smem_bytes(int64_t mode) { return mode == 1 ? Lay<1>::SMEM : Lay<2>::SMEM; }
+
+// ---- C ABI (fpr_cabi.h): init + table
+static int init_core(const FprMoeRawInitArgs* p) {   // per device: the GEMM opt-ins; once: SM count, TMA encoder, ENG_PDL2
+  try {
+    if (!sms_c(p->c.device)) return FPR_E_CUDA;
+    (void)tmap_encode();   // the static entry point, resolved here once (throws if unavailable)
+    (void)pdl2::on();      // latch ENG_PDL2 (pdl2's static) before the driver threads launch
+    return (smem_attr_c(k_gemm<1>, Lay<1>::SMEM, &g_gemm_attr[1]) && smem_attr_c(k_gemm<2>, Lay<2>::SMEM, &g_gemm_attr[2]))
+               ? FPR_OK : FPR_E_CUDA;
+  } catch (...) {
+    return FPR_E_CUDA;
+  }
+}
+extern "C" {
+static int c_init(const void* a) { return init_core((const FprMoeRawInitArgs*)a); }
+static int c_router_top_pack3(const void* a) { return router_top_pack3_core((const FprMoeRawRouterTopPack3Args*)a); }
+static int c_swiglu(const void* a) { return swiglu_core((const FprMoeRawSwigluArgs*)a); }
+static int c_prepr5(const void* a) { return prepr5_core((const FprMoeRawPrepr5Args*)a); }
+static int c_gemm1r(const void* a) { return gemm1r_core((const FprMoeRawGemm1rArgs*)a); }
+static int c_gemm2r(const void* a) { return gemm2r_core((const FprMoeRawGemm2rArgs*)a); }
+static int c_combine(const void* a) { return combine_core((const FprMoeRawCombineArgs*)a); }
+static const FprFnEntry k_moe_raw_fns[] = {
+    {"moe_raw.init", c_init, nullptr, (int64_t)sizeof(FprMoeRawInitArgs)},
+    {"moe_raw.router_top_pack3", c_router_top_pack3, nullptr, (int64_t)sizeof(FprMoeRawRouterTopPack3Args)},
+    {"moe_raw.swiglu", c_swiglu, nullptr, (int64_t)sizeof(FprMoeRawSwigluArgs)},
+    {"moe_raw.prepr5", c_prepr5, nullptr, (int64_t)sizeof(FprMoeRawPrepr5Args)},
+    {"moe_raw.gemm1r", c_gemm1r, nullptr, (int64_t)sizeof(FprMoeRawGemm1rArgs)},
+    {"moe_raw.gemm2r", c_gemm2r, nullptr, (int64_t)sizeof(FprMoeRawGemm2rArgs)},
+    {"moe_raw.combine", c_combine, nullptr, (int64_t)sizeof(FprMoeRawCombineArgs)},
+};
+static const FprExtTable k_moe_raw_table = {FPR_CABI_VERSION, "moe_raw", "", 7, k_moe_raw_fns};
+__attribute__((visibility("default"))) const FprExtTable* fpr_moe_raw_table(void) { return &k_moe_raw_table; }
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("route", &route);
@@ -1963,6 +2130,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("router_top_pack3", &router_top_pack3);
   m.def("prepr2", &prepr2);
   m.def("prepr5", &prepr5);
+  m.def("gather5_max_ec", &gather5_max_ec);
+  m.def("gather5_take", &gather5_take);
+  m.def("gather5_err", &gather5_err);
   m.def("swiglu", &swiglu);
   m.def("prepr", &prepr);
   m.def("gemm1r", &gemm1r);

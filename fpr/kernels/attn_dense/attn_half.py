@@ -58,7 +58,7 @@ def _ext():
 QA8 = int(os.environ.get("ATTN2B_QA8", "0"))
 
 # ATTN2B_SPA=1 (default 0): attn_sp.cu (one CTA per row x 64 heads, cp.async record gather, inverse RoPE fused)
-# replaces stock FlashMLA (main + combine) and dense.cu's inv_rope; ATTN2B_SPA=2: attn_sp3.cu (v3: a QK warpgroup with
+# replaces stock FlashMLA and dense.cu's inv_rope; ATTN2B_SPA=2: attn_sp3.cu (v3: a QK warpgroup with
 # Q in registers + 2 P V warpgroups; parked); ATTN2B_SPA=4: attn_sp4.cu (v2 + a producer warpgroup). Read at import.
 SPA = int(os.environ.get("ATTN2B_SPA", "0"))
 # ATTN2B_SPA_PF=MB (default 0): attn_sp also pulls the first MB of the next GEMM's weights (cuBLAS wo_a's bf16 wo_aT, or

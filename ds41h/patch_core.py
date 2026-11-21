@@ -1,11 +1,11 @@
 """Common ds41h runtime plumbing: per-forward step context, TP-group helpers, component registry.
 
 Step context
-------------
+
 `current_step()` describes the forward pass that is executing *now* (decode-only or not, token
 counts, cudagraph mode). It is derived from vLLM's ForwardContext, which every forward path enters:
   * eager / PIECEWISE target steps: GPUModelRunner.execute_model -> set_forward_context
-    (vllm/v1/worker/gpu/model_runner.py:2015-2026),
+
   * FULL cudagraph capture: ModelCudaGraphManager.capture -> forward_fn -> set_forward_context
     (vllm/v1/worker/gpu/cudagraph_utils.py:733-752), with the capture-time dummy attention metadata,
   * DSpark/DFlash draft forwards: DFlashSpeculator._run_model -> set_forward_context
