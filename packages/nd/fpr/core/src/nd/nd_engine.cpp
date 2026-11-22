@@ -439,13 +439,18 @@ std::string Engine::async_ok_(const std::vector<StepBatch>& b, const std::vector
   if (cfg_.vrows) return "ENG_D13_VROWS (variable rows: not ported to nd yet)";
   if (!cfg_.hsd.pool) return "HSD without the window pool (per-element prepare)";
   std::string why = host_->async_ok(b, ct);
+  bool copy_long = false;   // a page-copies step that is also a long-context step
   if (why == "page copies" && cfg_.decode_copies) {   // (v3.27, P4) Worker.copies natively at dispatch (Python: embedded)
     for (const auto& sb : b)
       if (!sb.poison.empty()) return "page copies with POISON pages (debug: Python's Worker.copies)";
     std::vector<StepBatch> b2(b);   // the rest of D13Host's checks on the step without its copies (rare: copy steps only)
     for (auto& x : b2) x.copies.clear();
     why = host_->async_ok(b2, ct);
-    if (!why.empty()) return why;
+    // A long-context step with page copies: D13Host's indexer bound is its LAST check (every other one passed), so it falls
+    // through to the ND_LONG classification below exactly as the same step without copies (before, batched > 262K steps
+    // with prefix-hit copies ran embedded). Every other reason is not long-related.
+    copy_long = why == "context beyond the decode graphs' indexer bound" && !cfg_.lng.level_ctx.empty();
+    if (!why.empty() && !copy_long) return why;
     std::vector<PageCopyBatch> g;
     copy_groups_(b, &g);
     std::string w;
@@ -457,6 +462,7 @@ std::string Engine::async_ok_(const std::vector<StepBatch>& b, const std::vector
     const int lvl = long_level_of(b, ct, cfg_.lng);
     if (lvl > 0 && cfg_.long_async) {
       why.clear();   // (v3.33, ND_LONG) the async long variant: the checks below run on its key Rk (long_lvl_)
+      if (copy_long) stats_["long_ctx_copy_steps_lvl" + std::to_string(lvl)]++;   // classified native (may still refuse below)
     } else if (lvl > 0) {
       why = "long-context decode lvl " + std::to_string(lvl) + " (ND_LONG off: Python's long variant)";
       stats_["long_ctx_steps_lvl" + std::to_string(lvl)]++;

@@ -1,4 +1,4 @@
-# ds41h native (4x H200)
+# ds41h native (4x H200), release R3
 
 Native C/C++ serving of [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) on one
 node with **4x H200** (141 GB each, x86_64, `sm_90a`). The vLLM-based ds41h stack it replaces is at tag `FPRv1`.
@@ -49,6 +49,30 @@ prefill (mostly GEMMs). ds41h native was measured at 600 W, with DSpark k=3.
 | Prefill, 8K-128K prompts | 53-61K tok/s | 52-65K tok/s | x1.0-1.13 |
 | First token at 250-290K | 4.78 s (250K) | 4.71 s (290K) | - |
 | KV cache, tokens held at once | ~21M | 67.8M | x3.2 |
+
+### R3 on an agentic scan workload (measured)
+
+85 concurrent multi-turn agent conversations on one 4x H200 node: contexts up to 400K tokens, ~2.3K new prompt tokens
+and ~45 output tokens per turn on average (most of each prompt hits the prefix cache), 14-minute runs, steady state
+from minute 5. R2 and R3 were measured back to back on the same host.
+
+| | R2 | R3 | Gain |
+|---|---|---|---|
+| Output tok/s | 3,400-3,580 | 3,860-3,960 | ~x1.2-1.25 |
+| Decode tok/s per request | 42-44 | 51-52 | ~x1.2 |
+| GPU busy (SM activity) | 75-85 % | ~88 % | |
+| First token, p50 | 0.37 s | 1.1 s | slower (by design) |
+
+R3 changes, all exact (outputs are unchanged):
+
+- **Long-context steps with page copies stay native.** Batched decode steps past 262K context that also copy prefix
+  pages ran in the Python fallback path; they now take the native loop (`packages/nd`, `nd_engine.cpp`).
+- **Fewer, fuller mixed steps.** `mixed_min_decode_steps=10` (`fpr/config/h200_native.env`) runs at least 10
+  decode-only steps between prefill-carrying steps under load, so each mixed step carries more prefill. This trades
+  ~0.6 s of first-token latency for throughput.
+- **Start-up under load.** Decode-bucket precreation now finishes after 45 s or 1,024 steps
+  (`ENG_DECODE_PRECREATE_DEADLINE_S` / `_SERIALS`) instead of waiting for a quiet moment. A restart under constant
+  traffic no longer runs at ~1/3 speed until the traffic stops.
 
 ## Requirements
 

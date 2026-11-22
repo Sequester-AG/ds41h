@@ -412,6 +412,15 @@ DECODE_PRECREATE_MAX_STEPS = int(os.environ.get("ENG_DECODE_PRECREATE_MAX_STEPS"
 # serials: "done (stalled)" when every requested bucket exists (its REPEAT count may be short: no traffic can reach it),
 # else GAVE UP; the done-point actions (HSD views precreate, MIX precreate, C1 / H1 precapture marks) run as before.
 DECODE_PRECREATE_STALL = int(os.environ.get("ENG_DECODE_PRECREATE_STALL", "64"))
+# ENG_DECODE_PRECREATE_DEADLINE_S / _SERIALS: STALL above arms only once _pc_pick ran (its _pc_s). When NO padding-eligible
+# decode step ever comes (a restart under sustained prefill-heavy traffic: every step mixed or C1-sized), neither STALL nor
+# MAX_STEPS can fire and nd holds every decode step embedded until a quiet moment. native_boundary therefore also decides once
+# PRECREATE has been active, with no _pc_pick, for DEADLINE_SERIALS step serials or DEADLINE_S seconds since its first
+# boundary: done (every requested bucket exists) else GAVE UP, then the done-point actions as before; a missing decode bucket
+# is created at its first use (nd refuses it once: one embedded step, as without PRECREATE). Either knob 0 = that limit off;
+# both 0 = off.
+DECODE_PRECREATE_DEADLINE_S = float(os.environ.get("ENG_DECODE_PRECREATE_DEADLINE_S", "45"))
+DECODE_PRECREATE_DEADLINE_SERIALS = int(os.environ.get("ENG_DECODE_PRECREATE_DEADLINE_SERIALS", "1024"))
 # ENG_HSD_VIEWS: HSD's per-bucket drafter scratch (DraftRank b / m) as flat-prefix views of
 # its own D_max ranks0[r] (kernels/hsdtail/hsd_views.py; ~1.5 GB per rank). With ENG_DECODE_PRECREATE also every drafter
 # bucket is created at PRECREATE's done point (hsd_views.precreate: draft_rank + plan + PeerComm; no graph capture).
@@ -1493,7 +1502,7 @@ class Engine:
         precreate_active). Never raises (_h1_precapture logs its own failure)."""
         out = dict(ran=[], deferred=False, precreate_active=self._pc is not None)
         stall = (self._pc is not None and self._pc_s is not None and DECODE_PRECREATE_STALL > 0
-                 and self.step_serial - self._pc_s > DECODE_PRECREATE_STALL)
+                 and self.step_serial - self._pc_s > DECODE_PRECREATE_STALL) or self._pc_deadline_due()
         job = getattr(self, "_precap_job", None)
         if not NATIVE_BOUNDARY or not (stall or getattr(self, "_h1_precap_due", False) or job is not None):
             return out
@@ -1601,9 +1610,34 @@ class Engine:
                     self._h1_precap_due = True      # (runs at the next step_mixed's start: see ENG_MIXED_HEAD_PRECAPTURE)
             self._pc = None
 
+    def _pc_deadline_due(self) -> bool:
+        """ENG_DECODE_PRECREATE_DEADLINE (see the flag): PRECREATE active, _pc_pick never ran, and DEADLINE_SERIALS step serials
+        or DEADLINE_S seconds have passed since the first call (which only arms: serial, time, GPU 0 allocated). Cheap; no GPU
+        work; called at every native boundary while PRECREATE is active."""
+        if self._pc is None or self._pc_s is not None:
+            return False
+        if DECODE_PRECREATE_DEADLINE_S <= 0 and DECODE_PRECREATE_DEADLINE_SERIALS <= 0:
+            return False
+        a = getattr(self, "_pc_arm", None)
+        if a is None:
+            self._pc_arm = (self.step_serial, time.perf_counter(), torch.cuda.memory_allocated(self.devs[0]))
+            return False
+        return ((DECODE_PRECREATE_DEADLINE_SERIALS > 0 and self.step_serial - a[0] > DECODE_PRECREATE_DEADLINE_SERIALS)
+                or (DECODE_PRECREATE_DEADLINE_S > 0 and time.perf_counter() - a[1] > DECODE_PRECREATE_DEADLINE_S))
+
     def _pc_stall_check(self) -> None:
         """ENG_DECODE_PRECREATE_STALL (see the flag): at a native step boundary, decide done / GAVE UP once no padding-eligible
         step came for DECODE_PRECREATE_STALL step serials. Buckets that exist count as created even below REPEAT."""
+        if self._pc is not None and self._pc_s is None and self._pc_deadline_due():   # (ENG_DECODE_PRECREATE_DEADLINE)
+            a = self._pc_arm
+            s = self.step_serial
+            if self._pc_t0 is None:            # (_pc_finish logs from _pc_t0: _pc_pick never set it)
+                self._pc_t0 = a
+            self._pc = [R for R in self._pc if R not in self.bk]
+            self.stats["precreate_deadline"] = self.stats.get("precreate_deadline", 0) + 1
+            self._pc_finish(s, f" (deadline: no padding-eligible decode step in {s - a[0]} step serials / "
+                               f"{time.perf_counter() - a[1]:.0f} s since PRECREATE's first native boundary)")
+            return
         if self._pc is None or self._pc_s is None or DECODE_PRECREATE_STALL <= 0:
             return
         s = self.step_serial
